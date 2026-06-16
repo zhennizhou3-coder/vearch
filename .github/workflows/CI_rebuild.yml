@@ -1,0 +1,187 @@
+name: CI Rebuild Index
+
+# ---------------------------------------------------------------------------
+# 触发条件
+# ---------------------------------------------------------------------------
+# 1) push:任意分支有提交都会即时触发,3 个 job(fast / long / chaos)
+#    全部跑。
+# 2) pull_request:PR 创建/更新时即时触发,3 个 job 全部跑。
+# 3) workflow_dispatch:GitHub 网页 Actions 页可手动按按钮重新跑。
+#
+# 注意成本:每次 push 都会跑 long (DiskANN 30min 上限) 和 chaos (会
+# kill PS / master),CI 时长大约 60-120min/次。如果觉得贵,把 long /
+# chaos 的 if: 加回来(`github.event_name == 'workflow_dispatch'`)即可
+# 退化成手动门控。
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+
+jobs:
+  # ===========================================================================
+  # Job A:快速 lifecycle
+  # ===========================================================================
+  rebuild-fast:
+    name: 'Fast rebuild lifecycle'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60     # 工作流超时硬上限,避免无限挂起占 runner 时间
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            docker-arch: ''
+    env:
+      TARGET_PLATFORM: ${{ matrix.platform }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # 复用现有的 cluster setup composite action — 它会:
+    # 1) build vearch docker image
+    # 2) docker-compose up 一套 3-master / 3-ps / 2-router 集群
+    # 3) 装 Python + pytest 依赖
+    - uses: ./.github/actions/set_cluster_env
+      with:
+        build-type: github
+
+    # ---- 模块测试:基础 lifecycle ----
+    # test_module_rebuild_index.py 覆盖:
+    #   trigger / progress / cancel / 多 target / DB-level / 全局 rebuild
+    - name: Run basic rebuild module tests
+      run: |
+        cd test
+        pytest test_module_rebuild_index.py \
+          -x --log-cli-level=INFO
+
+    # ---- 模块测试:comprehensive,排除 30min 那条 ----
+    # --deselect 把 test_rebuild_diskann 单独 cut 出去,放到 rebuild-long
+    # 那个 job 里跑(下面)。
+    - name: Run comprehensive rebuild tests (no DiskANN)
+      run: |
+        cd test
+        pytest test_module_rebuild_comprehensive.py \
+          -x --log-cli-level=INFO \
+          --deselect test_module_rebuild_comprehensive.py::TestRebuildIndexTypeMatrix::test_rebuild_diskann
+
+    # ---- 失败时把 master / PS / router 日志都打上来,debug 方便 ----
+    # `if: failure()` 只在前面的 step 挂掉时才跑。
+    - name: Upload cluster logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rebuild-fast-logs
+        path: |
+          cloud/logs/
+          test/*.log
+        retention-days: 7
+
+  # ===========================================================================
+  # Job B:长跑 — DiskANN(每次 push 都会跑)
+  # ===========================================================================
+  rebuild-long:
+    name: 'Long-running rebuild (DiskANN ≤30min)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90     # DiskANN 6.5 上限 30min,加上 build/setup 留 90min
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: ./.github/actions/set_cluster_env
+      with:
+        build-type: github
+
+    - name: Run DiskANN rebuild test
+      # 单独 -k 进 DiskANN 那一条,不拉别的连带跑。
+      run: |
+        cd test
+        pytest test_module_rebuild_comprehensive.py \
+          -k 'test_rebuild_diskann' \
+          -x --log-cli-level=INFO
+
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rebuild-long-logs
+        path: |
+          cloud/logs/
+          test/*.log
+        retention-days: 14    # 长跑日志多留几天好回溯
+
+  # ===========================================================================
+  # Job C:chaos 测试 — kill PS / master 故障注入(每次 push 都会跑)
+  # ===========================================================================
+  # 注意:chaos 测试用的是 test/utils/cluster_helpers.py,操作 *本地裸进程
+  # 的 PID 文件 + os.kill*,跟前两个 job 用的 docker-compose 集群路径不
+  # 兼容。所以这个 job 不复用 set_cluster_env,而是自己:
+  #   1) 直接 build vearch 二进制
+  #   2) 用 scripts/cluster.sh start 起 3 master + 3 ps + 2 router 裸进程
+  #   3) 跑 chaos 测试
+  #   4) finally 用 cluster.sh stop 收尾
+  # ---------------------------------------------------------------------------
+  rebuild-chaos:
+    name: 'Chaos rebuild (PS kill, master failover)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip setuptools wheel
+        pip install requests pytest pandas numpy h5py psutil tqdm
+
+    - name: Compile vearch binary
+      # chaos 测试需要的是 build/bin/vearch 二进制,不是 docker 镜像。
+      # cluster.sh 默认从这里读。
+      run: |
+        # 这一步可能需要根据你项目的 Makefile / build 命令调整。
+        # 当前仓库是 CGO + 第三方 C++ engine 链接,典型 build:
+        make build || (echo "make build failed; falling back to go build"; \
+                       go build -o build/bin/vearch ./cmd/vearch)
+
+    - name: Start cluster (raw processes)
+      run: |
+        bash scripts/cluster.sh start
+        # 给一段时间让 master 心跳 + PS 注册稳定。
+        sleep 10
+        bash scripts/cluster.sh status
+
+    - name: Run chaos rebuild tests
+      # -p no:cacheprovider 避免 .pytest_cache 堆在 runner 上。
+      # --maxfail=3 允许收齐多个 failing case 的日志,而不是首发 fail 就退。
+      run: |
+        cd test
+        pytest test_module_rebuild_chaos.py \
+          --maxfail=3 --log-cli-level=INFO \
+          -p no:cacheprovider
+
+    - name: Stop cluster (always run, even on failure)
+      if: always()
+      run: |
+        bash scripts/cluster.sh stop || true
+        bash scripts/cluster.sh status || true
+
+    - name: Upload cluster + chaos logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rebuild-chaos-logs
+        path: |
+          logs/                 # cluster.sh 默认输出目录
+          test/*.log
+        retention-days: 14
