@@ -12,8 +12,8 @@
 #include "index/reflector.h"
 #include "util/utils.h"
 
-#include <disk_utils.h>
-#include <ann_exception.h>
+#include <diskann/disk_utils.h>
+#include <diskann/ann_exception.h>
 #include <omp.h>
 #include <algorithm>
 #include <sstream>

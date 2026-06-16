@@ -12,7 +12,6 @@ Status DiskANNStaticModelParams::ParseFrom(const char *str) {
   }
 
   int val;
-  float fval;
 
   if (!jp.GetInt("R", val) && val > 0) R = val;
   if (!jp.GetInt("L", val) && val > 0) L = val;

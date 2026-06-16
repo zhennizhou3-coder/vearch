@@ -9,6 +9,8 @@
 vearch.iml
 .idea/
 .vscode/
+.claude/*
+!.claude/skills/
 __pycache__/
 err.log*
 
@@ -62,16 +64,4 @@ examples/golang/basic_usage/basic_usage
 scripts/benchmarks/*log
 scripts/benchmarks/__pycache__
 scripts/benchmarks/datasets/
-
-# chaos test runtime artifacts (生成于 scripts/cluster.sh)
-# 这些是单机集群的 PID 文件 + 日志 + 数据目录,跑 chaos 测试会被
-# 自动创建。本身不该入仓,本机重启后 cluster.sh 会重建。
-.cluster_pids/
-logs/
-data/
-# build/
-*.pid
-
-# pytest cache anywhere(原来只 ignore 了 test/.pytest_cache/,
-# 其它子目录跑 pytest 也会留)
-.pytest_cache/
+.joycode/

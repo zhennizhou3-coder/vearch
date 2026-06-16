@@ -14,9 +14,9 @@
 #endif
 
 // DiskANN headers
-#include <pq_flash_index.h>
-#include <aligned_file_reader.h>
-#include <linux_aligned_file_reader.h>
+#include <diskann/pq_flash_index.h>
+#include <diskann/aligned_file_reader.h>
+#include <diskann/linux_aligned_file_reader.h>
 
 namespace vearch {
 

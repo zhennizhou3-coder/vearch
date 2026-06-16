@@ -481,15 +481,17 @@ def test_vearch_document_search_with_index_recall(index_type):
     # hava result
     assert len(rs.json()["data"]["documents"][0]) == 100
 
-    total_batch = 2
-    delete_interface(total_batch, batch_size, full_field, seed, "by_ids")
-    logger.info("%s doc_num: %d" % (space_name, get_space_num()))
-    assert get_space_num() == 100
+    # diskann static now do not support delete or update
+    if index_type != "DISKANN_STATIC":
+        total_batch = 2
+        delete_interface(total_batch, batch_size, full_field, seed, "by_ids")
+        logger.info("%s doc_num: %d" % (space_name, get_space_num()))
+        assert get_space_num() == 100
 
-    rs = requests.post(url, auth=(username, password), data=json_str)
-    assert rs.json()["code"] == 0
-    # hava result
-    assert len(rs.json()["data"]["documents"][0]) == 100
+        rs = requests.post(url, auth=(username, password), data=json_str)
+        assert rs.json()["code"] == 0
+        # hava result
+        assert len(rs.json()["data"]["documents"][0]) == 100
 
     destroy(router_url, db_name, space_name)
 

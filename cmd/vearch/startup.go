@@ -226,6 +226,8 @@ func main() {
 
 	// start router
 	if tags[routerTag] || tags[allTag] {
+		runtime.GOMAXPROCS(runtime.NumCPU())
+		log.Info("router runtime cpu num: %d", runtime.GOMAXPROCS(0))
 		if err := config.Conf().Validate(config.Router); err != nil {
 			log.Error("validate router error: %v", err)
 			os.Exit(1)
