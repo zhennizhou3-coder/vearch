@@ -57,6 +57,8 @@ const (
 	paramNodeID         = "node_id"
 	paramRequestID      = "X-Request-Id"
 	versionID           = "version_id"
+	paramFieldName      = "field_name"
+	paramIndexType      = "index_type"
 	defaultResourceName = "default"
 )
 
@@ -290,6 +292,22 @@ func ExportToClusterHandler(router *gin.Engine, masterService *masterService, se
 	groupAuth.GET(fmt.Sprintf("/restore/dbs/:%s/spaces/:%s/progress", paramDbName, paramSpaceName), c.getRestoreProgress)
 	groupAuth.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s", paramDbName, paramSpaceName, versionID), c.deleteBackupVersion)
 	groupAuth.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s/direct", paramDbName, paramSpaceName, versionID), c.deleteBackupVersionDirect)
+
+	// rebuild index handler
+	groupAuth.POST("/rebuild/index/dbs", c.rebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/rebuild/index/dbs/:%s", paramDbName), c.rebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s", paramDbName, paramSpaceName), c.rebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s", paramDbName, paramSpaceName, paramFieldName, paramIndexType), c.rebuildIndex)
+
+	groupAuth.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/progress", paramDbName, paramSpaceName), c.getRebuildProgress)
+	groupAuth.GET("/rebuild/index/dbs", c.listAllRebuildProgress)
+	groupAuth.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/progress", paramDbName), c.listDBRebuildProgress)
+
+	// cancel rebuild handler
+	groupAuth.POST("/cancel/rebuild/index/dbs", c.cancelRebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s", paramDbName), c.cancelRebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s", paramDbName, paramSpaceName), c.cancelRebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s", paramDbName, paramSpaceName, paramFieldName, paramIndexType), c.cancelRebuildIndex)
 
 	// modify engine config handler
 	groupAuth.POST("/config/:"+paramDbName+"/:"+paramSpaceName, c.modifySpaceConfig)
@@ -752,8 +770,7 @@ func (ca *clusterAPI) getSpace(c *gin.Context) {
 			spaceInfo.DbName = dbName
 			spaceInfo.SpaceName = spaceName
 			spaceInfo.Schema = &entity.SpaceSchema{
-				Fields:  space.Fields,
-				Indexes: space.Indexes,
+				Fields: space.Fields,
 			}
 			spaceInfo.PartitionNum = space.PartitionNum
 			spaceInfo.ReplicaNum = space.ReplicaNum
@@ -775,8 +792,7 @@ func (ca *clusterAPI) getSpace(c *gin.Context) {
 				spaceInfo.DbName = dbName
 				spaceInfo.SpaceName = space.Name
 				spaceInfo.Schema = &entity.SpaceSchema{
-					Fields:  space.Fields,
-					Indexes: space.Indexes,
+					Fields: space.Fields,
 				}
 				spaceInfo.PartitionNum = space.PartitionNum
 				spaceInfo.ReplicaNum = space.ReplicaNum
@@ -1109,6 +1125,353 @@ func (ca *clusterAPI) deleteBackupVersionDirect(c *gin.Context) {
 		"version_id":    versionID,
 		"deleted_count": deletedCount,
 		"prefix":        backupPrefix,
+	})
+}
+
+// rebuildIndex rebuilds index for the specified scope:
+func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
+	startTime := time.Now()
+	operateName := "handleRebuildIndex"
+	httpCode := http.StatusOK
+	dbName := ""
+	spaceName := ""
+	defer func() {
+		defer monitor.Profiler(operateName, startTime, httpCode, dbName, spaceName)
+	}()
+
+	dbName = c.Param(paramDbName)
+	spaceName = c.Param(paramSpaceName)
+	urlFieldName := c.Param(paramFieldName)
+	urlIndexType := c.Param(paramIndexType)
+
+	log.Info("rebuildIndex handler called: dbName=%s, spaceName=%s, field=%s, indexType=%s, path=%s",
+		dbName, spaceName, urlFieldName, urlIndexType, c.Request.URL.Path)
+
+	// spaceName provided without dbName is invalid
+	if dbName == "" && spaceName != "" {
+		log.Warn("rebuildIndex: spaceName=%s provided without dbName", spaceName)
+		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(fmt.Errorf("dbName is required when spaceName is specified")))
+		return
+	}
+	rebuildReqTpl := &entity.RebuildRequest{}
+	if c.Request.Body != nil {
+		data, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			httpCode = response.New(c).JsonError(errors.NewErrBadRequest(err))
+			return
+		}
+		if len(data) > 0 {
+			if err := json.Unmarshal(data, rebuildReqTpl); err != nil {
+				httpCode = response.New(c).JsonError(errors.NewErrBadRequest(err))
+				return
+			}
+		}
+	}
+	if rebuildReqTpl.PartitionId != 0 && (dbName == "" || spaceName == "") {
+		log.Warn("rebuildIndex: PartitionId=%d requires both dbName and spaceName",
+			rebuildReqTpl.PartitionId)
+		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(
+			fmt.Errorf("partition_id requires both dbName and spaceName to be specified")))
+		return
+	}
+	if urlFieldName != "" {
+		rebuildReqTpl.FieldName = urlFieldName
+	}
+	if urlIndexType != "" {
+		rebuildReqTpl.IndexType = urlIndexType
+	}
+	if _, _, err := entity.NormalizeRebuildTarget(rebuildReqTpl.FieldName, rebuildReqTpl.IndexType); err != nil {
+		log.Warn("rebuildIndex: %v", err)
+		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(err))
+		return
+	}
+	if (rebuildReqTpl.FieldName != "" || rebuildReqTpl.IndexType != "") && (dbName == "" || spaceName == "") {
+		log.Warn("rebuildIndex: field_name/index_type requires both dbName and spaceName")
+		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(
+			fmt.Errorf("field_name/index_type require both dbName and spaceName to be specified")))
+		return
+	}
+	type target struct {
+		db    string
+		space string
+	}
+	var targets []target
+
+	ctx := c.Request.Context()
+	mc := ca.masterService.Master()
+
+	switch {
+	case dbName != "" && spaceName != "":
+		targets = append(targets, target{db: dbName, space: spaceName})
+	case dbName != "":
+		dbID, err := mc.QueryDBName2ID(ctx, dbName)
+		if err != nil {
+			log.Error("rebuildIndex: query db %s failed: %v", dbName, err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(fmt.Errorf("query db %s failed: %v", dbName, err)))
+			return
+		}
+		spaces, err := mc.QuerySpaces(ctx, dbID)
+		if err != nil {
+			log.Error("rebuildIndex: query spaces of db %s failed: %v", dbName, err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
+			return
+		}
+		for _, sp := range spaces {
+			targets = append(targets, target{db: dbName, space: sp.Name})
+		}
+	default:
+		// All spaces in all dbs.
+		dbs, err := mc.QueryDBs(ctx)
+		if err != nil {
+			log.Error("rebuildIndex: query dbs failed: %v", err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
+			return
+		}
+		for _, db := range dbs {
+			spaces, err := mc.QuerySpaces(ctx, int64(db.Id))
+			if err != nil {
+				log.Error("rebuildIndex: query spaces of db %s failed: %v", db.Name, err)
+				continue
+			}
+			for _, sp := range spaces {
+				targets = append(targets, target{db: db.Name, space: sp.Name})
+			}
+		}
+	}
+
+	if len(targets) == 0 {
+		log.Warn("rebuildIndex: no target spaces resolved (dbName=%s, spaceName=%s)", dbName, spaceName)
+		httpCode = response.New(c).JsonSuccess(map[string]interface{}{
+			"message":   "no spaces to rebuild",
+			"results":   []*entity.RebuildProgressResponse{},
+			"total":     0,
+			"succeeded": 0,
+			"failed":    0,
+		})
+		return
+	}
+
+	// Trigger rebuild for each target. Errors of individual targets are collected
+	// and do not abort the whole batch.
+	results := make([]*entity.RebuildProgressResponse, 0, len(targets))
+	failures := make([]map[string]string, 0)
+	succeeded := 0
+	for _, t := range targets {
+		req := *rebuildReqTpl // shallow copy of body params
+		req.Database = t.db
+		req.Space = t.space
+
+		progress, err := ca.masterService.Rebuild().StartRebuild(c, &req)
+		if err != nil {
+			log.Error("rebuildIndex failed for %s/%s: %v", t.db, t.space, err)
+			failures = append(failures, map[string]string{
+				"db_name":    t.db,
+				"space_name": t.space,
+				"error":      err.Error(),
+			})
+			continue
+		}
+		results = append(results, progress)
+		succeeded++
+	}
+
+	log.Info("rebuildIndex finished: dbName=%s, spaceName=%s, total=%d, succeeded=%d, failed=%d",
+		dbName, spaceName, len(targets), succeeded, len(failures))
+
+	httpCode = response.New(c).JsonSuccess(map[string]interface{}{
+		"results":   results,
+		"failures":  failures,
+		"total":     len(targets),
+		"succeeded": succeeded,
+		"failed":    len(failures),
+	})
+}
+
+// getRebuildProgress gets rebuild progress for the specified space
+func (ca *clusterAPI) getRebuildProgress(c *gin.Context) {
+	dbName := c.Param(paramDbName)
+	spaceName := c.Param(paramSpaceName)
+
+	log.Info("getRebuildProgress handler called: dbName=%s, spaceName=%s, path=%s",
+		dbName, spaceName, c.Request.URL.Path)
+
+	if dbName == "" || spaceName == "" {
+		log.Warn("getRebuildProgress: missing parameters, dbName=%s, spaceName=%s", dbName, spaceName)
+		response.New(c).JsonError(errors.NewErrBadRequest(fmt.Errorf("dbName and spaceName are required")))
+		return
+	}
+
+	progress, err := ca.masterService.Rebuild().GetRebuildProgress(c, dbName, spaceName)
+	if err != nil {
+		log.Error("getRebuildProgress failed: %v", err)
+		response.New(c).JsonError(errors.NewErrInternal(err))
+		return
+	}
+
+	log.Info("getRebuildProgress success: dbName=%s, spaceName=%s, status=%s, total=%d, completed=%d, failed=%d, running=%d, pending=%d, overall=%d%%, ratio=%.2f",
+		dbName, spaceName, progress.Status, progress.TotalTasks, progress.CompletedTasks, progress.FailedTasks,
+		progress.RunningTasks, progress.PendingTasks, progress.OverallPercent, progress.SuccessRatio)
+	response.New(c).JsonSuccess(progress)
+}
+
+// listAllRebuildProgress lists rebuild status for all spaces across all
+// databases. The result is a snapshot of the etcd-persisted rebuild records
+// and is eventually consistent — individual space states may have changed
+// by the time the response is consumed.
+func (ca *clusterAPI) listAllRebuildProgress(c *gin.Context) {
+	log.Info("listAllRebuildProgress handler called: path=%s", c.Request.URL.Path)
+
+	summary, err := ca.masterService.Rebuild().ListAllRebuildProgress(c)
+	if err != nil {
+		log.Error("listAllRebuildProgress failed: %v", err)
+		response.New(c).JsonError(errors.NewErrInternal(err))
+		return
+	}
+
+	log.Info("listAllRebuildProgress success: total=%d, completed=%d, failed=%d, cancelled=%d, running=%d, pending=%d, ratio=%.2f",
+		summary.Total, summary.CompletedCount, summary.FailedCount, summary.CancelledCount,
+		summary.RunningCount, summary.PendingCount, summary.SuccessRatio)
+	response.New(c).JsonSuccess(summary)
+}
+
+// listDBRebuildProgress lists rebuild status for all spaces in a given
+// database. Same eventually-consistent semantics as listAllRebuildProgress.
+func (ca *clusterAPI) listDBRebuildProgress(c *gin.Context) {
+	dbName := c.Param(paramDbName)
+
+	log.Info("listDBRebuildProgress handler called: dbName=%s, path=%s", dbName, c.Request.URL.Path)
+
+	if dbName == "" {
+		log.Warn("listDBRebuildProgress: missing dbName")
+		response.New(c).JsonError(errors.NewErrBadRequest(fmt.Errorf("dbName is required")))
+		return
+	}
+
+	summary, err := ca.masterService.Rebuild().ListDBRebuildProgress(c, dbName)
+	if err != nil {
+		log.Error("listDBRebuildProgress failed for db=%s: %v", dbName, err)
+		response.New(c).JsonError(errors.NewErrInternal(err))
+		return
+	}
+
+	log.Info("listDBRebuildProgress success: dbName=%s, total=%d, completed=%d, failed=%d, cancelled=%d, running=%d, pending=%d, ratio=%.2f",
+		dbName, summary.Total, summary.CompletedCount, summary.FailedCount, summary.CancelledCount,
+		summary.RunningCount, summary.PendingCount, summary.SuccessRatio)
+	response.New(c).JsonSuccess(summary)
+}
+
+// cancelRebuildIndex cancels rebuild for the specified scope. Space is the
+// minimum cancellation unit. The handler resolves the target space list from
+// the URL parameters and calls CancelRebuild for each one.
+func (ca *clusterAPI) cancelRebuildIndex(c *gin.Context) {
+	startTime := time.Now()
+	operateName := "handleCancelRebuildIndex"
+	httpCode := http.StatusOK
+	dbName := ""
+	spaceName := ""
+	defer func() {
+		defer monitor.Profiler(operateName, startTime, httpCode, dbName, spaceName)
+	}()
+
+	dbName = c.Param(paramDbName)
+	spaceName = c.Param(paramSpaceName)
+
+	log.Info("cancelRebuildIndex handler called: dbName=%s, spaceName=%s, path=%s",
+		dbName, spaceName, c.Request.URL.Path)
+
+	// spaceName provided without dbName is invalid
+	if dbName == "" && spaceName != "" {
+		log.Warn("cancelRebuildIndex: spaceName=%s provided without dbName", spaceName)
+		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(fmt.Errorf("dbName is required when spaceName is specified")))
+		return
+	}
+
+	ctx := c.Request.Context()
+	mc := ca.masterService.Master()
+
+	type target struct {
+		db    string
+		space string
+	}
+	var targets []target
+
+	switch {
+	case dbName != "" && spaceName != "":
+		targets = append(targets, target{db: dbName, space: spaceName})
+	case dbName != "":
+		dbID, err := mc.QueryDBName2ID(ctx, dbName)
+		if err != nil {
+			log.Error("cancelRebuildIndex: query db %s failed: %v", dbName, err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(fmt.Errorf("query db %s failed: %v", dbName, err)))
+			return
+		}
+		spaces, err := mc.QuerySpaces(ctx, dbID)
+		if err != nil {
+			log.Error("cancelRebuildIndex: query spaces of db %s failed: %v", dbName, err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
+			return
+		}
+		for _, sp := range spaces {
+			targets = append(targets, target{db: dbName, space: sp.Name})
+		}
+	default:
+		// Cancel all rebuilds across all dbs.
+		dbs, err := mc.QueryDBs(ctx)
+		if err != nil {
+			log.Error("cancelRebuildIndex: query dbs failed: %v", err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
+			return
+		}
+		for _, db := range dbs {
+			spaces, err := mc.QuerySpaces(ctx, int64(db.Id))
+			if err != nil {
+				log.Error("cancelRebuildIndex: query spaces of db %s failed: %v", db.Name, err)
+				continue
+			}
+			for _, sp := range spaces {
+				targets = append(targets, target{db: db.Name, space: sp.Name})
+			}
+		}
+	}
+
+	if len(targets) == 0 {
+		httpCode = response.New(c).JsonSuccess(map[string]interface{}{
+			"message":   "no spaces to cancel",
+			"results":   []*entity.CancelRebuildResponse{},
+			"total":     0,
+			"succeeded": 0,
+			"failed":    0,
+		})
+		return
+	}
+
+	results := make([]*entity.CancelRebuildResponse, 0, len(targets))
+	failures := make([]map[string]string, 0)
+	succeeded := 0
+	for _, t := range targets {
+		resp, err := ca.masterService.Rebuild().CancelRebuild(c, t.db, t.space)
+		if err != nil {
+			log.Error("cancelRebuildIndex failed for %s/%s: %v", t.db, t.space, err)
+			failures = append(failures, map[string]string{
+				"db_name":    t.db,
+				"space_name": t.space,
+				"error":      err.Error(),
+			})
+			continue
+		}
+		results = append(results, resp)
+		succeeded++
+	}
+
+	log.Info("cancelRebuildIndex finished: dbName=%s, spaceName=%s, total=%d, succeeded=%d, failed=%d",
+		dbName, spaceName, len(targets), succeeded, len(failures))
+
+	httpCode = response.New(c).JsonSuccess(map[string]interface{}{
+		"results":   results,
+		"failures":  failures,
+		"total":     len(targets),
+		"succeeded": succeeded,
+		"failed":    len(failures),
 	})
 }
 

@@ -37,6 +37,13 @@ import (
 
 var _ engine.Engine = &gammaEngine{}
 
+// indexLocker serialises BuildIndex / RebuildIndex / Load across the
+// entire PS process. The master rebuild scheduler already guarantees
+// that at any moment a PS has at most one rebuild RPC in flight, so
+// rebuild-vs-rebuild contention is not a concern; the package-level
+// scope here also covers BuildIndex (write-triggered) and Load
+// (partition reload), which are not coordinated by the scheduler and
+// historically have not needed per-partition parallelism.
 var indexLocker sync.Mutex
 
 type EngineConfig struct {
@@ -322,22 +329,39 @@ func (ge *gammaEngine) Optimize() error {
 	return nil
 }
 
-func (ge *gammaEngine) Rebuild(drop_before_rebuild int, limit_cpu int, describe int) error {
-	go func() {
-		if e := ge.RebuildIndex(drop_before_rebuild, limit_cpu, describe); e != nil {
-			log.Error("rebuild index:[%d] has err %v", ge.partitionID, e.Error())
-			return
-		}
-	}()
-	return nil
-}
+// Rebuild triggers an asynchronous index rebuild and returns immediately.
+//
+// NOTE: callers that need to observe the rebuild's terminal result (success
+// or CGO failure) MUST call RebuildIndex directly instead — RebuildIndex is
+// now synchronous (holds indexLocker around the CGO call) and returns the
+// real error, while this method still spawns a goroutine and swallows it
+// for backward compatibility with paths that fire-and-forget.
+// func (ge *gammaEngine) Rebuild(drop_before_rebuild int, limit_cpu int, describe int) error {
+// 	go func() {
+// 		if e := ge.RebuildIndex(drop_before_rebuild, limit_cpu, describe); e != nil {
+// 			log.Error("rebuild index:[%d] has err %v", ge.partitionID, e.Error())
+// 			return
+// 		}
+// 	}()
+// 	return nil
+// }
 
 func (ge *gammaEngine) IndexInfo() (int, int, int) {
+	status, indexed, max, _ := ge.IndexInfoWithErr()
+	return status, indexed, max
+}
+
+// IndexInfoWithErr is the error-aware counterpart of IndexInfo. The legacy
+// IndexInfo signature (returning all zeros on failure) is ambiguous because a
+// brand-new empty partition also legitimately reports (0,0,0). Callers that
+// need to make decisions based on the engine status — most notably the
+// rebuild monitor — should use this method and inspect err first.
+func (ge *gammaEngine) IndexInfoWithErr() (int, int, int, error) {
 	status := &entity.EngineStatus{}
 	if err := ge.GetEngineStatus(status); err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, err
 	}
-	return int(status.IndexStatus), int(status.MinIndexedNum), int(status.MaxDocid)
+	return int(status.IndexStatus), int(status.MinIndexedNum), int(status.MaxDocid), nil
 }
 
 func (ge *gammaEngine) GetEngineStatus(status *entity.EngineStatus) error {
@@ -380,7 +404,30 @@ func (ge *gammaEngine) BuildIndex() error {
 	return nil
 }
 
-func (ge *gammaEngine) RebuildIndex(drop_before_rebuild int, limit_cpu int, describe int) error {
+// RebuildIndex synchronously rebuilds the index for this partition.
+//
+// Why synchronous: the previous implementation spawned an inner goroutine to
+// run the CGO call, which meant
+//   - the `indexLocker.Lock(); defer Unlock()` taken in the outer function
+//     was released immediately after the goroutine was launched, leaving the
+//     CGO call effectively unprotected (concurrent rebuilds could collide
+//     inside the gamma engine), and
+//   - any non-zero return code from gamma.RebuildIndex was logged but never
+//     propagated to callers, so PSRebuildManager could not distinguish a real
+//     CGO failure from a genuinely in-progress rebuild and had to rely on a
+//     24h timeout to give up.
+//
+// Callers that want fire-and-forget semantics should use Rebuild() which
+// wraps this in a goroutine; callers that want to observe the terminal
+// result (PSRebuildManager) call RebuildIndex directly inside their own
+// background goroutine.
+
+// RebuildFieldIndex is the single rebuild entry point for the engine.
+// When field is empty, the C++ Engine::RebuildFieldIndex internally
+// falls back to Engine::RebuildIndex (whole-partition rebuild).
+// When field is specified, only the given (field, indexType) target
+// is rebuilt — other indexes on the same partition remain untouched.
+func (ge *gammaEngine) RebuildFieldIndex(field, indexType string, drop, cpu, des int) error {
 	ge.counter.Incr()
 	defer ge.counter.Decr()
 
@@ -392,19 +439,33 @@ func (ge *gammaEngine) RebuildIndex(drop_before_rebuild int, limit_cpu int, desc
 	indexLocker.Lock()
 	defer indexLocker.Unlock()
 
-	// UNINDEXED = 0, INDEXING, INDEXED
-	go func() {
-		ge.counter.Incr()
-		defer ge.counter.Decr()
-		startTime := time.Now()
-		if rc := gamma.RebuildIndex(ge.gamma, drop_before_rebuild, limit_cpu, describe); rc != 0 {
-			log.Error("rebuild index partition:[%d] err response code:[%d]", ge.partitionID, rc)
-		} else {
-			log.Info("rebuild index partition:[%d] cost:[%.2f]ms, ret:[%d]",
-				ge.partitionID, time.Since(startTime).Seconds()*1000, rc)
-		}
-	}()
+	if ge.hasClosed {
+		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED, nil)
+	}
 
+	// Empty field => whole-partition rebuild.
+	// Delegate to the C++ Engine::RebuildFieldIndex which internally
+	// falls back to Engine::RebuildIndex when field_name is empty.
+	// This avoids the circular Go→Go→C++ call chain and ensures the
+	// single CGO entry point is gamma.RebuildFieldIndex.
+	if field == "" {
+		log.Info("RebuildFieldIndex partition:[%d] field empty, delegating to C++ whole-partition rebuild", ge.partitionID)
+	}
+
+	log.Info("RebuildFieldIndex partition:[%d] field=%s indexType=%s drop=%d cpu=%d describe=%d",
+		ge.partitionID, field, indexType, drop, cpu, des)
+
+	startTime := time.Now()
+	rc := gamma.RebuildFieldIndex(ge.gamma, field, indexType, drop, cpu, des)
+	cost := time.Since(startTime).Seconds() * 1000
+	if rc != 0 {
+		log.Error("RebuildFieldIndex partition:[%d] field=%s indexType=%s cost:[%.2f]ms err rc:[%d]",
+			ge.partitionID, field, indexType, cost, rc)
+		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR,
+			fmt.Errorf("gamma.RebuildFieldIndex field=%s indexType=%s rc=%d", field, indexType, rc))
+	}
+	log.Info("RebuildFieldIndex partition:[%d] field=%s indexType=%s cost:[%.2f]ms rc:[0]",
+		ge.partitionID, field, indexType, cost)
 	return nil
 }
 

@@ -9,6 +9,8 @@
 
 #include <string>
 
+#include <random>
+
 #include "raw_vector.h"
 
 namespace vearch {
@@ -29,6 +31,9 @@ class MemoryRawVector : public RawVector {
 
   int GetVectorHeader(int64_t start, int n, ScopeVectors &vecs,
                       std::vector<int> &lens) override;
+
+  int GetRandomTrainVectors(int num, ScopeVectors &vecs,
+                            size_t &n_get, size_t &valid_count) override;
 
   int UpdateToStore(int64_t vid, uint8_t *v, int len) override;
 

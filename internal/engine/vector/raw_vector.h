@@ -84,6 +84,25 @@ class RawVector : public VectorReader {
   virtual int GetVectorHeader(int64_t start, int n, ScopeVectors &vec,
                               std::vector<int> &lens) = 0;
 
+  /** Get random training vectors, filtering out deleted ones.
+   *
+   * This method collects all valid (non-deleted) vector IDs, randomly
+   * samples up to `num` of them, and returns the vector data in a
+   * contiguous memory block.  It replaces the old pattern of calling
+   * GetVectorHeader(0, num, ...) which both includes deleted vectors
+   * and always picks the first num vectors (no randomness).
+   *
+   * @param num          desired number of training vectors
+   * @param vecs         [out] scope vectors containing the selected data
+   *                     (a single contiguous block)
+   * @param n_get        [out] actual number of valid vectors obtained
+   * @param valid_count  [out] total number of non-deleted vectors in the
+   *                     collection (for threshold checking)
+   * @return 0 on success
+   */
+  virtual int GetRandomTrainVectors(int num, ScopeVectors &vecs,
+                                    size_t &n_get, size_t &valid_count) = 0;
+
   /** dump vectors and sources to disk file
    *
    * @param path  the disk directory path

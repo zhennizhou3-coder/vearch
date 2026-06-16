@@ -390,33 +390,34 @@ int GammaVearchIndex::Indexing() {
   }
   RawVector *raw_vec = dynamic_cast<RawVector *>(vector_);
 
+  // Use GetRandomTrainVectors instead of GetVectorHeader:
+  //   - Filters out deleted vectors (bitmap check)
+  //   - Randomly samples training data for better cluster quality
   ScopeVectors headers;
-  std::vector<int> lens;
-  raw_vec->GetVectorHeader(0, training_threshold_, headers, lens);
-
-  // merge vectors
-  int raw_d = raw_vec->MetaInfo()->Dimension();
-  const char *train_raw_vec = nullptr;
-  int bytes_num = raw_d * training_threshold_ * sizeof(float);
-  utils::ScopeDeleter<uint8_t> del_train_raw_vec;
-  if (lens.size() == 1) {
-    train_raw_vec = (const char *)headers.Get(0);
-  } else {
-    char *buf = new char[bytes_num];
-    train_raw_vec = (const char *)buf;
-    del_train_raw_vec.set((const uint8_t *)train_raw_vec);
-    size_t offset = 0;
-    for (size_t i = 0; i < headers.Size(); ++i) {
-      memcpy((void *)(buf + offset), (void *)headers.Get(i),
-             sizeof(float) * raw_d * lens[i]);
-      offset += sizeof(float) * raw_d * lens[i];
-    }
+  size_t n_get = 0;
+  size_t valid_count = 0;
+  int ret = raw_vec->GetRandomTrainVectors(training_threshold_, headers,
+                                           n_get, valid_count);
+  if (ret != 0) {
+    LOG(ERROR) << "GetRandomTrainVectors failed, ret=" << ret;
+    return ret;
   }
 
-  int ret = ScannTraining(vearch_index_, train_raw_vec, bytes_num, raw_d,
-                          model_param_->n_thread);
+  if ((size_t)training_threshold_ > valid_count) {
+    LOG(ERROR) << "valid vector count [" << valid_count
+               << "] less then training_threshold[" << training_threshold_
+               << "], failed!";
+    return -1;
+  }
 
-  indexed_count_ = training_threshold_;
+  int raw_d = raw_vec->MetaInfo()->Dimension();
+  const char *train_raw_vec = (const char *)headers.Get(0);
+  int bytes_num = raw_d * n_get * sizeof(float);
+
+  ret = ScannTraining(vearch_index_, train_raw_vec, bytes_num, raw_d,
+                      model_param_->n_thread);
+
+  indexed_count_ = n_get;
   is_trained_ = true;
   CreateThreads(model_param_->n_thread);
   LOG(INFO) << "vearch index trained successful ! ! !";

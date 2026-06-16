@@ -10,7 +10,9 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <functional>
+#include <random>
 
 using std::string;
 namespace vearch {
@@ -203,6 +205,67 @@ int MemoryRawVector::GetVectorHeader(int64_t start, int n, ScopeVectors &vecs,
     start += len;
     n -= len;
   }
+  return 0;
+}
+
+int MemoryRawVector::GetRandomTrainVectors(int num, ScopeVectors &vecs,
+                                            size_t &n_get,
+                                            size_t &valid_count) {
+  size_t total = meta_info_->Size();
+
+  // Use Reservoir Sampling (Algorithm R) to select up to `num` random
+  // non-deleted vectors in a single pass with O(num) memory.
+  // This avoids the O(valid_count) memory overhead of collecting all
+  // valid IDs first, which would be ~8GB for 1B docs.
+  //
+  // Correctness: each valid vector has exactly num/valid_count
+  // probability of being in the final reservoir, ensuring uniformity.
+  std::vector<int64_t> reservoir;
+  reservoir.reserve(num);
+  std::mt19937 rng(std::random_device{}());
+  size_t seen = 0;
+
+  for (int64_t vid = 0; vid < (int64_t)total; ++vid) {
+    if (docids_bitmap_->Test(vid)) continue;  // skip deleted
+
+    if (reservoir.size() < (size_t)num) {
+      reservoir.push_back(vid);
+    } else {
+      std::uniform_int_distribution<size_t> dist(0, seen);
+      size_t r = dist(rng);
+      if (r < (size_t)num) reservoir[r] = vid;
+    }
+    ++seen;
+  }
+
+  valid_count = seen;
+  n_get = reservoir.size();
+  if (n_get == 0) {
+    LOG(ERROR) << desc_ << "no valid vectors for training";
+    return -1;
+  }
+
+  // Copy selected vectors into a contiguous memory block.
+  // For MemoryRawVector the data is already in memory segments,
+  // so we can memcpy directly — this is fast and produces the
+  // contiguous layout that faiss::Index::train() expects.
+  int dimension = meta_info_->Dimension();
+  size_t byte_size = (size_t)dimension * data_size_ * n_get;
+  uint8_t *train_vecs = new uint8_t[byte_size];
+  utils::ScopeDeleter<uint8_t> del_train_vecs(train_vecs);
+
+  for (size_t i = 0; i < n_get; ++i) {
+    int64_t vid = reservoir[i];
+    const uint8_t *src = GetFromMem(vid);
+    if (src == nullptr) {
+      LOG(ERROR) << desc_ << "GetFromMem returned null for vid=" << vid;
+      return -2;
+    }
+    memcpy(train_vecs + i * vector_byte_size_, src, vector_byte_size_);
+  }
+
+  del_train_vecs.release();
+  vecs.Add(train_vecs, true);
   return 0;
 }
 

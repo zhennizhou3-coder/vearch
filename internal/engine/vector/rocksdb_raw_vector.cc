@@ -9,6 +9,9 @@
 
 #include <stdio.h>
 
+#include <algorithm>
+#include <random>
+
 #include "rocksdb/table.h"
 #include "util/log.h"
 #include "util/utils.h"
@@ -242,6 +245,71 @@ int RocksDBRawVector::GetVectorHeader(int64_t start, int n, ScopeVectors &vecs,
   }
   vecs.Add(vectors);
   lens.push_back(c);
+  return 0;
+}
+
+int RocksDBRawVector::GetRandomTrainVectors(int num, ScopeVectors &vecs,
+                                             size_t &n_get,
+                                             size_t &valid_count) {
+  size_t total = meta_info_->Size();
+
+  // Use Reservoir Sampling (Algorithm R) to select up to `num` random
+  // non-deleted vectors in a single pass with O(num) memory.
+  // This avoids the O(valid_count) memory overhead of collecting all
+  // valid IDs first, which would be ~8GB for 1B docs.
+  //
+  // Correctness: each valid vector has exactly num/valid_count
+  // probability of being in the final reservoir, ensuring uniformity.
+  std::vector<int64_t> reservoir;
+  reservoir.reserve(num);
+  std::mt19937 rng(std::random_device{}());
+  size_t seen = 0;
+
+  for (int64_t vid = 0; vid < (int64_t)total; ++vid) {
+    if (docids_bitmap_->Test(vid)) continue;  // skip deleted
+
+    if (reservoir.size() < (size_t)num) {
+      reservoir.push_back(vid);
+    } else {
+      std::uniform_int_distribution<size_t> dist(0, seen);
+      size_t r = dist(rng);
+      if (r < (size_t)num) reservoir[r] = vid;
+    }
+    ++seen;
+  }
+
+  valid_count = seen;
+  n_get = reservoir.size();
+  if (n_get == 0) {
+    LOG(ERROR) << desc_ << "no valid vectors for training";
+    return -1;
+  }
+
+  // Batch-fetch the selected vectors via RocksDB MultiGet,
+  // then copy them into a contiguous memory block.
+  int dimension = meta_info_->Dimension();
+  ScopeVectors scope_vecs;
+  if (Gets(reservoir, scope_vecs)) {
+    LOG(ERROR) << desc_ << "RocksDB MultiGet failed for training vectors";
+    return -2;
+  }
+
+  size_t byte_size = (size_t)dimension * data_size_ * n_get;
+  uint8_t *train_vecs = new uint8_t[byte_size];
+  utils::ScopeDeleter<uint8_t> del_train_vecs(train_vecs);
+
+  for (size_t i = 0; i < n_get; ++i) {
+    if (scope_vecs.Get(i) == nullptr) {
+      LOG(ERROR) << desc_ << "Gets returned null for sampled vid="
+                 << reservoir[i] << " (consistency violation between bitmap and storage)";
+      return -2;
+    }
+    memcpy(train_vecs + i * vector_byte_size_, scope_vecs.Get(i),
+           vector_byte_size_);
+  }
+
+  del_train_vecs.release();
+  vecs.Add(train_vecs, true);
   return 0;
 }
 

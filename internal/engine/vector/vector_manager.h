@@ -37,7 +37,7 @@ class VectorManager {
 
   void DestroyRawVectors();
 
-  Status CreateVectorIndex(std::string &index_type, std::string &index_params,
+  Status CreateVectorIndex(const std::string &index_type, const std::string &index_params,
                            RawVector *vec, int training_threshold,
                            bool destroy_vec,
                            std::map<std::string, IndexModel *> &vector_indexes);
@@ -62,6 +62,38 @@ class VectorManager {
       std::map<std::string, IndexModel *> &rebuild_vector_indexes);
 
   Status ReCreateVectorIndexes(int training_threshold);
+
+  /**
+   * @brief Re-create vector index for a specific (field_name, index_type)
+   * pair. This is the per-field counterpart of ReCreateVectorIndexes.
+   *
+   * @param field_name  field name whose vector index should be rebuilt
+   * @param index_type  index type (e.g. "HNSW", "IVFFLAT", "IVFPQ", "FLAT")
+   * @param training_threshold  training threshold for the new index
+   * @return Status
+   */
+  Status ReCreateVectorIndex(const std::string &field_name,
+                             const std::string &index_type,
+                             int training_threshold);
+
+  /**
+   * @brief Rebuild (in-place) vector index for a specific (field_name,
+   * index_type) pair without dropping the old index first.
+   *
+   * This is the per-field counterpart of the CreateVectorIndexes +
+   * TrainIndex + ResetVectorIndexes sequence used by
+   * Engine::RebuildIndex(drop_before_rebuild=0). The new index is created,
+   * optionally trained, and then swapped in to replace the old one.
+   *
+   * @param field_name  field name whose vector index should be rebuilt
+   * @param index_type  index type (e.g. "HNSW", "IVFFLAT", "IVFPQ", "FLAT")
+   * @param training_threshold  training threshold for the new index
+   * @param do_train   whether to train the new index before swapping in
+   * @return Status
+   */
+  Status RebuildVectorIndex(const std::string &field_name,
+                            const std::string &index_type,
+                            int training_threshold, bool do_train);
 
   Status CreateVectorTable(TableInfo &table, std::vector<int> &vector_cf_ids,
                            StorageManager *storage_mgr);
@@ -91,6 +123,8 @@ class VectorManager {
   int Load(const std::vector<std::string> &path, int64_t &doc_num);
 
   bool Contains(std::string &field_name);
+
+  bool SupportIncrement();
 
   void VectorNames(std::vector<std::string> &names) {
     for (const auto &it : raw_vectors_) {

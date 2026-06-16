@@ -1,0 +1,57 @@
+# Router instance 2.
+# Start with: vearch -conf config/router2.toml router
+
+[global]
+    name = "vearch_test"
+    resource_name = "default"
+    data = ["data/router2/"]
+    log = "logs/router2/"
+    level = "info"
+    signkey = "secret"
+    skip_auth = false
+    self_manage_etcd = false
+    auto_recover_ps = true
+
+[[masters]]
+    name = "m1"
+    address = "127.0.0.1"
+    api_port = 28817
+    etcd_port = 22378
+    etcd_peer_port = 22390
+    etcd_client_port = 22370
+    cluster_state = "new"
+    pprof_port = 26062
+    monitor_port = 28821
+
+[[masters]]
+    name = "m2"
+    address = "127.0.0.1"
+    api_port = 28827
+    etcd_port = 22388
+    etcd_peer_port = 22391
+    etcd_client_port = 22371
+    cluster_state = "new"
+    pprof_port = 26072
+    monitor_port = 28831
+
+[[masters]]
+    name = "m3"
+    address = "127.0.0.1"
+    api_port = 28837
+    etcd_port = 22398
+    etcd_peer_port = 22392
+    etcd_client_port = 22372
+    cluster_state = "new"
+    pprof_port = 26082
+    monitor_port = 28841
+
+[router]
+    port = 19002
+    pprof_port = 16071
+    plugin_path = "plugin"
+
+[ps]
+    rpc_port = 18081
+    raft_heartbeat_port = 18898
+    raft_replicate_port = 18899
+    pprof_port = 16060

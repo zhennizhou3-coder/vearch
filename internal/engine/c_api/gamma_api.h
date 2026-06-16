@@ -104,6 +104,25 @@ int RebuildIndex(void *engine, int drop_before_rebuild, int limit_cpu,
                  int describe);
 
 /**
+ * @brief rebuild index for a specific (field_name, index_type) pair
+ *
+ * When field_name is empty, falls back to whole-partition RebuildIndex.
+ * For vector fields, destroys and re-creates only the specified index.
+ * For scalar fields, rebuilds the bitmap index for the field.
+ *
+ * @param engine  search engine pointer
+ * @param field_name  field name (C string), empty for whole-partition rebuild
+ * @param index_type  index type (C string), e.g. "HNSW", "IVFFLAT", "SCALAR"
+ * @param drop_before_rebuild  1 to drop before rebuild, 0 for in-place
+ * @param limit_cpu  CPU limit
+ * @param describe  describe level
+ * @return 0 on success, non-zero on failure
+ */
+int RebuildFieldIndex(void *engine, const char *field_name,
+                      const char *index_type, int drop_before_rebuild,
+                      int limit_cpu, int describe);
+
+/**
  * @brief dump datas into disk accord to Config
  *
  * @param engine

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 	"unicode"
 
@@ -195,6 +196,130 @@ func (s *Space) GetFieldIndexType(fieldName string) string {
 	return ""
 }
 
+// HasField reports whether fieldName is defined either in the explicit
+// Indexes list (multi-index aware) or in SpaceProperties (single-index
+// path). Used by the rebuild API to reject targets that name a field the
+// space doesn't actually have before any work is enqueued.
+func (s *Space) HasField(fieldName string) bool {
+	if fieldName == "" {
+		return false
+	}
+	for _, idx := range s.Indexes {
+		if idx.FieldName == fieldName {
+			return true
+		}
+		for _, fn := range idx.FieldNames {
+			if fn == fieldName {
+				return true
+			}
+		}
+	}
+	if _, ok := s.SpaceProperties[fieldName]; ok {
+		return true
+	}
+	return false
+}
+
+// GetIndexByFieldAndType returns the *Index whose (FieldName == fieldName
+// AND Type matches indexType case-insensitively). Multi-field indexes are
+// matched by membership in FieldNames. Returns nil when no such index is
+// declared on the space.
+//
+// This is the single source of truth for "does this (field, indexType)
+// pair really exist on this space?" used by both the master HTTP layer and
+// the PS-side handler so a bypassed validation in one layer cannot let an
+// unsupported target slip through.
+func (s *Space) GetIndexByFieldAndType(fieldName, indexType string) *Index {
+	if fieldName == "" || indexType == "" {
+		return nil
+	}
+	for _, idx := range s.Indexes {
+		if !strings.EqualFold(idx.Type, indexType) {
+			continue
+		}
+		if idx.FieldName == fieldName {
+			return idx
+		}
+		for _, fn := range idx.FieldNames {
+			if fn == fieldName {
+				return idx
+			}
+		}
+	}
+	// Fallback to per-property index declarations (single-index legacy
+	// shape). SpaceProperties[fieldName].Index is the authoritative
+	// per-field index when Indexes is empty.
+	if pro, ok := s.SpaceProperties[fieldName]; ok && pro != nil && pro.Index != nil {
+		if strings.EqualFold(pro.Index.Type, indexType) {
+			// Synthesise an Index view so callers always get a
+			// non-nil result with FieldName set.
+			return &Index{
+				Name:      pro.Index.Name,
+				Type:      pro.Index.Type,
+				FieldName: fieldName,
+				Params:    pro.Index.Params,
+			}
+		}
+	}
+	return nil
+}
+
+// IsVectorField reports whether the named field is a vector field.
+// Only vector fields need a rebuild; scalar indexes (SCALAR, INVERTED,
+// BITMAP, COMPOSITE, etc.) are updated continuously in the background
+// and do not require an explicit rebuild — the C++ Engine::RebuildFieldIndex
+// short-circuits them by returning 0 immediately.
+func (s *Space) IsVectorField(fieldName string) bool {
+	if pro, ok := s.SpaceProperties[fieldName]; ok && pro != nil {
+		return pro.FieldType == vearchpb.FieldType_VECTOR
+	}
+	return false
+}
+
+// AllIndexTargets returns the (field, indexType) tuples that the rebuild
+// scheduler should process. Only vector fields are included — scalar
+// indexes are updated continuously in the background and do not require
+// an explicit rebuild.
+func (s *Space) AllIndexTargets() []IndexTarget {
+	out := make([]IndexTarget, 0, len(s.Indexes))
+	seen := make(map[string]struct{})
+	add := func(field, typ string) {
+		if field == "" || typ == "" {
+			return
+		}
+		// Skip non-vector fields: rebuild only applies to vector indexes.
+		if !s.IsVectorField(field) {
+			return
+		}
+		k := field + "\x00" + strings.ToLower(typ)
+		if _, dup := seen[k]; dup {
+			return
+		}
+		seen[k] = struct{}{}
+		out = append(out, IndexTarget{FieldName: field, IndexType: typ})
+	}
+	for _, idx := range s.Indexes {
+		if idx == nil {
+			continue
+		}
+		if idx.FieldName != "" {
+			add(idx.FieldName, idx.Type)
+		}
+		for _, fn := range idx.FieldNames {
+			add(fn, idx.Type)
+		}
+	}
+	if len(out) == 0 {
+		// Legacy fallback: derive from SpaceProperties.
+		for fieldName, pro := range s.SpaceProperties {
+			if pro != nil && pro.Index != nil {
+				add(fieldName, pro.Index.Type)
+			}
+		}
+	}
+	return out
+}
+
 func (s *Space) PartitionIdsByRangeField(value []byte, field_type vearchpb.FieldType) ([]PartitionID, error) {
 	pids := make([]PartitionID, 0)
 	if len(s.Partitions) == 1 {
@@ -255,6 +380,7 @@ func (index *Index) UnmarshalJSON(bs []byte) error {
 		"SCANN":          "SCANN",
 		"SCALAR":         "SCALAR",
 		"IVFRABITQ":      "IVFRABITQ",
+		"DISKANN_STATIC": "DISKANN_STATIC",
 		"INVERTED":       "INVERTED",
 		"BITMAP":         "BITMAP",
 		"COMPOSITE":      "COMPOSITE",

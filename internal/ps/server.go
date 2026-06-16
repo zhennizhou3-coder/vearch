@@ -44,7 +44,7 @@ const maxTryTime = 5
 var (
 	defaultConcurrentNum = 256
 	defaultRpcTimeOut    = 10 // 10 seconds
-	defaultMinotorPort   = 8818
+	defaultMinotorPort   = 18818
 )
 
 // Server partition server
@@ -70,6 +70,8 @@ type Server struct {
 	rpcTimeOut               int
 	backupStatus             map[uint32]int
 	backupManager            BackupManager
+	rebuildManager           RebuildManager
+	rebuildOnce              sync.Once
 }
 
 // NewServer creates a server instance
@@ -172,6 +174,15 @@ func (s *Server) Start() error {
 
 	ExportToRpcHandler(s)
 	ExportToRpcAdminHandler(s)
+
+	// Rebuild tasks are intentionally NOT recovered across PS restarts.
+	// The PS is treated as a stateless executor: any in-flight rebuild
+	// that survives a process crash is reported "missing" to the master
+	// on the next status poll, and the master scheduler decides whether
+	// to redispatch via its space-level retry budget. See the design
+	// note at the top of rebuild_manager.go for why a "PS recovers and
+	// resumes" model is unsafe (the engine cannot prove a half-built
+	// index is clean).
 
 	log.Info("ps server successfully started...")
 

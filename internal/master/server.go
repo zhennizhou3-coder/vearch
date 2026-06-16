@@ -114,6 +114,31 @@ func (s *Server) Start() (err error) {
 	// start backup service (including backup monitor and version manager)
 	service.Backup().Start()
 
+	// start rebuild service (including rebuild manager)
+	//
+	// P0-#1 / P1-#3: a rebuild scheduler must run on exactly one master
+	// at a time. We pick the leader-checker based on deployment mode:
+	//
+	//   - Embedded etcd: consult the local etcdserver for raft leadership.
+	//     This is essentially free (no extra etcd traffic) and always
+	//     consistent with raft itself.
+	//   - User-managed etcd (SelfManageEtcd=true): the master has no
+	//     embedded etcdserver, so we elect via a cluster-wide etcd lock.
+	//     The campaign goroutine acquires the lock, holds it via
+	//     KeepAlive, and surfaces "am I the lock holder?" to the
+	//     scheduler. A dying leader's lease expires within ttl seconds
+	//     and another replica takes over.
+	if config.Conf().Global.SelfManageEtcd {
+		isLeader := service.Rebuild().StartEtcdLeaderCampaign(s.ctx, 30*time.Second)
+		service.Rebuild().SetLeaderChecker(isLeader)
+	} else if s.etcdServer != nil {
+		etcdSrv := s.etcdServer.Server
+		service.Rebuild().SetLeaderChecker(func() bool {
+			return uint64(etcdSrv.ID()) == etcdSrv.Lead()
+		})
+	}
+	service.Rebuild().Start()
+
 	monitorService := &monitorService{}
 	if config.Conf().Global.SelfManageEtcd {
 		monitorService = newMonitorService(service, &etcdserver.EtcdServer{})
@@ -121,9 +146,12 @@ func (s *Server) Start() (err error) {
 		monitorService = newMonitorService(service, s.etcdServer.Server)
 	}
 
-	gin.SetMode(gin.ReleaseMode)
+	if !log.IsDebugEnabled() {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
 	// start http server
+
 	httpServer := gin.New()
 	httpServer.Use(func(c *gin.Context) {
 		rid := c.GetHeader("X-Request-Id")

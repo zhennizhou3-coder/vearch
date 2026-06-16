@@ -328,10 +328,10 @@ int GammaIVFPQGPUIndex::Indexing() {
     gpu_index_ = CreateGPUIndex();
     {
       RawVector *raw_vec = dynamic_cast<RawVector *>(vector_);
-      size_t vectors_count = raw_vec->MetaInfo()->Size();
 
       size_t num;
-      if (vectors_count <= training_threshold_) {
+      size_t vectors_count = raw_vec->MetaInfo()->Size();
+      if (vectors_count <= (size_t)training_threshold_) {
         num = vectors_count;
         LOG(INFO) << "force merge all vectors for training, num=" << num;
       } else {
@@ -345,40 +345,27 @@ int GammaIVFPQGPUIndex::Indexing() {
           num = training_threshold_;
         }
       }
-      if (num > vectors_count) {
-        LOG(ERROR) << "vector total count [" << vectors_count
+
+      // Use GetRandomTrainVectors instead of GetVectorHeader:
+      //   - Filters out deleted vectors (bitmap check)
+      //   - Randomly samples training data for better cluster quality
+      ScopeVectors headers;
+      size_t n_get = 0;
+      size_t valid_count = 0;
+      int ret = raw_vec->GetRandomTrainVectors(num, headers, n_get,
+                                               valid_count);
+      if (ret != 0) {
+        LOG(ERROR) << "GetRandomTrainVectors failed, ret=" << ret;
+        return ret;
+      }
+
+      if (num > valid_count) {
+        LOG(ERROR) << "valid vector count [" << valid_count
                    << "] less then training_threshold[" << num << "], failed!";
         return -1;
       }
 
-      ScopeVectors headers;
-      std::vector<int> lens;
-      raw_vec->GetVectorHeader(0, num, headers, lens);
-
-      // merge vectors
-      int raw_d = raw_vec->MetaInfo()->Dimension();
-      const uint8_t *train_raw_vec = nullptr;
-      utils::ScopeDeleter1<uint8_t> del_train_raw_vec;
-      size_t n_get = 0;
-      if (lens.size() == 1) {
-        train_raw_vec = headers.Get(0);
-        n_get = lens[0];
-        if (num > training_threshold_ && num > n_get) {
-          LOG(ERROR) << "training vector get count [" << n_get
-                     << "] less then training_threshold[" << num
-                     << "], failed!";
-          return -2;
-        }
-      } else {
-        train_raw_vec = new uint8_t[raw_d * num * sizeof(float)];
-        del_train_raw_vec.set(train_raw_vec);
-        size_t offset = 0;
-        for (size_t i = 0; i < headers.Size(); ++i) {
-          memcpy((void *)(train_raw_vec + offset), (void *)headers.Get(i),
-                 sizeof(float) * raw_d * lens[i]);
-          offset += sizeof(float) * raw_d * lens[i];
-        }
-      }
+      const uint8_t *train_raw_vec = headers.Get(0);
       LOG(INFO) << "train vector wanted num=" << num << ", real num=" << n_get;
 
       gpu_index_->train(n_get, reinterpret_cast<const float *>(train_raw_vec));

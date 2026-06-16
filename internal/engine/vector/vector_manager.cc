@@ -160,7 +160,7 @@ void VectorManager::DestroyRawVectors() {
 }
 
 Status VectorManager::CreateVectorIndex(
-    std::string &index_type, std::string &index_params, RawVector *vec,
+    const std::string &index_type, const std::string &index_params, RawVector *vec,
     int training_threshold, bool destroy_vec,
     std::map<std::string, IndexModel *> &vector_indexes) {
   std::string vec_name = vec->MetaInfo()->Name();
@@ -338,6 +338,151 @@ Status VectorManager::ReCreateVectorIndexes(int training_threshold) {
   }
   pthread_rwlock_unlock(&index_rwmutex_);
   return status;
+}
+
+Status VectorManager::ReCreateVectorIndex(const std::string &field_name,
+                                          const std::string &index_type,
+                                          int training_threshold) {
+  std::string target_index_name = IndexName(field_name, index_type);
+
+  pthread_rwlock_wrlock(&index_rwmutex_);
+
+  // Find and destroy the existing index for (field_name, index_type).
+  auto it = vector_indexes_.find(target_index_name);
+  if (it != vector_indexes_.end()) {
+    if (it->second != nullptr) {
+      delete it->second;
+    }
+    vector_indexes_.erase(it);
+    LOG(INFO) << desc_ << "removed vector index: " << target_index_name;
+  } else {
+    LOG(INFO) << desc_ << "no existing vector index found for "
+              << target_index_name << ", will create new one";
+  }
+
+  // Look up the RawVector for this field.
+  auto vec_it = raw_vectors_.find(field_name);
+  if (vec_it == raw_vectors_.end() || vec_it->second == nullptr) {
+    pthread_rwlock_unlock(&index_rwmutex_);
+    std::string msg = "raw vector not found for field: " + field_name;
+    LOG(ERROR) << desc_ << msg;
+    return Status::ParamError(msg);
+  }
+
+  RawVector *vec = vec_it->second;
+
+  // Find the index_params_ entry matching the requested index_type.
+  std::string index_param;
+  for (size_t i = 0; i < index_types_.size(); ++i) {
+    if (index_types_[i] == index_type) {
+      index_param = index_params_[i];
+      break;
+    }
+  }
+  if (index_param.empty() && !index_params_.empty()) {
+    // Fallback: use the first index_params_ entry if no exact match.
+    index_param = index_params_[0];
+  }
+
+  // Create the new index for this specific (field, type).
+  std::map<std::string, IndexModel *> new_indexes;
+  Status status = CreateVectorIndex(index_type, index_param, vec,
+                                    training_threshold, false, new_indexes);
+  if (!status.ok()) {
+    LOG(ERROR) << desc_ << "CreateVectorIndex for " << target_index_name
+               << " failed: " << status.ToString();
+    // Clean up any partial index.
+    for (auto &[name, idx] : new_indexes) {
+      if (idx != nullptr) delete idx;
+    }
+    pthread_rwlock_unlock(&index_rwmutex_);
+    return status;
+  }
+
+  // Install the newly created index into vector_indexes_.
+  for (auto &[name, idx] : new_indexes) {
+    vector_indexes_[name] = idx;
+    LOG(INFO) << desc_ << "set " << name << " index";
+  }
+
+  pthread_rwlock_unlock(&index_rwmutex_);
+  LOG(INFO) << desc_ << "ReCreateVectorIndex for " << target_index_name
+            << " success";
+  return Status::OK();
+}
+
+Status VectorManager::RebuildVectorIndex(const std::string &field_name,
+                                         const std::string &index_type,
+                                         int training_threshold,
+                                         bool do_train) {
+  std::string target_index_name = IndexName(field_name, index_type);
+
+  // Look up the RawVector for this field.
+  auto vec_it = raw_vectors_.find(field_name);
+  if (vec_it == raw_vectors_.end() || vec_it->second == nullptr) {
+    std::string msg = "raw vector not found for field: " + field_name;
+    LOG(ERROR) << desc_ << msg;
+    return Status::ParamError(msg);
+  }
+  RawVector *vec = vec_it->second;
+
+  // Find the index_params entry matching the requested index_type.
+  std::string index_param;
+  for (size_t i = 0; i < index_types_.size(); ++i) {
+    if (index_types_[i] == index_type) {
+      index_param = index_params_[i];
+      break;
+    }
+  }
+  if (index_param.empty() && !index_params_.empty()) {
+    // Fallback: use the first index_params entry if no exact match.
+    index_param = index_params_[0];
+  }
+
+  // Step 1: Create a new index model (without destroying the old one).
+  std::map<std::string, IndexModel *> new_indexes;
+  Status status = CreateVectorIndex(index_type, index_param, vec,
+                                    training_threshold, false, new_indexes);
+  if (!status.ok()) {
+    LOG(ERROR) << desc_ << "RebuildVectorIndex CreateVectorIndex for "
+               << target_index_name << " failed: " << status.ToString();
+    for (auto &[name, idx] : new_indexes) {
+      if (idx != nullptr) delete idx;
+    }
+    return status;
+  }
+
+  // Step 2: Train the new index if requested.
+  if (do_train) {
+    int ret = TrainIndex(new_indexes);
+    if (ret != 0) {
+      LOG(ERROR) << desc_ << "RebuildVectorIndex TrainIndex for "
+                 << target_index_name << " failed, ret=" << ret;
+      for (auto &[name, idx] : new_indexes) {
+        if (idx != nullptr) delete idx;
+      }
+      return Status::IOError("TrainIndex failed");
+    }
+  }
+
+  // Step 3: Swap the new index in, replacing the old one for this field.
+  pthread_rwlock_wrlock(&index_rwmutex_);
+  auto it = vector_indexes_.find(target_index_name);
+  if (it != vector_indexes_.end()) {
+    if (it->second != nullptr) {
+      delete it->second;
+    }
+    vector_indexes_.erase(it);
+  }
+  for (auto &[name, idx] : new_indexes) {
+    vector_indexes_[name] = idx;
+    LOG(INFO) << desc_ << "set " << name << " index";
+  }
+  pthread_rwlock_unlock(&index_rwmutex_);
+
+  LOG(INFO) << desc_ << "RebuildVectorIndex for " << target_index_name
+            << " success";
+  return Status::OK();
 }
 
 Status VectorManager::CreateVectorTable(TableInfo &table,
@@ -523,7 +668,7 @@ int VectorManager::Update(
     pthread_rwlock_rdlock(&index_rwmutex_);
     for (std::string &index_type : index_types_) {
       auto it = vector_indexes_.find(IndexName(name, index_type));
-      if (it != vector_indexes_.end()) {
+      if (it != vector_indexes_.end() && it->second->SupportIncrement()) {
         it->second->updated_vids_.push(docid);
       }
     }
@@ -543,6 +688,9 @@ int VectorManager::Delete(int64_t docid) {
   }
   pthread_rwlock_rdlock(&index_rwmutex_);
   for (const auto &[name, index] : vector_indexes_) {
+    if (!index->SupportIncrement()) {
+      continue;
+    }
     std::vector<int64_t> vids;
     vids.resize(1);
     vids[0] = docid;
@@ -574,6 +722,12 @@ int VectorManager::AddRTVecsToIndex(bool &index_is_dirty) {
   index_is_dirty = false;
   pthread_rwlock_rdlock(&index_rwmutex_);
   for (const auto &[name, index_model] : vector_indexes_) {
+    if (!index_model->SupportIncrement()) {
+      int64_t vid;
+      while (index_model->updated_vids_.try_pop(vid)) {
+      }
+      continue;
+    }
     RawVector *raw_vec = dynamic_cast<RawVector *>(index_model->vector_);
     int64_t total_stored_vecs = raw_vec->MetaInfo()->Size();
     int64_t indexed_vec_count = index_model->indexed_count_;
@@ -1391,6 +1545,16 @@ void VectorManager::AddIndexTypeAndParam(const std::string &index_type,
   index_params_.push_back(index_param);
   LOG(INFO) << desc_ << "Added index type: " << index_type
             << ", index param: " << index_param;
+}
+
+bool VectorManager::SupportIncrement() {
+  for (const auto &it : vector_indexes_) {
+    IndexModel *idx = it.second;
+    if (idx != nullptr && !idx->SupportIncrement()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 int VectorManager::MinIndexedNum() {

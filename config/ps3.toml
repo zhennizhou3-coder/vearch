@@ -1,0 +1,70 @@
+# PS instance 3.
+# Start with: vearch -conf config/ps3.toml ps
+
+[global]
+    name = "vearch_test"
+    resource_name = "default"
+    data = ["data/ps3/"]
+    log = "logs/ps3/"
+    level = "info"
+    signkey = "secret"
+    skip_auth = false
+    self_manage_etcd = false
+    auto_recover_ps = true
+    raft_consistent = false
+    resource_limit_rate = 0.85
+
+[[masters]]
+    name = "m1"
+    address = "127.0.0.1"
+    api_port = 28817
+    etcd_port = 22378
+    etcd_peer_port = 22390
+    etcd_client_port = 22370
+    cluster_state = "new"
+    pprof_port = 26062
+    monitor_port = 28821
+
+[[masters]]
+    name = "m2"
+    address = "127.0.0.1"
+    api_port = 28827
+    etcd_port = 22388
+    etcd_peer_port = 22391
+    etcd_client_port = 22371
+    cluster_state = "new"
+    pprof_port = 26072
+    monitor_port = 28831
+
+[[masters]]
+    name = "m3"
+    address = "127.0.0.1"
+    api_port = 28837
+    etcd_port = 22398
+    etcd_peer_port = 22392
+    etcd_client_port = 22372
+    cluster_state = "new"
+    pprof_port = 26082
+    monitor_port = 28841
+
+[router]
+    port = 19001
+    pprof_port = 16061
+    plugin_path = "plugin"
+
+[ps]
+    rpc_port = 18083
+    raft_heartbeat_port = 18902
+    raft_replicate_port = 18903
+    pprof_port = 16064
+    ps_heartbeat_timeout = 5
+    heartbeat-interval = 200
+    raft_retain_logs = 20000000
+    raft_replica_concurrency = 1
+    raft_snap_concurrency = 1
+    raft_truncate_count = 500000
+    raft_diff_count = 10000
+    replica_auto_recover_time = 1800
+    private = false
+    flush_time_interval = 600
+    flush_count_threshold = 200000

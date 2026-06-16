@@ -342,3 +342,82 @@ func operatePsMemLimitCfg(method, addr string, cfg *entity.MemoryLimitCfg) error
 func UpdateMemoryLimitCfg(addr string, cfg *entity.MemoryLimitCfg) error {
 	return operatePsMemLimitCfg(MemoryLimitHandler, addr, cfg)
 }
+
+// ExecuteRebuildIndex executes rebuild index on a partition server.
+//
+// fieldName + indexType identify which (field, indexType) target this RPC
+// is rebuilding. They are part of the PS-side task identity so the master
+// can dispatch and poll multiple targets per (space, pid) without name
+// collision (one space at a time per PS still — that invariant is
+// enforced upstream by the scheduler).
+func ExecuteRebuildIndex(addr string, spaceKey, fieldName, indexType string,
+	pid entity.PartitionID, dropBefore int, limitCPU int, describe int) error {
+	param := &entity.RebuildIndexParam{
+		SpaceKey:   spaceKey,
+		FieldName:  fieldName,
+		IndexType:  indexType,
+		DropBefore: dropBefore,
+		LimitCPU:   limitCPU,
+		Describe:   describe,
+	}
+	value, err := vjson.Marshal(param)
+	if err != nil {
+		return err
+	}
+
+	args := &vearchpb.PartitionData{PartitionID: pid, Data: value, Type: vearchpb.OpType_CREATE}
+	reply := new(vearchpb.PartitionData)
+	err = Execute(addr, RebuildIndexHandler, args, reply)
+	if err != nil {
+		log.Error("ExecuteRebuildIndex RPC error: %v", err)
+		return err
+	}
+	if reply.Err.Code != vearchpb.ErrorEnum_SUCCESS {
+		log.Error("ExecuteRebuildIndex RPC reply error code: %v", reply.Err.Code)
+		return vearchpb.NewError(reply.Err.Code, nil)
+	}
+
+	log.Info("ExecuteRebuildIndex RPC success: addr=%s, spaceKey=%s, field=%s, indexType=%s, pid=%d",
+		addr, spaceKey, fieldName, indexType, pid)
+	return nil
+}
+
+// GetRebuildStatus queries partition rebuild status for a specific
+// (field, indexType) target. The (spaceKey, pid, fieldName, indexType)
+// tuple is the PS-side task identity key.
+func GetRebuildStatus(addr string, spaceKey, fieldName, indexType string,
+	pid entity.PartitionID) (*entity.RebuildStatusResponse, error) {
+	query := &entity.RebuildStatusQuery{
+		SpaceKey:  spaceKey,
+		FieldName: fieldName,
+		IndexType: indexType,
+	}
+
+	value, err := vjson.Marshal(query)
+	if err != nil {
+		return nil, err
+	}
+
+	args := &vearchpb.PartitionData{PartitionID: pid, Data: value, Type: vearchpb.OpType_GET}
+	reply := new(vearchpb.PartitionData)
+	err = Execute(addr, RebuildStatusHandler, args, reply)
+	if err != nil {
+		log.Error("GetRebuildStatus RPC error: %v", err)
+		return nil, err
+	}
+
+	if reply.Err.Code != vearchpb.ErrorEnum_SUCCESS {
+		log.Error("GetRebuildStatus RPC reply error code: %v", reply.Err.Code)
+		return nil, vearchpb.NewError(reply.Err.Code, nil)
+	}
+
+	response := &entity.RebuildStatusResponse{}
+	if err := vjson.Unmarshal(reply.Data, response); err != nil {
+		log.Error("GetRebuildStatus unmarshal error: %v", err)
+		return nil, err
+	}
+
+	log.Info("GetRebuildStatus RPC success: addr=%s, spaceKey=%s, field=%s, indexType=%s, pid=%d, status=%d, progress=%d%%",
+		addr, spaceKey, fieldName, indexType, pid, response.Status, response.Progress)
+	return response, nil
+}

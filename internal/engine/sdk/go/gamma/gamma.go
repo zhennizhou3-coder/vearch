@@ -145,8 +145,18 @@ func BuildIndex(engine unsafe.Pointer) int {
 	return int(C.BuildIndex(engine))
 }
 
-func RebuildIndex(engine unsafe.Pointer, drop_before_rebuild int, limit_cpu int, describe int) int {
-	return int(C.RebuildIndex(engine, C.int(drop_before_rebuild), C.int(limit_cpu), C.int(describe)))
+// RebuildFieldIndex rebuilds the index for a specific (field, indexType) pair.
+// When fieldName is empty, the C++ Engine::RebuildFieldIndex internally falls
+// back to Engine::RebuildIndex (whole-partition rebuild). This is the single
+// CGO entry point for all rebuild operations — callers should always use this
+// function instead of the removed RebuildIndex wrapper.
+func RebuildFieldIndex(engine unsafe.Pointer, fieldName, indexType string, dropBeforeRebuild int, limitCPU int, describe int) int {
+	cFieldName := C.CString(fieldName)
+	defer C.free(unsafe.Pointer(cFieldName))
+	cIndexType := C.CString(indexType)
+	defer C.free(unsafe.Pointer(cIndexType))
+	return int(C.RebuildFieldIndex(engine, cFieldName, cIndexType,
+		C.int(dropBeforeRebuild), C.int(limitCPU), C.int(describe)))
 }
 
 func Dump(engine unsafe.Pointer) int {

@@ -25,8 +25,8 @@ from multiprocessing import Pool as ThreadPool
 import numpy as np
 import datetime
 
-router_url = os.getenv("ROUTER_URL", "http://127.0.0.1:9001")
-master_url = os.getenv("MASTER_URL", "http://127.0.0.1:8817")
+router_url = os.getenv("ROUTER_URL", "http://127.0.0.1:19001")
+master_url = os.getenv("MASTER_URL", "http://127.0.0.1:28817")
 db_name = "ts_db"
 space_name = "ts_space"
 username = "root"
@@ -1383,7 +1383,7 @@ def prepare_cluster_for_document_test(total, xb, partition_num=1):
     query_interface(total_batch, batch_size, xb, full_field, seed, "by_ids")
 
 
-def waiting_index_finish(total, timewait=5, space_name=space_name):
+def waiting_index_finish(total, timewait=5, space_name=space_name, db_name=db_name):
     url = router_url + "/dbs/" + db_name + "/spaces/" + space_name
     num = 0
     while num < total:
@@ -1400,6 +1400,29 @@ def waiting_index_finish(total, timewait=5, space_name=space_name):
             logger.debug("waiting index finish, num is 0, "+response.text)
         logger.debug("index num: %d" % (num))
         time.sleep(timewait)
+
+
+def waiting_index_finish_with_timeout(
+    total, timewait=5, space_name=space_name, db_name=db_name, max_rounds=200
+):
+    """Like waiting_index_finish but fails after max_rounds (for slow builds e.g. DiskANN)."""
+    url = router_url + "/dbs/" + db_name + "/spaces/" + space_name
+    for round_i in range(max_rounds):
+        num = 0
+        response = requests.get(url, auth=(username, password))
+        if response.json()["code"] != 0:
+            logger.error(
+                "waiting index finish, response code is not 0, " + response.text
+            )
+            break
+        partitions = response.json()["data"]["partitions"]
+        for p in partitions:
+            num += p["index_num"]
+        logger.info("index num: %d (round %d)" % (num, round_i))
+        if num >= total:
+            return
+        time.sleep(timewait)
+    assert False, "index_num did not reach %d within %d rounds" % (total, max_rounds)
 
 
 def get_space_num(space_name: str = space_name):

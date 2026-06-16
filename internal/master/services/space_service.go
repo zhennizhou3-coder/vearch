@@ -311,6 +311,17 @@ func (s *SpaceService) DeleteSpace(ctx context.Context, as *AliasService, dbName
 		return err
 	}
 
+	// Also drop any rebuild record bound to this space. Without this the
+	// scheduler's PrefixScan(PrefixRebuild) keeps surfacing the orphan
+	// record every tick; if its Status is still running, psBusy gets
+	// rebuilt with its NodeIDs marked busy, blocking dispatch of any
+	// future rebuild on those PSs until master is restarted. The space
+	// is gone — its rebuild record must go with it.
+	if err := masterClient.Delete(ctx, entity.RebuildSpaceKey(dbName, spaceName)); err != nil {
+		log.Error("delete rebuild record for space:[%s/%s] err:[%s]",
+			dbName, spaceName, err.Error())
+	}
+
 	return nil
 }
 
@@ -394,9 +405,12 @@ func (s *SpaceService) DescribeSpace(ctx context.Context, space *entity.Space, s
 
 		replicasStatus := make(map[entity.NodeID]string)
 		for nodeID, status := range partition.ReStatusMap {
-			if status == entity.ReplicasOK {
+			switch status {
+			case entity.ReplicasOK:
 				replicasStatus[nodeID] = "ReplicasOK"
-			} else {
+			case entity.ReplicasRebuilding:
+				replicasStatus[nodeID] = "ReplicasRebuilding"
+			default:
 				replicasStatus[nodeID] = "ReplicasNotReady"
 			}
 		}

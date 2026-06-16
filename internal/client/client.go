@@ -561,7 +561,13 @@ func (r *routerRequest) searchFromPartition(ctx context.Context, partitionID ent
 	serverCache := r.client.Master().Cache().serverCache
 
 	rpcEnd, rpcStart := time.Now(), time.Now()
-	nodeID := GetNodeIdsByClientType(clientType, partition, serverCache, r.client)
+	nodeID, leaderFellBack := GetNodeIdsByClientType(clientType, partition, serverCache, r.client)
+	if leaderFellBack {
+		// Falling back to a follower while still asking PS for a
+		// leader-typed read would be rejected by checkReadable.
+		// Downgrade the request header so PS serves it.
+		pd.SearchRequest.Head.ClientType = ""
+	}
 
 	faultyNodeNum := r.replicasFaultyNum(partition.Replicas)
 	retryTime := 0
@@ -670,10 +676,21 @@ func (r *routerRequest) searchFromPartition(ctx context.Context, partitionID ent
 		log.Error("nodeID %v partitionID: %d rpc err [%v], retryTime: %d, len(partition.Replicas)=%d, faultyNodeNum: %d", nodeID, partitionID, retry_err, retryTime, len(partition.Replicas), faultyNodeNum)
 		if strings.Contains(retry_err.Error(), "connect: connection refused") {
 			r.client.PS().AddFaulty(nodeID, time.Second*30)
+		} else if clientType == request.Leader && isPartitionNotLeaderErr(retry_err) {
+			// Leader-typed read landed on a node that won't serve it
+			// (rebuild fallback that PS rejected, stale leader cache,
+			// or a leadership flip mid-request). Downgrade semantics
+			// and retry against a non-leader replica.
+			log.Warn("partition %d leader-typed read got PARTITION_NOT_LEADER from nodeID=%d, downgrading to non-leader and retrying", partitionID, nodeID)
+			clientType = request.NotLeader
+			pd.SearchRequest.Head.ClientType = ""
 		} else {
 			break
 		}
-		nodeID = GetNodeIdsByClientType(clientType, partition, serverCache, r.client)
+		nodeID, leaderFellBack = GetNodeIdsByClientType(clientType, partition, serverCache, r.client)
+		if leaderFellBack {
+			pd.SearchRequest.Head.ClientType = ""
+		}
 
 		faultyNodeNum = r.replicasFaultyNum(partition.Replicas)
 		retryTime++
@@ -971,7 +988,10 @@ func (r *routerRequest) queryFromPartition(ctx context.Context, partitionID enti
 	// ensure node is alive
 	servers := r.client.Master().Cache().serverCache
 
-	nodeID := GetNodeIdsByClientType(clientType, partition, servers, r.client)
+	nodeID, leaderFellBack := GetNodeIdsByClientType(clientType, partition, servers, r.client)
+	if leaderFellBack {
+		pd.QueryRequest.Head.ClientType = ""
+	}
 
 	faultyNodeNum := r.replicasFaultyNum(partition.Replicas)
 	retryTime := 0
@@ -1005,10 +1025,17 @@ func (r *routerRequest) queryFromPartition(ctx context.Context, partitionID enti
 		log.Error("nodeID %v partitionID: %d rpc err [%v], retryTime: %d, len(partition.Replicas)=%d, faultyNodeNum: %d", nodeID, partitionID, retry_err, retryTime, len(partition.Replicas), faultyNodeNum)
 		if strings.Contains(retry_err.Error(), "connect: connection refused") {
 			r.client.PS().AddFaulty(nodeID, time.Second*30)
+		} else if clientType == request.Leader && isPartitionNotLeaderErr(retry_err) {
+			log.Warn("partition %d leader-typed read got PARTITION_NOT_LEADER from nodeID=%d, downgrading to non-leader and retrying", partitionID, nodeID)
+			clientType = request.NotLeader
+			pd.QueryRequest.Head.ClientType = ""
 		} else {
 			break
 		}
-		nodeID = GetNodeIdsByClientType(clientType, partition, servers, r.client)
+		nodeID, leaderFellBack = GetNodeIdsByClientType(clientType, partition, servers, r.client)
+		if leaderFellBack {
+			pd.QueryRequest.Head.ClientType = ""
+		}
 
 		faultyNodeNum = r.replicasFaultyNum(partition.Replicas)
 		retryTime++
@@ -1346,10 +1373,90 @@ func (r *routerRequest) SearchByPartitions(searchReq *vearchpb.SearchRequest) *r
 
 var replicaRoundRobin = newRoundRobin[entity.PartitionID, entity.NodeID]()
 
-func GetNodeIdsByClientType(clientType string, partition *entity.Partition, servers *cache.Cache, client *Client) entity.NodeID {
+// isReplicaRebuilding reports whether a replica is currently being
+// rebuilt and therefore must not receive query traffic. The state is
+// set by the master rebuild scheduler in partition.ReStatusMap and
+// cleared on rebuild terminal. Independent of RaftConsistent: any
+// deployment must skip rebuilding replicas because the engine layer
+// is mid-swap and may return inconsistent results.
+func isReplicaRebuilding(partition *entity.Partition, nodeID entity.NodeID) bool {
+	if partition == nil || partition.ReStatusMap == nil {
+		return false
+	}
+	return partition.ReStatusMap[nodeID] == entity.ReplicasRebuilding
+}
+
+// isPartitionNotLeaderErr reports whether a PS rpc error is the
+// PARTITION_NOT_LEADER signal — either via a typed VearchErr or via
+// a string match on the wrapped error message.
+func isPartitionNotLeaderErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if vErr, ok := err.(*vearchpb.VearchErr); ok {
+		return vErr.GetError().Code == vearchpb.ErrorEnum_PARTITION_NOT_LEADER
+	}
+	return strings.Contains(err.Error(), vearchpb.ErrMsg(vearchpb.ErrorEnum_PARTITION_NOT_LEADER))
+}
+
+// pickHealthyNonRebuildingReplica picks a replica suitable as a
+// fallback target when the originally chosen replica (typically the
+// leader) is rebuilding. Filters apply the same liveness/health checks
+// as the Random path. Returns 0 when no candidate is available.
+func pickHealthyNonRebuildingReplica(partition *entity.Partition,
+	servers *cache.Cache, client *Client, excludeNodeID entity.NodeID) entity.NodeID {
+	candidates := make([]entity.NodeID, 0)
+	for _, nodeID := range partition.Replicas {
+		if nodeID == excludeNodeID {
+			continue
+		}
+		if _, ok := servers.Get(cast.ToString(nodeID)); !ok {
+			continue
+		}
+		if client.PS().TestFaulty(nodeID) {
+			continue
+		}
+		if isReplicaRebuilding(partition, nodeID) {
+			continue
+		}
+		if config.Conf().Global.RaftConsistent &&
+			partition.ReStatusMap[nodeID] != entity.ReplicasOK {
+			continue
+		}
+		candidates = append(candidates, nodeID)
+	}
+	return replicaRoundRobin.Next(partition.Id, candidates)
+}
+
+// GetNodeIdsByClientType picks a target node for a partition request. The
+// second return value is true when the caller asked for the leader but we
+// fell back to a follower because the leader is mid-rebuild; the caller
+// must then downgrade request.Head.ClientType so the follower will accept
+// the read (PS rejects leader-typed reads on non-PA_READWRITE partitions).
+func GetNodeIdsByClientType(clientType string, partition *entity.Partition, servers *cache.Cache, client *Client) (entity.NodeID, bool) {
 	nodeId := uint64(0)
+	leaderFellBack := false
 	switch clientType {
 	case request.Leader:
+		// Leader path normally bypasses health checks. But if the
+		// leader is mid-rebuild we'd serve a query against an index
+		// that is being torn down/swapped. Fall back to a healthy
+		// non-rebuilding replica; this briefly relaxes strong-leader
+		// consistency but keeps the partition queryable. Per-partition
+		// serialization in the rebuild scheduler guarantees that at
+		// most one replica is rebuilding at a time, so a fallback
+		// candidate normally exists.
+		if isReplicaRebuilding(partition, partition.LeaderID) {
+			if fb := pickHealthyNonRebuildingReplica(partition, servers, client, partition.LeaderID); fb != 0 {
+				log.Warn("partition %d leader=%d rebuilding, fallback to nodeID=%d",
+					partition.Id, partition.LeaderID, fb)
+				nodeId = fb
+				leaderFellBack = true
+				break
+			}
+			log.Warn("partition %d leader=%d rebuilding and no fallback replica available; routing to leader anyway",
+				partition.Id, partition.LeaderID)
+		}
 		nodeId = partition.LeaderID
 	case request.NotLeader:
 		noLeaderIDs := make([]entity.NodeID, 0)
@@ -1359,6 +1466,9 @@ func GetNodeIdsByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if client.PS().TestFaulty(nodeID) {
+				continue
+			}
+			if isReplicaRebuilding(partition, nodeID) {
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1382,6 +1492,9 @@ func GetNodeIdsByClientType(clientType string, partition *entity.Partition, serv
 			if client.PS().TestFaulty(nodeID) {
 				continue
 			}
+			if isReplicaRebuilding(partition, nodeID) {
+				continue
+			}
 			if config.Conf().Global.RaftConsistent {
 				if partition.ReStatusMap[nodeID] == entity.ReplicasOK {
 					randIDs = append(randIDs, nodeID)
@@ -1402,6 +1515,9 @@ func GetNodeIdsByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if client.PS().TestFaulty(nodeID) {
+				continue
+			}
+			if isReplicaRebuilding(partition, nodeID) {
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1449,6 +1565,9 @@ func GetNodeIdsByClientType(clientType string, partition *entity.Partition, serv
 			if client.PS().TestFaulty(nodeID) {
 				continue
 			}
+			if isReplicaRebuilding(partition, nodeID) {
+				continue
+			}
 			if config.Conf().Global.RaftConsistent {
 				if partition.ReStatusMap[nodeID] == entity.ReplicasOK {
 					if server.HostZone == entity.HostZone {
@@ -1480,6 +1599,9 @@ func GetNodeIdsByClientType(clientType string, partition *entity.Partition, serv
 			if client.PS().TestFaulty(nodeID) {
 				continue
 			}
+			if isReplicaRebuilding(partition, nodeID) {
+				continue
+			}
 			if config.Conf().Global.RaftConsistent {
 				if partition.ReStatusMap[nodeID] == entity.ReplicasOK {
 					randIDs = append(randIDs, nodeID)
@@ -1490,7 +1612,7 @@ func GetNodeIdsByClientType(clientType string, partition *entity.Partition, serv
 		}
 		nodeId = replicaRoundRobin.Next(partition.Id, randIDs)
 	}
-	return nodeId
+	return nodeId, leaderFellBack
 }
 
 func AddMergeResultArr(dest []*vearchpb.SearchResult, src []*vearchpb.SearchResult) error {

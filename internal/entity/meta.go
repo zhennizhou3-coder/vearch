@@ -71,6 +71,14 @@ func LockRoleKey(rolename string) string {
 	return fmt.Sprintf("%s%s", PrefixLock, rolename)
 }
 
+// LockRebuildScheduler is the cluster-wide lock key used by the rebuild
+// scheduler to elect a single leader among multiple master replicas. Used
+// for the SelfManageEtcd code path where we don't have access to an
+// embedded etcdserver to consult for raft leadership (P1-#3).
+func LockRebuildScheduler() string {
+	return fmt.Sprintf("%srebuild_scheduler", PrefixLock)
+}
+
 // FailServerKey generate fail server key
 func FailServerKey(nodeID uint64) string {
 	return fmt.Sprintf("%s%d", PrefixFailServer, nodeID)
@@ -91,6 +99,12 @@ func AliasKey(aliasName string) string {
 
 func MasterMemberKey(ID uint64) string {
 	return fmt.Sprintf("%s%d", PrefixMasterMember, ID)
+}
+
+// RebuildSpaceKey returns the etcd key holding the SpaceRebuildRecord
+// for the given (dbName, spaceName) pair.
+func RebuildSpaceKey(dbName, spaceName string) string {
+	return fmt.Sprintf("%s%s/%s", PrefixRebuild, dbName, spaceName)
 }
 
 func LockAliasKey(aliasName string) string {
@@ -122,6 +136,7 @@ func SetPrefixAndSequence(cluster_id string) {
 	PrefixAlias = PrefixEtcdClusterID + PrefixAlias
 	PrefixRole = PrefixEtcdClusterID + PrefixRole
 	PrefixMasterMember = PrefixEtcdClusterID + PrefixMasterMember
+	PrefixRebuild = PrefixEtcdClusterID + PrefixRebuild
 }
 
 // sids sequence key for etcd
@@ -152,6 +167,7 @@ var (
 	PrefixAlias        = "/alias/"
 	PrefixRole         = "/role/"
 	PrefixMasterMember = "/member/"
+	PrefixRebuild      = "/rebuild/index/space/"
 )
 
 var PrefixEtcdClusterID = "/vearch/default/"

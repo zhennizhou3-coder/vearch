@@ -269,6 +269,16 @@ int RebuildIndex(void *engine, int drop_before_rebuild, int limit_cpu,
   return ret;
 }
 
+int RebuildFieldIndex(void *engine, const char *field_name,
+                      const char *index_type, int drop_before_rebuild,
+                      int limit_cpu, int describe) {
+  std::string field_str = field_name ? field_name : "";
+  std::string type_str = index_type ? index_type : "";
+  int ret = static_cast<vearch::Engine *>(engine)->RebuildFieldIndex(
+      field_str, type_str, drop_before_rebuild, limit_cpu, describe);
+  return ret;
+}
+
 void GetEngineStatus(void *engine, char **status_str, int *len) {
   std::string status = static_cast<vearch::Engine *>(engine)->EngineStatus();
   *len = status.length();
