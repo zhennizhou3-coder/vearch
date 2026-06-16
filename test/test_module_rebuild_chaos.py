@@ -268,7 +268,17 @@ def _ensure_clean_db():
 
 def _hnsw_cfg(name, pn=2, rn=2):
     dim = xb.shape[1]
-    return {"name": name, "partition_num": pn, "replica_num": rn,
+    # resource_name 必须显式传 "default":
+    # vearch master 代码里定义了 DefaultResourceName = "default" 常量
+    # (master/services/space_service.go:48) 但 *从来没* 在 CreateSpace
+    # 路径上把 space.ResourceName 默认填成它。结果如果客户端不传该字段,
+    # space.ResourceName = ""(空字符串),placement 时跟 PS 的
+    # ResourceName ("default") 比较 → 全部过滤掉 → "not enough partition
+    # servers" 假阴性。chaos 测试集群所有 PS toml 都是 resource_name=
+    # "default",对齐传 "default" 就能通过 placement 过滤。
+    return {"name": name,
+            "partition_num": pn, "replica_num": rn,
+            "resource_name": "default",
             "fields": [
                 {"name": "field_int", "type": "integer"},
                 {"name": "field_long", "type": "long"},

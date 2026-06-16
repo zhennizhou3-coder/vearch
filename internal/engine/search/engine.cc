@@ -1284,7 +1284,7 @@ int Engine::Indexing() {
     return -1;
   }
 
-  LOG(INFO) << space_name_ << " vector manager TrainIndex success! biu";
+  LOG(INFO) << space_name_ << " vector manager TrainIndex success!";
   int ret = 0;
   bool has_error = false;
 

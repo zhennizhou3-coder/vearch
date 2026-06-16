@@ -4,9 +4,7 @@ from typing import List, Union
 class RelationOperator:
     IN = "IN"
     NOT_IN = "NOT IN"
-    # EQ and NE support after vearch v3.5.8
-    EQ = "="
-    NE = "!="
+    # TODO EQ = "="
     GT = ">"
     GE = ">="
     LT = "<"
@@ -35,6 +33,16 @@ class Condition(object):
 
     def dict(self):
         return {"field": self.fv.field, "operator": self.relation_operator, "value": self.fv.value}
+
+
+class Conditions(object):
+    def __init__(self, operator: str, conditions: List[Condition]):
+        self.operator = operator
+        self.conditions = conditions
+
+    def dict(self):
+        conditions_dict = [condition.dict() for condition in self.conditions]
+        return {"operator": self.operator, "conditions": conditions_dict}
 
 
 class Filter(object):
@@ -89,6 +97,21 @@ class Filter(object):
                 "operator": "IN",
                 "field": "country",
                 "value": ["USA", "Canada", "UK"]
+            },
+            {
+                "operator": "OR",
+                "conditions": [
+                    {
+                        "operator": "=",
+                        "field": "gender",
+                        "value": "Male"
+                    },
+                    {
+                        "operator": "LIKE",
+                        "field": "occupation",
+                        "value": "Engineer"
+                    }
+                ]
             }
         ]
     }
@@ -98,11 +121,12 @@ class Filter(object):
     print(result)  # True if the data satisfies the filter condition, False otherwise
     """
 
-    def __init__(self, operator: str, conditions: List[Condition]):
+    def __init__(self, operator: str, conditions: Union[FieldValue, Union[Condition, Conditions]]):
         self.operator = operator
         self.conditions = conditions
 
     def dict(self):
         if self.operator not in BooleanOperators:
-            raise ValueError(f"Invalid operator: {self.operator}")
-        return {"operator": self.operator, "conditions": [condition.dict() for condition in self.conditions]}
+            return {"operator": self.operator, "field": self.conditions.field, "value": self.conditions.value}
+        conditions_dict = [condition.dict() for condition in self.conditions]
+        return {"operator": self.operator, "conditions": conditions_dict}

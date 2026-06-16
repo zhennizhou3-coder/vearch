@@ -1,6 +1,6 @@
 [global]
     # the name will validate join cluster by same name
-    name = "vearch_zhouzn"
+    name = "vearch"
     # specify which resources to use to create space
     resource_name = "default"
     # you data save to disk path ,If you are in a production environment, You'd better set absolute paths
@@ -29,7 +29,7 @@
     # etcd server ip or domain
     address = ["127.0.0.1"]
     # advertise_client_urls AND listen_client_urls
-    etcd_client_port = 22379
+    etcd_client_port = 2379
     # provider username and password,if you turn on auth
     user_name = "root"
     password = ""
@@ -41,37 +41,37 @@
     # ip or domain
     address = "127.0.0.1"
     # api port for http server
-    api_port = 28817
+    api_port = 8817
     # port for etcd server
-    etcd_port = 22378
+    etcd_port = 2378
     # listen_peer_urls List of comma separated URLs to listen on for peer traffic.
     # advertise_peer_urls List of this member's peer URLs to advertise to the rest of the cluster. The URLs needed to be a comma-separated list.
-    etcd_peer_port = 22390
+    etcd_peer_port = 2390
     # List of this member's client URLs to advertise to the public.
     # The URLs needed to be a comma-separated list.
     # advertise_client_urls AND listen_client_urls
-    etcd_client_port = 22370
+    etcd_client_port = 2370
     # init cluster state
     cluster_state = "new"
-    pprof_port = 26062
+    pprof_port = 6062
     # monitor
-    monitor_port = 28818
+    monitor_port = 8818
 
 [router]
     # port for server
-    port = 19001
+    port = 9001
     # rpc_port = 9002
-    pprof_port = 16061
+    pprof_port = 6061
     plugin_path = "plugin"
     allow_origins = ["http://google.com"]
 
 [ps]
     # port for server
-    rpc_port = 18081
+    rpc_port = 8081
     ps_heartbeat_timeout = 5 # seconds
     # raft config begin
-    raft_heartbeat_port = 18898
-    raft_replicate_port = 18899
+    raft_heartbeat_port = 8898
+    raft_replicate_port = 8899
     heartbeat-interval = 200 # ms
     raft_retain_logs = 20000000
     raft_replica_concurrency = 1

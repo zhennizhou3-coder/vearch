@@ -228,7 +228,7 @@ func (handler *DocumentHandler) proxyMaster(group *gin.RouterGroup) error {
 	group.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
 	group.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s",
 		URLParamDbName, URLParamSpaceName, URLParamFieldName, URLParamIndexType), handler.handleMasterRequest)
-
+	
 	group.GET("/rebuild/index/dbs", handler.handleMasterRequest)
 	group.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/progress", URLParamDbName), handler.handleMasterRequest)
 	group.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/progress", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
@@ -237,8 +237,8 @@ func (handler *DocumentHandler) proxyMaster(group *gin.RouterGroup) error {
 	group.POST("/cancel/rebuild/index/dbs", handler.handleMasterRequest)
 	group.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s", URLParamDbName), handler.handleMasterRequest)
 	group.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
-	group.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s",
-		URLParamDbName, URLParamSpaceName, URLParamFieldName, URLParamIndexType), handler.handleMasterRequest)
+	// group.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s",
+	// 	URLParamDbName, URLParamSpaceName, URLParamFieldName, URLParamIndexType), handler.handleMasterRequest)
 
 	// space handler
 	group.POST(fmt.Sprintf("/dbs/:%s/spaces", URLParamDbName), handler.handleMasterRequest)

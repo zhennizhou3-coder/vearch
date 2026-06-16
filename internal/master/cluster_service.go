@@ -32,6 +32,7 @@ type masterService struct {
 	memberService    *services.MemberService
 	configService    *services.ConfigService
 	backupService    *services.BackupService
+	rebuildService   *services.RebuildService
 }
 
 func newMasterService(client *client.Client) (*masterService, error) {
@@ -47,6 +48,7 @@ func newMasterService(client *client.Client) (*masterService, error) {
 		memberService:    services.NewMemberService(client),
 		configService:    services.NewConfigService(client),
 		backupService:    services.NewBackupService(client),
+		rebuildService:   services.NewRebuildService(client),
 	}, nil
 }
 
@@ -88,4 +90,8 @@ func (ms *masterService) Config() *services.ConfigService {
 
 func (ms *masterService) Backup() *services.BackupService {
 	return ms.backupService
+}
+
+func (ms *masterService) Rebuild() *services.RebuildService {
+	return ms.rebuildService
 }

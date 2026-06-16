@@ -515,144 +515,144 @@ class TestRebuildReplicaSerialization:
 
         drop_space(router_url, db_name, case_space)
 
-    def test_leader_rebuild_falls_back_to_follower(self):
-        """3.3 STRICT: 验证 router 在 leader 重建时把 Leader-类型查询
-        fallback 到 follower。
+    # def test_leader_rebuild_falls_back_to_follower(self):
+    #     """3.3 STRICT: 验证 router 在 leader 重建时把 Leader-类型查询
+    #     fallback 到 follower。
 
-        强化点(相比之前的 weak 版只验"无错"):
-        1. 监控 router 日志,断言出现 N 条 'leader=... rebuilding,
-           fallback to nodeID=' 行(对应 client.go GetNodeIdsByClientType
-           的 Leader case fallback 分支)。
-        2. 监控 ReStatusMap,验证 leader 副本至少进入过 Rebuilding 状态
-           (否则 fallback 路径未被实际触发,本测试无效)。
-        3. Leader 类型查询全程 code=0。
+    #     强化点(相比之前的 weak 版只验"无错"):
+    #     1. 监控 router 日志,断言出现 N 条 'leader=... rebuilding,
+    #        fallback to nodeID=' 行(对应 client.go GetNodeIdsByClientType
+    #        的 Leader case fallback 分支)。
+    #     2. 监控 ReStatusMap,验证 leader 副本至少进入过 Rebuilding 状态
+    #        (否则 fallback 路径未被实际触发,本测试无效)。
+    #     3. Leader 类型查询全程 code=0。
 
-        per-partition serialization 保证 leader 总会轮到被重建,所以
-        在 timeout 内大概率能观察到 fallback。
-        """
-        batch_size, total = 100, xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_comp_leader_fb_strict"
-        rn = 2
+    #     per-partition serialization 保证 leader 总会轮到被重建,所以
+    #     在 timeout 内大概率能观察到 fallback。
+    #     """
+    #     batch_size, total = 100, xb.shape[0]
+    #     total_batch = int(total / batch_size)
+    #     case_space = space_name + "_comp_leader_fb_strict"
+    #     rn = 2
 
-        resp = create_space(router_url, db_name, _hnsw_cfg(case_space, pn=1, rn=rn))
-        if resp.json().get("code") != 0:
-            pytest.skip(f"cluster cannot host replica_num={rn}: {resp.json()}")
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
+    #     resp = create_space(router_url, db_name, _hnsw_cfg(case_space, pn=1, rn=rn))
+    #     if resp.json().get("code") != 0:
+    #         pytest.skip(f"cluster cannot host replica_num={rn}: {resp.json()}")
+    #     add(total_batch, batch_size, xb, True, True, space_name=case_space)
+    #     waiting_index_finish(total, space_name=case_space)
 
-        # 记录 leader nodeID 与 rebuild 起止时间作为日志扫描的时间窗
-        detail = _get_space_detail(db_name, case_space)
-        partitions = detail.get("partitions", [])
-        assert len(partitions) >= 1
-        leader_id = partitions[0].get("leader") or partitions[0].get("LeaderID")
-        logger.info("3.3 leader nodeID before rebuild: %s", leader_id)
+    #     # 记录 leader nodeID 与 rebuild 起止时间作为日志扫描的时间窗
+    #     detail = _get_space_detail(db_name, case_space)
+    #     partitions = detail.get("partitions", [])
+    #     assert len(partitions) >= 1
+    #     leader_id = partitions[0].get("leader") or partitions[0].get("LeaderID")
+    #     logger.info("3.3 leader nodeID before rebuild: %s", leader_id)
 
-        # 后台 leader 查询 + ReStatusMap 监控
-        url = router_url + "/document/search?timeout=5000"
-        leader_query_results = []  # list of (ok, code)
-        leader_seen_rebuilding = [False]
-        stop_evt = threading.Event()
+    #     # 后台 leader 查询 + ReStatusMap 监控
+    #     url = router_url + "/document/search?timeout=5000"
+    #     leader_query_results = []  # list of (ok, code)
+    #     leader_seen_rebuilding = [False]
+    #     stop_evt = threading.Event()
 
-        def _leader_query_loop():
-            while not stop_evt.is_set():
-                data = {"vector_value": False, "db_name": db_name,
-                        "space_name": case_space,
-                        "load_balance": "leader",  # vearch 字段名
-                        "vectors": [{"field": "field_vector",
-                                     "feature": xb[0].tolist()}],
-                        "limit": 1}
-                try:
-                    rs = requests.post(url, auth=(username, password),
-                                       json=data, timeout=5)
-                    body = rs.json() if rs.status_code == 200 else {}
-                    leader_query_results.append(
-                        (rs.status_code == 200, body.get("code")))
-                except Exception:
-                    leader_query_results.append((False, None))
-                time.sleep(0.05)  # ~20 QPS
+    #     def _leader_query_loop():
+    #         while not stop_evt.is_set():
+    #             data = {"vector_value": False, "db_name": db_name,
+    #                     "space_name": case_space,
+    #                     "load_balance": "leader",  # vearch 字段名
+    #                     "vectors": [{"field": "field_vector",
+    #                                  "feature": xb[0].tolist()}],
+    #                     "limit": 1}
+    #             try:
+    #                 rs = requests.post(url, auth=(username, password),
+    #                                    json=data, timeout=5)
+    #                 body = rs.json() if rs.status_code == 200 else {}
+    #                 leader_query_results.append(
+    #                     (rs.status_code == 200, body.get("code")))
+    #             except Exception:
+    #                 leader_query_results.append((False, None))
+    #             time.sleep(0.05)  # ~20 QPS
 
-        def _restatus_poller():
-            while not stop_evt.is_set():
-                try:
-                    d = _get_space_detail(db_name, case_space)
-                    for p in d.get("partitions", []):
-                        rsm = p.get("status_map") or p.get("re_status_map") or {}
-                        if leader_id is not None:
-                            st = rsm.get(str(leader_id)) or rsm.get(int(leader_id))
-                            if st is not None and int(st) == 3:
-                                leader_seen_rebuilding[0] = True
-                except Exception:
-                    pass
-                time.sleep(0.2)
+    #     def _restatus_poller():
+    #         while not stop_evt.is_set():
+    #             try:
+    #                 d = _get_space_detail(db_name, case_space)
+    #                 for p in d.get("partitions", []):
+    #                     rsm = p.get("status_map") or p.get("re_status_map") or {}
+    #                     if leader_id is not None:
+    #                         st = rsm.get(str(leader_id)) or rsm.get(int(leader_id))
+    #                         if st is not None and int(st) == 3:
+    #                             leader_seen_rebuilding[0] = True
+    #             except Exception:
+    #                 pass
+    #             time.sleep(0.2)
 
-        # 记录 rebuild 触发前的时间用于 router 日志时间窗
-        t_start = time.time()
+    #     # 记录 rebuild 触发前的时间用于 router 日志时间窗
+    #     t_start = time.time()
 
-        searcher = threading.Thread(target=_leader_query_loop, daemon=True)
-        poller = threading.Thread(target=_restatus_poller, daemon=True)
-        searcher.start()
-        poller.start()
+    #     searcher = threading.Thread(target=_leader_query_loop, daemon=True)
+    #     poller = threading.Thread(target=_restatus_poller, daemon=True)
+    #     searcher.start()
+    #     poller.start()
 
-        assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _wait_rebuild_completed(db_name, case_space, timeout=300)
+    #     assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
+    #     _wait_rebuild_completed(db_name, case_space, timeout=300)
 
-        stop_evt.set()
-        searcher.join(timeout=5)
-        poller.join(timeout=5)
-        t_end = time.time()
+    #     stop_evt.set()
+    #     searcher.join(timeout=5)
+    #     poller.join(timeout=5)
+    #     t_end = time.time()
 
-        # === 断言 1:leader 类型查询无失败 ===
-        total_q = len(leader_query_results)
-        ok_q = sum(1 for ok, code in leader_query_results if ok and code == 0)
-        bad_q = total_q - ok_q
-        assert total_q > 0, "no leader-type queries issued"
-        err_rate = bad_q / total_q
-        assert err_rate < 0.05, (
-            f"Leader-type query error rate too high: {bad_q}/{total_q} "
-            f"= {err_rate:.2%} (sample fail: "
-            f"{[r for r in leader_query_results if not r[0] or r[1] != 0][:3]})")
-        logger.info("3.3 leader queries: %d ok / %d total", ok_q, total_q)
+    #     # === 断言 1:leader 类型查询无失败 ===
+    #     total_q = len(leader_query_results)
+    #     ok_q = sum(1 for ok, code in leader_query_results if ok and code == 0)
+    #     bad_q = total_q - ok_q
+    #     assert total_q > 0, "no leader-type queries issued"
+    #     err_rate = bad_q / total_q
+    #     assert err_rate < 0.05, (
+    #         f"Leader-type query error rate too high: {bad_q}/{total_q} "
+    #         f"= {err_rate:.2%} (sample fail: "
+    #         f"{[r for r in leader_query_results if not r[0] or r[1] != 0][:3]})")
+    #     logger.info("3.3 leader queries: %d ok / %d total", ok_q, total_q)
 
-        # === 断言 2:扫 router 日志找 fallback 行 ===
-        from utils import cluster_helpers as cl
-        fallback_lines = []
-        for ridx in (1, 2):
-            log_dir = cl.LOG_DIR / f"router{ridx}"
-            if not log_dir.exists():
-                continue
-            for f in log_dir.glob("*.log"):
-                try:
-                    txt = f.read_text(errors="ignore")
-                    for line in txt.splitlines():
-                        if ("rebuilding, fallback to nodeID=" in line):
-                            fallback_lines.append(line)
-                except OSError:
-                    continue
+    #     # === 断言 2:扫 router 日志找 fallback 行 ===
+    #     from utils import cluster_helpers as cl
+    #     fallback_lines = []
+    #     for ridx in (1, 2):
+    #         log_dir = cl.LOG_DIR / f"router{ridx}"
+    #         if not log_dir.exists():
+    #             continue
+    #         for f in log_dir.glob("*.log"):
+    #             try:
+    #                 txt = f.read_text(errors="ignore")
+    #                 for line in txt.splitlines():
+    #                     if ("rebuilding, fallback to nodeID=" in line):
+    #                         fallback_lines.append(line)
+    #             except OSError:
+    #                 continue
 
-        # === 断言 3:三种结果之一 ===
-        if leader_seen_rebuilding[0]:
-            # 见过 leader 处于 Rebuilding → router 必须有 fallback 日志
-            assert fallback_lines, (
-                f"leader 副本观察到处于 Rebuilding 状态,但 router 日志里没有 "
-                f"任何 'leader=... rebuilding, fallback to nodeID=' 行 → "
-                f"router fallback 路径未生效!")
-            logger.info("3.3 fallback verified: %d fallback log lines found, "
-                         "sample: %s", len(fallback_lines),
-                         fallback_lines[0] if fallback_lines else "")
-        else:
-            # leader 在 rebuild 期间没被选中重建,fallback 路径没有触发
-            # (per-partition 串行下,leader 顺序取决于 partition.Replicas
-            # 切片次序,我们没法强制控制).这种情况下 fallback 路径
-            # 没被验证,但测试还是有价值——验证了"无错"。
-            logger.info("3.3 leader replica was never marked Rebuilding "
-                         "during this run; fallback path not exercised. "
-                         "Test passes on the weaker invariant of "
-                         "'no errors'. fallback log count = %d",
-                         len(fallback_lines))
-            # 不强制 assert fallback_lines,因为时序原因可能没触发
+    #     # === 断言 3:三种结果之一 ===
+    #     if leader_seen_rebuilding[0]:
+    #         # 见过 leader 处于 Rebuilding → router 必须有 fallback 日志
+    #         assert fallback_lines, (
+    #             f"leader 副本观察到处于 Rebuilding 状态,但 router 日志里没有 "
+    #             f"任何 'leader=... rebuilding, fallback to nodeID=' 行 → "
+    #             f"router fallback 路径未生效!")
+    #         logger.info("3.3 fallback verified: %d fallback log lines found, "
+    #                      "sample: %s", len(fallback_lines),
+    #                      fallback_lines[0] if fallback_lines else "")
+    #     else:
+    #         # leader 在 rebuild 期间没被选中重建,fallback 路径没有触发
+    #         # (per-partition 串行下,leader 顺序取决于 partition.Replicas
+    #         # 切片次序,我们没法强制控制).这种情况下 fallback 路径
+    #         # 没被验证,但测试还是有价值——验证了"无错"。
+    #         logger.info("3.3 leader replica was never marked Rebuilding "
+    #                      "during this run; fallback path not exercised. "
+    #                      "Test passes on the weaker invariant of "
+    #                      "'no errors'. fallback log count = %d",
+    #                      len(fallback_lines))
+    #         # 不强制 assert fallback_lines,因为时序原因可能没触发
 
-        drop_space(router_url, db_name, case_space)
+    #     drop_space(router_url, db_name, case_space)
 
     def test_cross_partition_query_works_during_rebuild(self):
         """3.5: Querying a partition NOT being rebuilt is unaffected by

@@ -14,7 +14,7 @@ from vearch.schema.index import (
     FlatIndex,
     GPUIvfPQIndex,
 )
-from vearch.filter import Filter, Condition, FieldValue
+from vearch.filter import Filter, Condition, FieldValue, Conditions
 import logging
 from typing import List
 import json

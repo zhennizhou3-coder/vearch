@@ -20,6 +20,11 @@ COPY --from=builder /usr/local/include/roaring /usr/local/include/roaring
 COPY --from=builder /usr/local/lib64/libfaiss* /usr/local/lib64/
 COPY --from=builder /usr/local/include/faiss /usr/local/include/faiss
 COPY --from=builder /usr/local/share/faiss /usr/local/share/faiss
+
+COPY --from=builder /usr/local/lib64/libdiskann* /usr/local/lib64/
+COPY --from=builder /usr/local/include/diskann /usr/local/include/diskann
+COPY --from=builder /usr/local/include/*.h /usr/local/include/
 COPY --from=builder /usr/local/bin/go /usr/local/bin/go
+
 
 RUN dnf install -y git

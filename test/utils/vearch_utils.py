@@ -25,8 +25,10 @@ from multiprocessing import Pool as ThreadPool
 import numpy as np
 import datetime
 
-router_url = os.getenv("ROUTER_URL", "http://127.0.0.1:19001")
-master_url = os.getenv("MASTER_URL", "http://127.0.0.1:28817")
+# router_url = os.getenv("ROUTER_URL", "http://127.0.0.1:19001")
+# master_url = os.getenv("MASTER_URL", "http://127.0.0.1:28817")
+router_url = os.getenv("ROUTER_URL", "http://127.0.0.1:9001")
+master_url = os.getenv("MASTER_URL", "http://127.0.0.1:8817")
 db_name = "ts_db"
 space_name = "ts_space"
 username = "root"

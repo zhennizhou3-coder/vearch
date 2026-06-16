@@ -307,7 +307,7 @@ func ExportToClusterHandler(router *gin.Engine, masterService *masterService, se
 	groupAuth.POST("/cancel/rebuild/index/dbs", c.cancelRebuildIndex)
 	groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s", paramDbName), c.cancelRebuildIndex)
 	groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s", paramDbName, paramSpaceName), c.cancelRebuildIndex)
-	groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s", paramDbName, paramSpaceName, paramFieldName, paramIndexType), c.cancelRebuildIndex)
+	// groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s", paramDbName, paramSpaceName, paramFieldName, paramIndexType), c.cancelRebuildIndex)
 
 	// modify engine config handler
 	groupAuth.POST("/config/:"+paramDbName+"/:"+paramSpaceName, c.modifySpaceConfig)
