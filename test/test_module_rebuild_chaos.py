@@ -88,7 +88,10 @@ def _partition_id(partition):
 
 
 def _partition_restatus_map(partition):
-    return partition.get("status_map") or partition.get("re_status_map") or {}
+    # detail 接口把 per-replica rebuild 状态暴露在 "replica_status",值是字符串
+    # (ReplicasOK / ReplicasRebuilding / ReplicasNotReady),见
+    # internal/entity/partition.go:90 + space_service.go:407。不是数字 status_map。
+    return partition.get("replica_status") or {}
 
 
 def _wait_status(db, space, target_statuses, timeout=120, poll=1.0):
@@ -294,10 +297,32 @@ def _hnsw_cfg(name, pn=2, rn=2):
             ]}
 
 
+def _wait_index_status_indexed(db, space, max_rounds=180, poll_interval=5):
+    """等到 space 所有 partition 的 index_status 都到 INDEXED(=2) 且 status!="red"。
+
+    waiting_index_finish 只等全局 index_num 到 total,不保证每个 partition 的
+    index_status 已翻成 INDEXED。慢速 CI 上这个间隙会被放大,直接触发 rebuild
+    会撞到 "rebuild requires an existing index"(某 partition 仍 UNINDEXED)。
+    所有 chaos 测试都经 _populate 准备数据,这里统一加闸。
+    """
+    url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
+    for _ in range(max_rounds):
+        rs = requests.get(url, auth=(username, password))
+        body = rs.json()
+        data = body.get("data", {})
+        partitions = data.get("partitions", [])
+        statuses = [p.get("index_status", -1) for p in partitions]
+        if data.get("status") != "red" and partitions and all(s == 2 for s in statuses):
+            return
+        time.sleep(poll_interval)
+    pytest.fail(f"index_status did not reach INDEXED for {db}/{space}")
+
+
 def _populate(case_space, total=5000):
     batch_size = 100
     add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
     waiting_index_finish(total, space_name=case_space)
+    _wait_index_status_indexed(db_name, case_space)
 
 
 def _wait_until_running(db, space, timeout=60):
@@ -509,16 +534,9 @@ class TestRebuildPSFailure:
 
             # Best-effort: scan PS log for the duplicate-rebuild guard line
             # we know is logged when the same task key is asked twice.
-            ps1_log = cl.LOG_DIR / "ps1"
-            duplicate_guards = 0
-            if ps1_log.exists():
-                for f in ps1_log.glob("*.log"):
-                    try:
-                        txt = f.read_text(errors="ignore")
-                        # The guard message in rebuild_manager.go:121.
-                        duplicate_guards += txt.count("ignoring duplicate start")
-                    except OSError:
-                        continue
+            txt = cl.read_node_logs("ps", 1)
+            # The guard message in rebuild_manager.go:121.
+            duplicate_guards = txt.count("ignoring duplicate start")
             # Either the guard fired (idempotent) or the second dispatch
             # never reached the same PS (also fine). The bad case would be
             # PS RUNNING two RebuildIndex CGO calls concurrently — that
@@ -737,15 +755,8 @@ class TestRebuildMasterFailover:
         #      concurrently.
         duplicates_seen = 0
         for ps_idx in PSES_IDX:
-            log_dir = cl.LOG_DIR / f"ps{ps_idx}"
-            if not log_dir.exists():
-                continue
-            for f in log_dir.glob("*.log"):
-                try:
-                    txt = f.read_text(errors="ignore")
-                    duplicates_seen += txt.count("ignoring duplicate start")
-                except OSError:
-                    continue
+            txt = cl.read_node_logs("ps", ps_idx)
+            duplicates_seen += txt.count("ignoring duplicate start")
         logger.info("test_no_double_dispatch: 'ignoring duplicate start' "
                      "count across all PSes = %d (zero is OK; positive "
                      "means PS-side guard fired and prevented reentry)",
@@ -1048,7 +1059,7 @@ class TestRebuildReplicaRoutingChaos:
             post_detail = _get_space_detail(db_name, case_space)
             for p in post_detail.get("partitions", []):
                 for nid, st in _partition_restatus_map(p).items():
-                    assert int(st) == 1, (
+                    assert st == "ReplicasOK", (
                         "rebuild 后 pid=%s node=%s status=%s 未恢复 OK" %
                         (_partition_id(p), nid, st))
 
@@ -1182,17 +1193,17 @@ class TestRebuildReplicaRoutingChaos:
                 "node_id=%s 的已完成 task, 无法验证 fallback" % (leader_id,))
 
             fallback_lines = []
+            router_logs_available = False
             for ridx in (1, 2):
-                log_dir = cl.LOG_DIR / f"router{ridx}"
-                if not log_dir.exists():
-                    continue
-                for f in log_dir.glob("*.log"):
-                    try:
-                        for line in f.read_text(errors="ignore").splitlines():
-                            if "rebuilding, fallback to nodeID=" in line:
-                                fallback_lines.append(line)
-                    except OSError:
-                        continue
+                txt = cl.read_node_logs("router", ridx)
+                if txt:
+                    router_logs_available = True
+                for line in txt.splitlines():
+                    if "rebuilding, fallback to nodeID=" in line:
+                        fallback_lines.append(line)
+            if not router_logs_available:
+                pytest.skip("router logs unavailable in this cluster mode; "
+                            "cannot verify fallback log line")
             assert fallback_lines, (
                 "router 日志未出现 'partition X leader=Y rebuilding, "
                 "fallback to nodeID=Z'")
@@ -1607,19 +1618,9 @@ class TestRebuildPSFailureExtras:
             # consecutive times" error message anywhere on master logs.
             saw_streak_msg = False
             for name in ("m1", "m2", "m3"):
-                log_path = cl.LOG_DIR / f"master_{name}"
-                if not log_path.exists():
-                    continue
-                for f in log_path.glob("*.log"):
-                    try:
-                        txt = f.read_text(errors="ignore")
-                        if "consecutive times" in txt or \
-                           "PollFailureStreak" in txt:
-                            saw_streak_msg = True
-                            break
-                    except OSError:
-                        continue
-                if saw_streak_msg:
+                txt = cl.read_node_logs("master", name)
+                if "consecutive times" in txt or "PollFailureStreak" in txt:
+                    saw_streak_msg = True
                     break
             logger.info("slow-path streak detection observed in master "
                          "logs: %s", saw_streak_msg)
@@ -1671,17 +1672,11 @@ class TestRebuildPSFailureExtras:
             # three PSes (the retry's redispatch target is dynamic).
             dispatch_lines = []  # tuples (ps_idx, line)
             for ps_idx in PSES_IDX:
-                log_dir = cl.LOG_DIR / f"ps{ps_idx}"
-                if not log_dir.exists():
-                    continue
-                for f in log_dir.glob("*.log"):
-                    try:
-                        for line in f.read_text(errors="ignore").splitlines():
-                            if "RebuildFieldIndex dispatched" in line and \
-                               "dropBefore" in line:
-                                dispatch_lines.append((ps_idx, line))
-                    except OSError:
-                        continue
+                txt = cl.read_node_logs("ps", ps_idx)
+                for line in txt.splitlines():
+                    if "RebuildFieldIndex dispatched" in line and \
+                       "dropBefore" in line:
+                        dispatch_lines.append((ps_idx, line))
 
             if not dispatch_lines:
                 pytest.skip("no 'dispatched' lines found in PS logs; "
@@ -1773,10 +1768,9 @@ class TestRebuildPSFailureExtras:
             stuck_rebuilding = []
             for p in data.get("partitions", []):
                 pid = p.get("pid")
-                # ReStatusMap key name may differ across versions.
-                rsm = p.get("status_map") or p.get("re_status_map") or {}
+                rsm = _partition_restatus_map(p)
                 for nid, st in rsm.items():
-                    if int(st) == 3:  # ReplicasRebuilding
+                    if st == "ReplicasRebuilding":
                         stuck_rebuilding.append((pid, nid, st))
 
             assert not stuck_rebuilding, (

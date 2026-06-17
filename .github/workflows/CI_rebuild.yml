@@ -4,14 +4,14 @@ name: CI Rebuild Index
 # 触发条件 + 执行顺序
 # ---------------------------------------------------------------------------
 # 1) push / pull_request / workflow_dispatch 时触发整条 pipeline。
-# 2) 当前 CI 只跑 rebuild-fast job。DiskANN 不再单独拆到 long job,
-#    而是跟 comprehensive 测试一起正常执行。
+# 2) rebuild-fast(comprehensive + DiskANN)先跑;通过后 rebuild-chaos
+#    (needs: rebuild-fast)接着跑故障注入测试。
 #
 # 设计权衡:
 #   - comprehensive 直接包含 DiskANN,避免单独 -k 跑 DiskANN 时绕过
 #     test_prepare_db 造成 db_not_exist。
-#   - chaos job 保留定义但在 CI 上禁用,因为它依赖裸进程 PID 文件和
-#     os.kill,与当前 docker-compose cluster 环境不兼容。
+#   - chaos job 复用同一套 docker-compose 集群:cluster_helpers.py 是双模式的,
+#     docker 模式下 kill_ps→`docker kill vearch-psN`、日志走 `docker exec`。
 # ---------------------------------------------------------------------------
 
 on:
@@ -23,6 +23,9 @@ on:
 jobs:
   rebuild-fast:
     name: 'Rebuild comprehensive tests'
+    # ⚠️ 临时禁用:comprehensive 已经跑通,先腾出资源单独验证 chaos job。
+    # 验完 chaos 后把这行删掉、并恢复 rebuild-chaos 的 `needs: rebuild-fast`。
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 90     # comprehensive + DiskANN 可能比纯 fast 更久
     strategy:
@@ -77,98 +80,54 @@ jobs:
   # ===========================================================================
   # Job B:chaos 测试 — kill PS / master 故障注入
   # ===========================================================================
-  # 注意:chaos 测试用的是 test/utils/cluster_helpers.py,操作 *本地裸进程
-  # 的 PID 文件 + os.kill*,跟前两个 job 用的 docker-compose 集群路径不
-  # 兼容。所以这个 job 不复用 set_cluster_env,而是自己:
-  #   1) 直接 build vearch 二进制
-  #   2) 用 scripts/cluster.sh start 起 3 master + 3 ps + 2 router 裸进程
-  #   3) 跑 chaos 测试
-  #   4) finally 用 cluster.sh stop 收尾
+  # chaos 测试通过 test/utils/cluster_helpers.py 注入故障。该 helper 是双模式
+  # 的(bare / docker),docker 模式下 kill_ps→`docker kill vearch-psN`、
+  # start_ps→`docker start`、日志走 `docker exec ... cat /vearch/logs/*.log`。
+  # 所以这个 job 直接复用 rebuild-fast 的 docker-compose 集群(set_cluster_env),
+  # 不再单独 build 裸二进制 + cluster.sh。
   # ---------------------------------------------------------------------------
   rebuild-chaos:
     name: 'Chaos rebuild (PS kill, master failover)'
-    needs: rebuild-fast
-    # ⚠️ CI 上禁用 chaos job(if: false 让整个 job skip)。
-    # 理由:
-    #   - chaos 用 test/utils/cluster_helpers.py 操作 host PID 文件 +
-    #     os.kill,跟 CI 用的 docker-compose 集群路径不兼容。
-    #   - 即便走 host 裸进程,vearch 是 CGO + C++ engine,build 依赖
-    #     cmake + faiss + OpenBLAS + RocksDB + libgomp 等系统级 dep,
-    #     ubuntu-latest 裸 runner 没装这些,make build 会失败。
-    #   - host 集群 router 在 19001,而 vearch_utils.py 默认 router_url
-    #     = 9001(对应 docker-compose 暴露端口),端口不一致测试会发请求
-    #     发到错的地方。
-    #
-    # chaos 测试本机跑没问题:
-    #   bash scripts/cluster.sh start
-    #   ROUTER_URL=http://127.0.0.1:19001 \
-    #     pytest test/test_module_rebuild_chaos.py --log-cli-level=INFO
-    #
-    # 想在 CI 上跑 chaos,需要先把 cluster_helpers 改成 docker 操作模式
-    # (kill_ps → docker kill vearch-psN,start_ps → docker start),
-    # 再把这个 if: false 删了。
-    if: false
+    # ⚠️ 临时去掉 `needs: rebuild-fast`,让 chaos 独立跑(rebuild-fast 已 if:false
+    # 被禁用,留着 needs 会让 chaos 被连带 skip)。验完 chaos 后恢复 needs。
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            docker-arch: ''
+    env:
+      TARGET_PLATFORM: ${{ matrix.platform }}
+      # cluster_helpers 也会自动探测,显式声明更稳。
+      VEARCH_CLUSTER_MODE: docker
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
+    # 复用同一套 cluster setup:build 镜像 + docker-compose up 3M/2R/3PS + 装 pytest 依赖。
+    - uses: ./.github/actions/set_cluster_env
       with:
-        go-version: '1.21'
-
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
-
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip setuptools wheel
-        pip install requests pytest pandas numpy h5py psutil tqdm
-
-    - name: Compile vearch binary
-      # chaos 测试需要的是 build/bin/vearch 二进制,不是 docker 镜像。
-      # cluster.sh 默认从这里读。
-      run: |
-        # 这一步可能需要根据你项目的 Makefile / build 命令调整。
-        # 当前仓库是 CGO + 第三方 C++ engine 链接,典型 build:
-        make build || (echo "make build failed; falling back to go build"; \
-                       go build -o build/bin/vearch ./cmd/vearch)
-
-    - name: Start cluster (raw processes)
-      run: |
-        bash scripts/cluster.sh start
-        # 给一段时间让 master 心跳 + PS 注册稳定。
-        sleep 10
-        bash scripts/cluster.sh status
+        build-type: github
 
     - name: Run chaos rebuild tests
+      # --maxfail=3 收齐多个 failing case 的日志,而不是首发 fail 就退。
       # -p no:cacheprovider 避免 .pytest_cache 堆在 runner 上。
-      # --maxfail=3 允许收齐多个 failing case 的日志,而不是首发 fail 就退。
       run: |
         cd test
         pytest test_module_rebuild_chaos.py \
           --maxfail=3 --log-cli-level=INFO \
           -p no:cacheprovider
 
-    - name: Stop cluster (always run, even on failure)
-      if: always()
-      run: |
-        bash scripts/cluster.sh stop || true
-        bash scripts/cluster.sh status || true
-
-    - name: Upload cluster + chaos logs on failure
+    - name: Upload chaos logs on failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
         name: rebuild-chaos-logs
-        # path 用 | 多行字符串时,行内 `#` 不是注释 — YAML 会把它当成路径字符
-        # 的一部分,然后 actions/upload-artifact 报「No files were found with
-        # the provided path」。所以这里不能加 inline 注释。
+        # docker mode 下集群日志在容器内 /vearch/logs/,host 上没有目录;
+        # 这里只收 pytest 自身产物。需要容器日志时测试会按需 `docker exec` 拉取。
         path: |
-          logs/
           test/*.log
         retention-days: 14
+
