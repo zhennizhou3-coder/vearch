@@ -4,19 +4,14 @@ name: CI Rebuild Index
 # 触发条件 + 执行顺序
 # ---------------------------------------------------------------------------
 # 1) push / pull_request / workflow_dispatch 时触发整条 pipeline。
-# 2) 3 个 job 通过 `needs:` 串联,顺序执行:
-#      rebuild-fast  →  rebuild-long  →  rebuild-chaos
-#    前一个 job 失败,后续 job 默认 skip(needs 上游 fail = 不跑)。
+# 2) 当前 CI 只跑 rebuild-fast job。DiskANN 不再单独拆到 long job,
+#    而是跟 comprehensive 测试一起正常执行。
 #
 # 设计权衡:
-#   - 顺序 vs 并行:fast 几分钟跑完,long 30min,chaos 也很重。串行可以
-#     用 fast 的结果做 fail-fast,避免 fast 都挂的情况下白烧 long/chaos
-#     runner 分钟。代价是总时长是各 job 时长之和(60+90+90=240min 上限,
-#     实际跑得快)。
-#   - 单 yml 多 job vs 多 yml 文件:GitHub Actions 跨 workflow 顺序只能
-#     用 workflow_run,而 workflow_run 仅在 default branch 上的 workflow
-#     文件生效 — 当前 feat_rebuild_index 是 feature 分支,workflow_run
-#     必挂。单 yml 多 job + needs 是任何分支都能跑的标准做法。
+#   - comprehensive 直接包含 DiskANN,避免单独 -k 跑 DiskANN 时绕过
+#     test_prepare_db 造成 db_not_exist。
+#   - chaos job 保留定义但在 CI 上禁用,因为它依赖裸进程 PID 文件和
+#     os.kill,与当前 docker-compose cluster 环境不兼容。
 # ---------------------------------------------------------------------------
 
 on:
@@ -26,13 +21,10 @@ on:
 
 
 jobs:
-  # ===========================================================================
-  # Job A:快速 lifecycle (第 1 步)
-  # ===========================================================================
   rebuild-fast:
-    name: 'Fast rebuild lifecycle'
+    name: 'Rebuild comprehensive tests'
     runs-on: ubuntu-latest
-    timeout-minutes: 60     # 工作流超时硬上限,避免无限挂起占 runner 时间
+    timeout-minutes: 90     # comprehensive + DiskANN 可能比纯 fast 更久
     strategy:
       fail-fast: false
       matrix:
@@ -64,15 +56,11 @@ jobs:
     #     pytest test_module_rebuild_index.py \
     #       -x --log-cli-level=INFO
 
-    # ---- 模块测试:comprehensive,排除 30min 那条 ----
-    # --deselect 把 test_rebuild_diskann 单独 cut 出去,放到 rebuild-long
-    # 那个 job 里跑(下面)。
-    - name: Run comprehensive rebuild tests (no DiskANN)
+    - name: Run comprehensive rebuild tests
       run: |
         cd test
         pytest test_module_rebuild_comprehensive.py \
-          -x -rs --log-cli-level=INFO \
-          --deselect test_module_rebuild_comprehensive.py::TestRebuildIndexTypeMatrix::test_rebuild_diskann
+          -x -rs --log-cli-level=INFO
 
     # ---- 失败时把 master / PS / router 日志都打上来,debug 方便 ----
     # `if: failure()` 只在前面的 step 挂掉时才跑。
@@ -87,40 +75,7 @@ jobs:
         retention-days: 7
 
   # ===========================================================================
-  # Job B:长跑 — DiskANN (第 2 步,等 fast 通过后才跑)
-  # ===========================================================================
-  rebuild-long:
-    name: 'Long-running rebuild (DiskANN ≤30min)'
-    needs: rebuild-fast      # ← 串联:fast 成功才跑 long
-    runs-on: ubuntu-latest
-    timeout-minutes: 90     # DiskANN 6.5 上限 30min,加上 build/setup 留 90min
-
-    steps:
-    - uses: actions/checkout@v4
-    - uses: ./.github/actions/set_cluster_env
-      with:
-        build-type: github
-
-    - name: Run DiskANN rebuild test
-      # 单独 -k 进 DiskANN 那一条,不拉别的连带跑。
-      run: |
-        cd test
-        pytest test_module_rebuild_comprehensive.py \
-          -k 'test_rebuild_diskann' \
-          -x -rs --log-cli-level=INFO
-
-    - name: Upload logs on failure
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: rebuild-long-logs
-        path: |
-          cloud/logs/
-          test/*.log
-        retention-days: 14    # 长跑日志多留几天好回溯
-
-  # ===========================================================================
-  # Job C:chaos 测试 — kill PS / master 故障注入 (第 3 步,等 long 通过后才跑)
+  # Job B:chaos 测试 — kill PS / master 故障注入
   # ===========================================================================
   # 注意:chaos 测试用的是 test/utils/cluster_helpers.py,操作 *本地裸进程
   # 的 PID 文件 + os.kill*,跟前两个 job 用的 docker-compose 集群路径不
@@ -132,7 +87,7 @@ jobs:
   # ---------------------------------------------------------------------------
   rebuild-chaos:
     name: 'Chaos rebuild (PS kill, master failover)'
-    needs: rebuild-long      # ← 串联:long 成功才跑 chaos
+    needs: rebuild-fast
     # ⚠️ CI 上禁用 chaos job(if: false 让整个 job skip)。
     # 理由:
     #   - chaos 用 test/utils/cluster_helpers.py 操作 host PID 文件 +

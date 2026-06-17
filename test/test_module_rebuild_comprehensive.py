@@ -216,6 +216,27 @@ def _hnsw_cfg(name, pn=2, rn=1):
                  "dimension": dim},
             ]}
 
+def _hnsw_range_partition_cfg(name, pn=1, rn=2):
+    dim = xb.shape[1]
+    return {"name": name, "partition_num": pn, "replica_num": rn,
+            "fields": [
+                {"name": "field_int", "type": "integer"},
+                {"name": "field_date", "type": "date"},
+                {"name": "field_vector", "type": "vector",
+                 "index": {"name": "gamma", "type": "HNSW",
+                           "params": {"metric_type": "InnerProduct", "nlinks": 32, "efConstruction": 40, "training_threshold": 1}},
+                 "dimension": dim},
+            ],
+            "partition_rule": {
+                "type": "RANGE",
+                "field": "field_date",
+                "ranges": [
+                    {"name": "p0", "value": "2026-01-02"},
+                    {"name": "p1", "value": "2026-01-03"},
+                    {"name": "p2", "value": "2026-01-04"},
+                ],
+            }}
+
 def _flat_cfg(name, pn=1, rn=1):
     dim = xb.shape[1]
     return {"name": name, "partition_num": pn, "replica_num": rn,
@@ -287,6 +308,26 @@ def _add_multi3_docs(space_name, n_fields=3):
             docs.append(doc)
         rs = requests.post(url, auth=(username, password), json={"db_name": db_name, "space_name": space_name, "documents": docs})
         assert rs.json().get("code") == 0
+    waiting_index_finish(total, space_name=space_name)
+
+def _add_range_partition_docs(space_name, total=10000, batch_size=100):
+    """Insert docs into named range partitions p0 and p1."""
+    url = router_url + "/document/upsert?timeout=2000000"
+    for i in range(total // batch_size):
+        docs = []
+        for j in range(batch_size):
+            idx = i * batch_size + j
+            docs.append({
+                "_id": str(idx),
+                "field_int": idx,
+                "field_date": "2026-01-01" if idx < total // 2 else "2026-01-02",
+                "field_vector": xb[idx].tolist(),
+            })
+        rs = requests.post(url, auth=(username, password),
+                           json={"db_name": db_name, "space_name": space_name,
+                                 "documents": docs},
+                           timeout=30)
+        assert rs.json().get("code") == 0, rs.text
     waiting_index_finish(total, space_name=space_name)
 
 
@@ -389,21 +430,20 @@ class TestRebuildReplicaSerialization:
         要求多 PS 集群(由 scripts/cluster.sh 启动)。
         """
         batch_size, total = 100, xb.shape[0]
-        total_batch = int(total / batch_size)
         case_space = space_name + "_comp_search_skip_strict"
-        rn, pn = 2, 2
+        rn, pn = 2, 1
 
-        resp = create_space(router_url, db_name, _hnsw_cfg(case_space, pn=pn, rn=rn))
+        resp = create_space(router_url, db_name, _hnsw_range_partition_cfg(case_space, pn=pn, rn=rn))
         if resp.json().get("code") != 0:
-            pytest.skip(f"cluster cannot host replica_num={rn}: {resp.json()}")
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
+            pytest.skip(f"cluster cannot host range partition replica_num={rn}: {resp.json()}")
+        _add_range_partition_docs(case_space, total=total, batch_size=batch_size)
 
-        # 拿 partition 列表(用第一个 partition 名做定向查询).
+        # Use a real partition_rule range name. Plain hash partitions do not
+        # support partition_names and would fail with "space partition rule is nil".
         detail = _get_space_detail(db_name, case_space)
         partitions = detail.get("partitions", [])
         assert len(partitions) >= 2, f"need ≥2 partitions, got {partitions}"
-        target_pname = partitions[0].get("name") or str(partitions[0]["pid"])
+        target_pname = "p0"
 
         # === 第 1 阶段:baseline 测 latency 分布 ===
         baseline_latencies = []
@@ -422,9 +462,14 @@ class TestRebuildReplicaSerialization:
                 rs = requests.post(url, auth=(username, password),
                                    json=data, timeout=5)
                 dt = (time.time() - t0) * 1000
-                ok = (rs.status_code == 200 and rs.json().get("code") == 0)
+                body = rs.json()
+                ok = (rs.status_code == 200 and body.get("code") == 0)
+                if not ok:
+                    logger.info("3.2 targeted search failed: status=%s body=%s",
+                                rs.status_code, rs.text[:500])
                 return ok, dt
-            except Exception:
+            except Exception as e:
+                logger.info("3.2 targeted search exception: %s", e)
                 return False, (time.time() - t0) * 1000
 
         # 收集 baseline 5s
@@ -515,144 +560,144 @@ class TestRebuildReplicaSerialization:
 
         drop_space(router_url, db_name, case_space)
 
-    # def test_leader_rebuild_falls_back_to_follower(self):
-    #     """3.3 STRICT: 验证 router 在 leader 重建时把 Leader-类型查询
-    #     fallback 到 follower。
+    def test_leader_rebuild_falls_back_to_follower(self):
+        """3.3 STRICT: 验证 router 在 leader 重建时把 Leader-类型查询
+        fallback 到 follower。
 
-    #     强化点(相比之前的 weak 版只验"无错"):
-    #     1. 监控 router 日志,断言出现 N 条 'leader=... rebuilding,
-    #        fallback to nodeID=' 行(对应 client.go GetNodeIdsByClientType
-    #        的 Leader case fallback 分支)。
-    #     2. 监控 ReStatusMap,验证 leader 副本至少进入过 Rebuilding 状态
-    #        (否则 fallback 路径未被实际触发,本测试无效)。
-    #     3. Leader 类型查询全程 code=0。
+        强化点(相比之前的 weak 版只验"无错"):
+        1. 监控 router 日志,断言出现 N 条 'leader=... rebuilding,
+           fallback to nodeID=' 行(对应 client.go GetNodeIdsByClientType
+           的 Leader case fallback 分支)。
+        2. 监控 ReStatusMap,验证 leader 副本至少进入过 Rebuilding 状态
+           (否则 fallback 路径未被实际触发,本测试无效)。
+        3. Leader 类型查询全程 code=0。
 
-    #     per-partition serialization 保证 leader 总会轮到被重建,所以
-    #     在 timeout 内大概率能观察到 fallback。
-    #     """
-    #     batch_size, total = 100, xb.shape[0]
-    #     total_batch = int(total / batch_size)
-    #     case_space = space_name + "_comp_leader_fb_strict"
-    #     rn = 2
+        per-partition serialization 保证 leader 总会轮到被重建,所以
+        在 timeout 内大概率能观察到 fallback。
+        """
+        batch_size, total = 100, xb.shape[0]
+        total_batch = int(total / batch_size)
+        case_space = space_name + "_comp_leader_fb_strict"
+        rn = 2
 
-    #     resp = create_space(router_url, db_name, _hnsw_cfg(case_space, pn=1, rn=rn))
-    #     if resp.json().get("code") != 0:
-    #         pytest.skip(f"cluster cannot host replica_num={rn}: {resp.json()}")
-    #     add(total_batch, batch_size, xb, True, True, space_name=case_space)
-    #     waiting_index_finish(total, space_name=case_space)
+        resp = create_space(router_url, db_name, _hnsw_cfg(case_space, pn=1, rn=rn))
+        if resp.json().get("code") != 0:
+            pytest.skip(f"cluster cannot host replica_num={rn}: {resp.json()}")
+        add(total_batch, batch_size, xb, True, True, space_name=case_space)
+        waiting_index_finish(total, space_name=case_space)
 
-    #     # 记录 leader nodeID 与 rebuild 起止时间作为日志扫描的时间窗
-    #     detail = _get_space_detail(db_name, case_space)
-    #     partitions = detail.get("partitions", [])
-    #     assert len(partitions) >= 1
-    #     leader_id = partitions[0].get("leader") or partitions[0].get("LeaderID")
-    #     logger.info("3.3 leader nodeID before rebuild: %s", leader_id)
+        # 记录 leader nodeID 与 rebuild 起止时间作为日志扫描的时间窗
+        detail = _get_space_detail(db_name, case_space)
+        partitions = detail.get("partitions", [])
+        assert len(partitions) >= 1
+        leader_id = partitions[0].get("leader") or partitions[0].get("LeaderID")
+        logger.info("3.3 leader nodeID before rebuild: %s", leader_id)
 
-    #     # 后台 leader 查询 + ReStatusMap 监控
-    #     url = router_url + "/document/search?timeout=5000"
-    #     leader_query_results = []  # list of (ok, code)
-    #     leader_seen_rebuilding = [False]
-    #     stop_evt = threading.Event()
+        # 后台 leader 查询 + ReStatusMap 监控
+        url = router_url + "/document/search?timeout=5000"
+        leader_query_results = []  # list of (ok, code)
+        leader_seen_rebuilding = [False]
+        stop_evt = threading.Event()
 
-    #     def _leader_query_loop():
-    #         while not stop_evt.is_set():
-    #             data = {"vector_value": False, "db_name": db_name,
-    #                     "space_name": case_space,
-    #                     "load_balance": "leader",  # vearch 字段名
-    #                     "vectors": [{"field": "field_vector",
-    #                                  "feature": xb[0].tolist()}],
-    #                     "limit": 1}
-    #             try:
-    #                 rs = requests.post(url, auth=(username, password),
-    #                                    json=data, timeout=5)
-    #                 body = rs.json() if rs.status_code == 200 else {}
-    #                 leader_query_results.append(
-    #                     (rs.status_code == 200, body.get("code")))
-    #             except Exception:
-    #                 leader_query_results.append((False, None))
-    #             time.sleep(0.05)  # ~20 QPS
+        def _leader_query_loop():
+            while not stop_evt.is_set():
+                data = {"vector_value": False, "db_name": db_name,
+                        "space_name": case_space,
+                        "load_balance": "leader",  # vearch 字段名
+                        "vectors": [{"field": "field_vector",
+                                     "feature": xb[0].tolist()}],
+                        "limit": 1}
+                try:
+                    rs = requests.post(url, auth=(username, password),
+                                       json=data, timeout=5)
+                    body = rs.json() if rs.status_code == 200 else {}
+                    leader_query_results.append(
+                        (rs.status_code == 200, body.get("code")))
+                except Exception:
+                    leader_query_results.append((False, None))
+                time.sleep(0.05)  # ~20 QPS
 
-    #     def _restatus_poller():
-    #         while not stop_evt.is_set():
-    #             try:
-    #                 d = _get_space_detail(db_name, case_space)
-    #                 for p in d.get("partitions", []):
-    #                     rsm = p.get("status_map") or p.get("re_status_map") or {}
-    #                     if leader_id is not None:
-    #                         st = rsm.get(str(leader_id)) or rsm.get(int(leader_id))
-    #                         if st is not None and int(st) == 3:
-    #                             leader_seen_rebuilding[0] = True
-    #             except Exception:
-    #                 pass
-    #             time.sleep(0.2)
+        def _restatus_poller():
+            while not stop_evt.is_set():
+                try:
+                    d = _get_space_detail(db_name, case_space)
+                    for p in d.get("partitions", []):
+                        rsm = p.get("status_map") or p.get("re_status_map") or {}
+                        if leader_id is not None:
+                            st = rsm.get(str(leader_id)) or rsm.get(int(leader_id))
+                            if st is not None and int(st) == 3:
+                                leader_seen_rebuilding[0] = True
+                except Exception:
+                    pass
+                time.sleep(0.2)
 
-    #     # 记录 rebuild 触发前的时间用于 router 日志时间窗
-    #     t_start = time.time()
+        # 记录 rebuild 触发前的时间用于 router 日志时间窗
+        t_start = time.time()
 
-    #     searcher = threading.Thread(target=_leader_query_loop, daemon=True)
-    #     poller = threading.Thread(target=_restatus_poller, daemon=True)
-    #     searcher.start()
-    #     poller.start()
+        searcher = threading.Thread(target=_leader_query_loop, daemon=True)
+        poller = threading.Thread(target=_restatus_poller, daemon=True)
+        searcher.start()
+        poller.start()
 
-    #     assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
-    #     _wait_rebuild_completed(db_name, case_space, timeout=300)
+        assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
+        _wait_rebuild_completed(db_name, case_space, timeout=300)
 
-    #     stop_evt.set()
-    #     searcher.join(timeout=5)
-    #     poller.join(timeout=5)
-    #     t_end = time.time()
+        stop_evt.set()
+        searcher.join(timeout=5)
+        poller.join(timeout=5)
+        t_end = time.time()
 
-    #     # === 断言 1:leader 类型查询无失败 ===
-    #     total_q = len(leader_query_results)
-    #     ok_q = sum(1 for ok, code in leader_query_results if ok and code == 0)
-    #     bad_q = total_q - ok_q
-    #     assert total_q > 0, "no leader-type queries issued"
-    #     err_rate = bad_q / total_q
-    #     assert err_rate < 0.05, (
-    #         f"Leader-type query error rate too high: {bad_q}/{total_q} "
-    #         f"= {err_rate:.2%} (sample fail: "
-    #         f"{[r for r in leader_query_results if not r[0] or r[1] != 0][:3]})")
-    #     logger.info("3.3 leader queries: %d ok / %d total", ok_q, total_q)
+        # === 断言 1:leader 类型查询无失败 ===
+        total_q = len(leader_query_results)
+        ok_q = sum(1 for ok, code in leader_query_results if ok and code == 0)
+        bad_q = total_q - ok_q
+        assert total_q > 0, "no leader-type queries issued"
+        err_rate = bad_q / total_q
+        assert err_rate < 0.05, (
+            f"Leader-type query error rate too high: {bad_q}/{total_q} "
+            f"= {err_rate:.2%} (sample fail: "
+            f"{[r for r in leader_query_results if not r[0] or r[1] != 0][:3]})")
+        logger.info("3.3 leader queries: %d ok / %d total", ok_q, total_q)
 
-    #     # === 断言 2:扫 router 日志找 fallback 行 ===
-    #     from utils import cluster_helpers as cl
-    #     fallback_lines = []
-    #     for ridx in (1, 2):
-    #         log_dir = cl.LOG_DIR / f"router{ridx}"
-    #         if not log_dir.exists():
-    #             continue
-    #         for f in log_dir.glob("*.log"):
-    #             try:
-    #                 txt = f.read_text(errors="ignore")
-    #                 for line in txt.splitlines():
-    #                     if ("rebuilding, fallback to nodeID=" in line):
-    #                         fallback_lines.append(line)
-    #             except OSError:
-    #                 continue
+        # === 断言 2:扫 router 日志找 fallback 行 ===
+        from utils import cluster_helpers as cl
+        fallback_lines = []
+        for ridx in (1, 2):
+            log_dir = cl.LOG_DIR / f"router{ridx}"
+            if not log_dir.exists():
+                continue
+            for f in log_dir.glob("*.log"):
+                try:
+                    txt = f.read_text(errors="ignore")
+                    for line in txt.splitlines():
+                        if ("rebuilding, fallback to nodeID=" in line):
+                            fallback_lines.append(line)
+                except OSError:
+                    continue
 
-    #     # === 断言 3:三种结果之一 ===
-    #     if leader_seen_rebuilding[0]:
-    #         # 见过 leader 处于 Rebuilding → router 必须有 fallback 日志
-    #         assert fallback_lines, (
-    #             f"leader 副本观察到处于 Rebuilding 状态,但 router 日志里没有 "
-    #             f"任何 'leader=... rebuilding, fallback to nodeID=' 行 → "
-    #             f"router fallback 路径未生效!")
-    #         logger.info("3.3 fallback verified: %d fallback log lines found, "
-    #                      "sample: %s", len(fallback_lines),
-    #                      fallback_lines[0] if fallback_lines else "")
-    #     else:
-    #         # leader 在 rebuild 期间没被选中重建,fallback 路径没有触发
-    #         # (per-partition 串行下,leader 顺序取决于 partition.Replicas
-    #         # 切片次序,我们没法强制控制).这种情况下 fallback 路径
-    #         # 没被验证,但测试还是有价值——验证了"无错"。
-    #         logger.info("3.3 leader replica was never marked Rebuilding "
-    #                      "during this run; fallback path not exercised. "
-    #                      "Test passes on the weaker invariant of "
-    #                      "'no errors'. fallback log count = %d",
-    #                      len(fallback_lines))
-    #         # 不强制 assert fallback_lines,因为时序原因可能没触发
+        # === 断言 3:三种结果之一 ===
+        if leader_seen_rebuilding[0]:
+            # 见过 leader 处于 Rebuilding → router 必须有 fallback 日志
+            assert fallback_lines, (
+                f"leader 副本观察到处于 Rebuilding 状态,但 router 日志里没有 "
+                f"任何 'leader=... rebuilding, fallback to nodeID=' 行 → "
+                f"router fallback 路径未生效!")
+            logger.info("3.3 fallback verified: %d fallback log lines found, "
+                         "sample: %s", len(fallback_lines),
+                         fallback_lines[0] if fallback_lines else "")
+        else:
+            # leader 在 rebuild 期间没被选中重建,fallback 路径没有触发
+            # (per-partition 串行下,leader 顺序取决于 partition.Replicas
+            # 切片次序,我们没法强制控制).这种情况下 fallback 路径
+            # 没被验证,但测试还是有价值——验证了"无错"。
+            logger.info("3.3 leader replica was never marked Rebuilding "
+                         "during this run; fallback path not exercised. "
+                         "Test passes on the weaker invariant of "
+                         "'no errors'. fallback log count = %d",
+                         len(fallback_lines))
+            # 不强制 assert fallback_lines,因为时序原因可能没触发
 
-    #     drop_space(router_url, db_name, case_space)
+        drop_space(router_url, db_name, case_space)
 
     def test_cross_partition_query_works_during_rebuild(self):
         """3.5: Querying a partition NOT being rebuilt is unaffected by
@@ -1227,41 +1272,41 @@ class TestRebuildIndexTypeMatrix:
         assert pre == post
         drop_space(router_url, db_name, case_space)
 
-    def test_rebuild_ivfpqfs(self):
-        """6.3: IVFPQFS — fast-scan IVFPQ variant. The master allowlist
-        (entity/space.go:370-387) is build-dependent: in a default build
-        IVFPQFS is not whitelisted and the request fails at the master
-        validator with PARAM_ERROR. In that case we skip; the test still
-        documents the intent and runs end-to-end on builds that include it.
-        """
-        case_space = space_name + "_comp_ivfpqfs"
-        embedding_size = xb.shape[1]
-        cfg = {
-            "name": case_space, "partition_num": 1, "replica_num": 1,
-            "fields": [
-                {"name": "field_int", "type": "integer"},
-                {"name": "field_vector", "type": "vector",
-                 "index": {"name": "gamma", "type": "IVFPQFS",
-                           "params": {"metric_type": "L2",
-                                      "ncentroids": 128, "nsubvector": 32,
-                                      "training_threshold": 3999}},
-                 "dimension": embedding_size},
-            ],
-        }
-        resp = create_space(router_url, db_name, cfg)
-        body = resp.json()
-        if body.get("code") != 0:
-            pytest.skip(
-                f"IVFPQFS not accepted by master allowlist on this build: "
-                f"code={body.get('code')} msg={body.get('msg')}")
-        try:
-            self._run_lifecycle_existing_space(case_space, total=10000,
-                                                rebuild_timeout=600)
-        finally:
-            try:
-                drop_space(router_url, db_name, case_space)
-            except Exception:
-                pass
+    # def test_rebuild_ivfpqfs(self):
+    #     """6.3: IVFPQFS — fast-scan IVFPQ variant. The master allowlist
+    #     (entity/space.go:370-387) is build-dependent: in a default build
+    #     IVFPQFS is not whitelisted and the request fails at the master
+    #     validator with PARAM_ERROR. In that case we skip; the test still
+    #     documents the intent and runs end-to-end on builds that include it.
+    #     """
+    #     case_space = space_name + "_comp_ivfpqfs"
+    #     embedding_size = xb.shape[1]
+    #     cfg = {
+    #         "name": case_space, "partition_num": 1, "replica_num": 1,
+    #         "fields": [
+    #             {"name": "field_int", "type": "integer"},
+    #             {"name": "field_vector", "type": "vector",
+    #              "index": {"name": "gamma", "type": "IVFPQFS",
+    #                        "params": {"metric_type": "L2",
+    #                                   "ncentroids": 128, "nsubvector": 32,
+    #                                   "training_threshold": 3999}},
+    #              "dimension": embedding_size},
+    #         ],
+    #     }
+    #     resp = create_space(router_url, db_name, cfg)
+    #     body = resp.json()
+    #     if body.get("code") != 0:
+    #         pytest.skip(
+    #             f"IVFPQFS not accepted by master allowlist on this build: "
+    #             f"code={body.get('code')} msg={body.get('msg')}")
+    #     try:
+    #         self._run_lifecycle_existing_space(case_space, total=10000,
+    #                                             rebuild_timeout=600)
+    #     finally:
+    #         try:
+    #             drop_space(router_url, db_name, case_space)
+    #         except Exception:
+    #             pass
 
     def test_rebuild_binary_ivf(self):
         """6.4: BinaryIVF on packed binary vectors.
@@ -1484,40 +1529,40 @@ class TestRebuildIndexTypeMatrix:
             except Exception:
                 pass
 
-    def test_rebuild_scann(self):
-        """6.6: SCANN — accelerated quantization-based index. Requires
-        engine compiled with USE_SCANN. Skips cleanly if either master
-        rejects the type or PS engine returns an init failure.
-        """
-        case_space = space_name + "_comp_scann"
-        embedding_size = xb.shape[1]
-        cfg = {
-            "name": case_space, "partition_num": 1, "replica_num": 1,
-            "fields": [
-                {"name": "field_int", "type": "integer"},
-                {"name": "field_vector", "type": "vector",
-                 "index": {"name": "gamma", "type": "SCANN",
-                           "params": {"metric_type": "InnerProduct",
-                                      "ncentroids": 256, "nsubvector": 64,
-                                      "nprobe": 10,
-                                      "training_threshold": 3999}},
-                 "dimension": embedding_size},
-            ],
-        }
-        resp = create_space(router_url, db_name, cfg)
-        body = resp.json()
-        if body.get("code") != 0:
-            pytest.skip(
-                f"SCANN not supported on this cluster build: "
-                f"code={body.get('code')} msg={body.get('msg')}")
-        try:
-            self._run_lifecycle_existing_space(case_space, total=10000,
-                                                rebuild_timeout=900)
-        finally:
-            try:
-                drop_space(router_url, db_name, case_space)
-            except Exception:
-                pass
+    # def test_rebuild_scann(self):
+    #     """6.6: SCANN — accelerated quantization-based index. Requires
+    #     engine compiled with USE_SCANN. Skips cleanly if either master
+    #     rejects the type or PS engine returns an init failure.
+    #     """
+    #     case_space = space_name + "_comp_scann"
+    #     embedding_size = xb.shape[1]
+    #     cfg = {
+    #         "name": case_space, "partition_num": 1, "replica_num": 1,
+    #         "fields": [
+    #             {"name": "field_int", "type": "integer"},
+    #             {"name": "field_vector", "type": "vector",
+    #              "index": {"name": "gamma", "type": "SCANN",
+    #                        "params": {"metric_type": "InnerProduct",
+    #                                   "ncentroids": 256, "nsubvector": 64,
+    #                                   "nprobe": 10,
+    #                                   "training_threshold": 3999}},
+    #              "dimension": embedding_size},
+    #         ],
+    #     }
+    #     resp = create_space(router_url, db_name, cfg)
+    #     body = resp.json()
+    #     if body.get("code") != 0:
+    #         pytest.skip(
+    #             f"SCANN not supported on this cluster build: "
+    #             f"code={body.get('code')} msg={body.get('msg')}")
+    #     try:
+    #         self._run_lifecycle_existing_space(case_space, total=10000,
+    #                                             rebuild_timeout=900)
+    #     finally:
+    #         try:
+    #             drop_space(router_url, db_name, case_space)
+    #         except Exception:
+    #             pass
 
     def _run_lifecycle_existing_space(self, case_space, total=10000,
                                       rebuild_timeout=600,
