@@ -304,6 +304,30 @@ def _docker_exec_cat_logs(container_name, timeout=15):
         return ""
 
 
+def _docker_exec_master_healthy(container_name, timeout=8):
+    """docker 模式下,master api 端口没暴露到 host(m2/m3)时,exec 进容器
+    curl localhost:8817/servers 判活(所有 master 容器内部都监听 8817,见
+    docker-compose 的 healthcheck)。容器必须 running,任何失败返回 False。
+
+    解决的问题:wait_for_master_quorum 原本只探 host 暴露了 api 的 master
+    (docker 下只有 m1)。一旦 chaos 测试 kill 掉 m1,host 上就探不到任何
+    master,即使 m2+m3 quorum 健康也会误判「quorum lost」。
+    """
+    if not _docker_inspect_running(container_name):
+        return False
+    try:
+        out = subprocess.run(
+            ["docker", "exec", container_name, "sh", "-c",
+             "curl -fs -u root:secret http://localhost:8817/servers"],
+            capture_output=True, text=True, timeout=timeout)
+        if out.returncode != 0 or not out.stdout:
+            return False
+        import json as _json
+        return _json.loads(out.stdout).get("code") == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        return False
+
+
 # bare 模式下各角色的 host 日志目录名(LOG_DIR 下的子目录)。
 _BARE_LOG_DIRNAME = {
     "ps": lambda idx: f"ps{idx}",
@@ -597,24 +621,30 @@ def wait_for_master_ready(name, timeout=30):
 
 
 def wait_for_master_quorum(timeout=30):
-    """Poll until at least one master with a host-exposed api port responds
-    to /servers. docker mode 下只 master1 (api=8817) 在 host 上可达。
+    """Poll until at least one master is reachable / serving.
+
+    docker mode 下只 master1 (api=8817) 在 host 上可达;其它 master 的 api
+    没暴露,但可以 `docker exec` 进容器 curl localhost:8817 判活。否则一旦
+    kill 掉 m1,host 上探不到任何 master 会误判 quorum 丢失(即使 m2+m3
+    quorum 健康)。
     """
     def _ok():
         for name, ports in MASTERS.items():
             api_port = ports.get("api")
-            if api_port is None:
-                continue
-            try:
-                r = requests.get(
-                    f"http://127.0.0.1:{api_port}/servers",
-                    auth=AUTH,
-                    timeout=2,
-                )
-                if r.status_code == 200 and r.json().get("code") == 0:
+            if api_port is not None:
+                try:
+                    r = requests.get(
+                        f"http://127.0.0.1:{api_port}/servers",
+                        auth=AUTH,
+                        timeout=2,
+                    )
+                    if r.status_code == 200 and r.json().get("code") == 0:
+                        return True
+                except Exception:
+                    pass
+            elif CLUSTER_MODE == "docker":
+                if _docker_exec_master_healthy(ports.get("container_name")):
                     return True
-            except Exception:
-                continue
         return False
     _wait_until(_ok, timeout=timeout, desc="any master to be reachable")
 
