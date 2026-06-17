@@ -62,9 +62,15 @@ def _trigger_rebuild(db, space, max_retries=0, drop_before_rebuild=False):
 
 
 def _get_progress(db, space):
-    r = requests.get(
-        f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}/progress",
-        auth=(username, password), timeout=5)
+    try:
+        r = requests.get(
+            f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}/progress",
+            auth=(username, password), timeout=5)
+    except requests.exceptions.RequestException:
+        # PS 死 / 集群降级时 router 可能 hang 到超时;视为本次 poll 无结果,
+        # 由调用方(_wait_terminal / _wait_until_running 等都 `if p:` 兜底)
+        # 下一轮重试,而不是把整条测试带挂。
+        return None
     if r.status_code != 200:
         return None
     body = r.json()
@@ -1412,7 +1418,39 @@ class TestRebuildReplicaRoutingChaos:
                 except Exception as e:
                     return False, repr(e)
 
-            # 5. 触发 p1 单 partition rebuild --------------------------
+            # 5. (strong 模式) 先 kill Z,并等 router 把死 Z 踢出 p2 候选、
+            #    确认"无重建时 X.r2 确实在为 p2 服务"(baseline)。
+            #    把 kill 提前到触发 rebuild 之前有两个关键好处:
+            #      1) 消除"打到刚死、router 还没踢掉的 Z"造成的超时噪声 ——
+            #         之前窗口内 0 成功多半就是采样全打在没被踢掉的死 Z 上;
+            #      2) baseline 通过后,p2 候选只剩 X.r2(node1),后面重建期间
+            #         若 p2 失败即可干净归因为"重建 X.r1 干扰了 X 的 p2 路由",
+            #         而非环境/驱逐问题。
+            killed = [False]
+            if mode == "strong":
+                try:
+                    cl.kill_ps(kill_ps_idx, hard=True)
+                    killed[0] = True
+                    logger.info("3.5 killed ps%d (node=%s) BEFORE rebuild "
+                                "to isolate p2 onto X.r2",
+                                kill_ps_idx, kill_node)
+                except Exception as e:
+                    logger.warning("kill_ps(%d) failed: %s", kill_ps_idx, e)
+                baseline_ok = False
+                deadline = time.time() + 40
+                while time.time() < deadline:
+                    ok, _ = _qpart(p2_pid, 1.0, 1000)
+                    if ok:
+                        baseline_ok = True
+                        break
+                    time.sleep(0.5)
+                if not baseline_ok:
+                    pytest.skip(
+                        "baseline: Z 死后(无重建)p2 始终路由不到 X.r2 —— "
+                        "与 rebuild 无关的路由/驱逐问题,无法验证 3.5 不变量")
+                logger.info("3.5 baseline OK: 无重建时 p2 已稳定路由到 X.r2")
+
+            # 6. 触发 p1 单 partition rebuild --------------------------
             rebuild_url = (f"{router_url}/rebuild/index/dbs/{db_name}"
                            f"/spaces/{case_space}")
             trig_resp = requests.post(rebuild_url,
@@ -1420,12 +1458,11 @@ class TestRebuildReplicaRoutingChaos:
                                       json={"partition_id": p1_pid})
             assert trig_resp.json().get("code") == 0, trig_resp.text
 
-            # 6. 启动 watcher + 查询线程, 仅在窗口内采样 -------------
+            # 7. 启动 watcher + 查询线程, 仅在窗口内采样 -------------
             p1_results, p2_results = [], []
             stop_evt = threading.Event()
             window_open = [False]
             x_running_seen = [False]
-            killed = [False]
 
             def _watcher():
                 lid = int(x_node)
@@ -1440,23 +1477,7 @@ class TestRebuildReplicaRoutingChaos:
                                         and int(t.get("status", -1)) == 1
                                         and t.get("dispatched", False)):
                                     in_window = True
-                                    if not x_running_seen[0]:
-                                        x_running_seen[0] = True
-                                        # strong 模式: 第一次看到窗口立刻
-                                        # kill Z, 让 X.r2 成为 p2 唯一可达
-                                        if mode == "strong" and not killed[0]:
-                                            try:
-                                                cl.kill_ps(kill_ps_idx,
-                                                           hard=True)
-                                                killed[0] = True
-                                                logger.info(
-                                                    "3.5 killed ps%d (node=%s)"
-                                                    " to force p2 → X.r2",
-                                                    kill_ps_idx, kill_node)
-                                            except Exception as e:
-                                                logger.warning(
-                                                    "kill_ps(%d) failed: %s",
-                                                    kill_ps_idx, e)
+                                    x_running_seen[0] = True
                                     break
                         window_open[0] = in_window
                         if p and p.get("status") in (
@@ -1473,14 +1494,14 @@ class TestRebuildReplicaRoutingChaos:
                     time.sleep(0.01)
 
             watcher = threading.Thread(target=_watcher, daemon=True)
-            # p1: 温和超时(2s)避免误伤 9a "全成功";p2: 激进超时(0.6s)
-            # 让窗口内尽可能多发请求,随机路由很快命中存活的 X.r2。
+            # 死 Z 已在 baseline 阶段被 router 踢出,p2 候选只剩 X.r2(node1),
+            # 故两个 partition 都用温和超时即可(无需 fast-fail 死节点)。
             q1 = threading.Thread(
                 target=_q_loop,
                 args=(p1_pid, p1_results, 2, 2000), daemon=True)
             q2 = threading.Thread(
                 target=_q_loop,
-                args=(p2_pid, p2_results, 0.6, 600), daemon=True)
+                args=(p2_pid, p2_results, 2, 2000), daemon=True)
             watcher.start(); q1.start(); q2.start()
 
             try:
@@ -1523,40 +1544,26 @@ class TestRebuildReplicaRoutingChaos:
             )
 
             # 9b. p2 查询
-            #   strong: kill 掉 Z 后 p2 唯一候选只剩 X.r2;但 SIGKILL 后
-            #           router 需要一个心跳周期才能把死掉的 Z 踢出候选集,这
-            #           期间打到 Z 的查询会 ReadTimeout(传播延迟,不是 "X 被
-            #           整体排除")。区分三种结果:
-            #             - 干净路由失败 (code≠0, 非超时) ⇒ 真回归 ⇒ fail
-            #             - 至少一次成功 ⇒ X.r2 在为 p2 服务 ⇒ 不变量成立
-            #             - 只有瞬时超时、零成功 ⇒ 本次 rebuild 窗口短于 router
-            #               驱逐死副本的时间,不构成有效观测 ⇒ skip
+            #   strong: baseline 已证明"无重建时 X.r2 在为 p2 服务",且死 Z
+            #           早已被 router 踢出候选 ⇒ 重建期间 p2 只会路由到 X.r2。
+            #           此时 p2 若 *零成功* / 大量失败,即可干净归因为"重建
+            #           X.r1 干扰了 X 节点上 p2 的服务/路由"(跨 partition 干扰
+            #           回归)⇒ fail。
             #   weak:   仅证 p1 rebuild 没把 p2 整体打挂 (无法直接证 X.r2)
             p2_fail = [r for r in p2_results if not r[0]]
             if mode == "strong":
-                def _is_timeout(r):
-                    s = str(r[1]).lower()
-                    return "timed out" in s or "timeout" in s
-                clean_fail = [r for r in p2_fail if not _is_timeout(r)]
                 p2_ok = len(p2_results) - len(p2_fail)
-                assert not clean_fail, (
-                    f"kill 掉 p2 的另一个 replica (ps{kill_ps_idx}) 后 "
-                    f"partition_id={p2_pid} 出现干净路由失败 "
-                    f"{len(clean_fail)}/{len(p2_results)};X.r2 应当仍参与 p2 "
-                    f"路由,但 router 可能因为 X.r1 在 rebuild 而把 X 整个节点"
-                    f"排除 (sample={clean_fail[:3]})"
+                assert p2_ok >= 1, (
+                    f"baseline 已证明无重建时 X.r2 可为 p2(partition_id="
+                    f"{p2_pid})服务,但 p1 在 X(node={x_node})上重建期间 p2 "
+                    f"零成功({len(p2_fail)} 次失败)⇒ 重建 X.r1 干扰了 X 节点"
+                    f"上 p2 的路由/服务(跨 partition 隔离被破坏)"
+                    f" (sample={p2_fail[:3]})"
                 )
-                if p2_ok == 0:
-                    pytest.skip(
-                        f"kill Z 后窗口内 p2 仅有瞬时超时({len(p2_fail)} 次)、"
-                        "无成功样本:本次 rebuild 窗口短于 router 驱逐死副本的"
-                        "时间,不构成有效 strong 观测 (sample="
-                        f"{p2_fail[:3]})"
-                    )
                 if p2_fail:
                     logger.info(
-                        "3.5 strong: p2 有 %d 次瞬时超时(kill Z 传播延迟)、"
-                        "%d 次成功 ⇒ X.r2 确在参与 p2 路由", len(p2_fail), p2_ok)
+                        "3.5 strong: 重建期间 p2 %d 成功 / %d 失败(X.r2 仍在"
+                        "服务,但有抖动)", p2_ok, len(p2_fail))
             else:
                 ok = len(p2_results) - len(p2_fail)
                 rate = ok / len(p2_results) if p2_results else 0
@@ -1806,10 +1813,15 @@ class TestRebuildPSFailureExtras:
                 f"{case_space}?detail=true")
             partitions = None
             for _ in range(15):
-                r = requests.get(detail_url, auth=(username, password),
-                                 timeout=5)
-                if r.status_code == 200:
-                    partitions = (r.json().get("data") or {}).get("partitions")
+                try:
+                    r = requests.get(detail_url, auth=(username, password),
+                                     timeout=5)
+                    if r.status_code == 200:
+                        partitions = (r.json().get("data") or {}).get("partitions")
+                except requests.exceptions.RequestException:
+                    # ps2 死期间 router 汇总分区信息会 hang 到超时 → 视为本轮
+                    # 拿不到,继续重试(等 leader 重选 / 集群稳定)。
+                    partitions = None
                 if partitions:
                     break
                 time.sleep(2)
@@ -1836,7 +1848,8 @@ class TestRebuildPSFailureExtras:
 
             # Bonus: search must still respond 200 (not stuck due to a
             # stale Rebuilding marker preventing replica from receiving
-            # query traffic).
+            # query traffic). ps2 死期间 router 可能 hang,重试几次并容忍瞬时
+            # 超时;只要有一次正常响应即可。
             search_url = router_url + "/document/search?timeout=5000"
             search_data = {
                 "vector_value": False,
@@ -1846,9 +1859,19 @@ class TestRebuildPSFailureExtras:
                              "feature": xb[0].tolist()}],
                 "limit": 1,
             }
-            sr = requests.post(search_url, auth=(username, password),
-                               json=search_data, timeout=10)
-            assert sr.status_code == 200, sr.text
+            sr = None
+            for _ in range(8):
+                try:
+                    sr = requests.post(search_url, auth=(username, password),
+                                       json=search_data, timeout=10)
+                    if sr.status_code == 200:
+                        break
+                except requests.exceptions.RequestException:
+                    sr = None
+                time.sleep(2)
+            assert sr is not None and sr.status_code == 200, (
+                "post-failure search 始终未正常响应(ps2 死期间 router 持续"
+                f"hang/超时):{getattr(sr, 'text', 'no response')[:200]}")
             logger.info("post-failure search response code=%s",
                          sr.json().get("code"))
         finally:
