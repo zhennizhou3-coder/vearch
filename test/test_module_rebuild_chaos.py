@@ -58,7 +58,7 @@ def _trigger_rebuild(db, space, max_retries=0, drop_before_rebuild=False):
         payload["drop_before_rebuild"] = True
     return requests.post(
         f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}",
-        auth=(username, password), json=payload)
+        auth=(username, password), json=payload, timeout=30)
 
 
 def _get_progress(db, space):
@@ -79,14 +79,32 @@ def _get_progress(db, space):
     return body.get("data", {}) or {}
 
 
-def _get_space_detail(db, space):
-    r = requests.get(
-        f"{router_url}/dbs/{db}/spaces/{space}?detail=true",
-        auth=(username, password), timeout=5)
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body.get("code") == 0, body
-    return body.get("data", {}) or {}
+def _get_space_detail(db, space, retries=6, retry_sleep=2):
+    """读 space detail。kill PS / 集群降级时 router 汇总分区信息会 hang 到
+    超时;这里重试若干次(给 leader 重选 / PS 恢复留时间),持续失败才 raise,
+    而不是单次 ReadTimeout 就把整条测试带挂。所有调用方共享这层健壮性。
+    """
+    last = None
+    for _ in range(retries):
+        try:
+            r = requests.get(
+                f"{router_url}/dbs/{db}/spaces/{space}?detail=true",
+                auth=(username, password), timeout=5)
+        except requests.exceptions.RequestException as e:
+            last = repr(e)
+            time.sleep(retry_sleep)
+            continue
+        if r.status_code == 200:
+            body = r.json()
+            if body.get("code") == 0:
+                return body.get("data", {}) or {}
+            last = body
+        else:
+            last = r.text
+        time.sleep(retry_sleep)
+    raise AssertionError(
+        f"_get_space_detail({db}/{space}) 连续 {retries} 次失败"
+        f"(集群可能严重降级): {last}")
 
 
 def _partition_id(partition):
@@ -272,7 +290,7 @@ def _ensure_clean_db():
     _ensure_all_masters_alive()
     try:
         url = f"{router_url}/dbs/{db_name}/spaces"
-        body = requests.get(url, auth=(username, password)).json()
+        body = requests.get(url, auth=(username, password), timeout=5).json()
         if body.get("code") == 0 and body.get("data"):
             for sp in body["data"]:
                 sn = sp.get("space_name") or sp.get("name") or ""
@@ -325,10 +343,12 @@ def _wait_index_status_indexed(db, space, max_rounds=180, poll_interval=5):
     """
     url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
     for _ in range(max_rounds):
-        rs = requests.get(url, auth=(username, password))
-        body = rs.json()
-        data = body.get("data", {})
-        partitions = data.get("partitions", [])
+        try:
+            rs = requests.get(url, auth=(username, password), timeout=5)
+            data = rs.json().get("data", {}) if rs.status_code == 200 else {}
+        except requests.exceptions.RequestException:
+            data = {}  # router 暂时 hang(降级)→ 本轮跳过,下一轮重试
+        partitions = data.get("partitions") or []
         statuses = [p.get("index_status", -1) for p in partitions]
         if data.get("status") != "red" and partitions and all(s == 2 for s in statuses):
             return
@@ -954,7 +974,7 @@ class TestRebuildReplicaRoutingChaos:
             waiting_index_finish(total, space_name=case_space)
 
             detail = _get_space_detail(db_name, case_space)
-            partitions = detail.get("partitions", [])
+            partitions = detail.get("partitions") or []
             assert len(partitions) >= 2, f"need >=2 partitions: {partitions}"
             search_url = router_url + "/document/search?timeout=5000"
 
@@ -1078,7 +1098,7 @@ class TestRebuildReplicaRoutingChaos:
                 (baseline_p99, rebuild_p99))
 
             post_detail = _get_space_detail(db_name, case_space)
-            for p in post_detail.get("partitions", []):
+            for p in post_detail.get("partitions") or []:
                 for nid, st in _partition_restatus_map(p).items():
                     assert st == "ReplicasOK", (
                         "rebuild 后 pid=%s node=%s status=%s 未恢复 OK" %
@@ -1108,7 +1128,7 @@ class TestRebuildReplicaRoutingChaos:
             waiting_index_finish(total, space_name=case_space)
 
             detail = _get_space_detail(db_name, case_space)
-            partitions = detail.get("partitions", [])
+            partitions = detail.get("partitions") or []
             assert partitions, "space has no partition"
             leader_id = (partitions[0].get("leader")
                          or partitions[0].get("LeaderID")
@@ -1232,7 +1252,9 @@ class TestRebuildReplicaRoutingChaos:
                         fallback_lines[0])
 
             post_detail = _get_space_detail(db_name, case_space)
-            post_partition = post_detail.get("partitions", [])[0]
+            post_parts = post_detail.get("partitions") or []
+            assert post_parts, "rebuild 后 detail 未返回任何 partition"
+            post_partition = post_parts[0]
             post_leader_id = (post_partition.get("leader")
                               or post_partition.get("LeaderID")
                               or post_partition.get("raft_status", {}).get("Leader"))
@@ -1293,7 +1315,7 @@ class TestRebuildReplicaRoutingChaos:
             #         Z, 进入 strong 模式。
             #   次选: 任意共享 X → 进入 weak 模式 (不 kill)。
             detail = _get_space_detail(db_name, case_space)
-            partitions = detail.get("partitions", [])
+            partitions = detail.get("partitions") or []
             assert len(partitions) >= 2, f"need ≥2 partitions: {partitions}"
 
             # detail API 的 replica_status 由 PS 心跳写入, 新建 space 后
@@ -1455,7 +1477,8 @@ class TestRebuildReplicaRoutingChaos:
                            f"/spaces/{case_space}")
             trig_resp = requests.post(rebuild_url,
                                       auth=(username, password),
-                                      json={"partition_id": p1_pid})
+                                      json={"partition_id": p1_pid},
+                                      timeout=30)
             assert trig_resp.json().get("code") == 0, trig_resp.text
 
             # 7. 启动 watcher + 查询线程, 仅在窗口内采样 -------------
@@ -1581,7 +1604,7 @@ class TestRebuildReplicaRoutingChaos:
 
             # 10. rebuild 完成后所有 ReStatus 回到 OK ------------------
             post = _get_space_detail(db_name, case_space)
-            for p in post.get("partitions", []):
+            for p in post.get("partitions") or []:
                 rsm = p.get("replica_status") or {}
                 for nid, st in rsm.items():
                     assert st != "ReplicasRebuilding", (
@@ -1974,7 +1997,7 @@ class TestRebuildPSFailureExtras:
             assert pl.get("code") == 0, pl
             our_node = None
             detail = _get_space_detail(db_name, case_space)
-            our_pids = {p.get("pid") for p in detail.get("partitions", [])}
+            our_pids = {p.get("pid") for p in detail.get("partitions") or []}
             for it in pl.get("data") or []:
                 if it.get("id") in our_pids:
                     reps = it.get("replicas") or []
@@ -2084,7 +2107,7 @@ class TestRebuildPSFailureExtras:
             pl = requests.get(f"{router_url}/partitions",
                               auth=(username, password), timeout=5).json()
             detail = _get_space_detail(db_name, case_space)
-            our_pids = {p.get("pid") for p in detail.get("partitions", [])}
+            our_pids = {p.get("pid") for p in detail.get("partitions") or []}
             our_node = None
             for it in pl.get("data") or []:
                 if it.get("id") in our_pids:

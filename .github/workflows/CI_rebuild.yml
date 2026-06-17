@@ -23,9 +23,6 @@ on:
 jobs:
   rebuild-fast:
     name: 'Rebuild comprehensive tests'
-    # ⚠️ 临时禁用:comprehensive 已经跑通,先腾出资源单独验证 chaos job。
-    # 验完 chaos 后把这行删掉、并恢复 rebuild-chaos 的 `needs: rebuild-fast`。
-    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 90     # comprehensive + DiskANN 可能比纯 fast 更久
     strategy:
@@ -51,13 +48,11 @@ jobs:
     # ---- 模块测试:基础 lifecycle ----
     # test_module_rebuild_index.py 覆盖:
     #   trigger / progress / cancel / 多 target / DB-level / 全局 rebuild
-    # Basic lifecycle tests have already passed. Keep this step disabled
-    # temporarily so CI can focus on the remaining comprehensive coverage.
-    # - name: Run basic rebuild module tests
-    #   run: |
-    #     cd test
-    #     pytest test_module_rebuild_index.py \
-    #       -x --log-cli-level=INFO
+    - name: Run basic rebuild module tests
+      run: |
+        cd test
+        pytest test_module_rebuild_index.py \
+          -x --log-cli-level=INFO
 
     - name: Run comprehensive rebuild tests
       run: |
@@ -88,8 +83,7 @@ jobs:
   # ---------------------------------------------------------------------------
   rebuild-chaos:
     name: 'Chaos rebuild (PS kill, master failover)'
-    # ⚠️ 临时去掉 `needs: rebuild-fast`,让 chaos 独立跑(rebuild-fast 已 if:false
-    # 被禁用,留着 needs 会让 chaos 被连带 skip)。验完 chaos 后恢复 needs。
+    needs: rebuild-fast
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
