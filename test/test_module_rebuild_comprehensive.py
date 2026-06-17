@@ -60,8 +60,24 @@ gt = sift10k.get_groundtruth()
 
 
 def _trigger_rebuild(db, space, field_name="", index_type="", max_retries=0,
-                     drop_before_rebuild=False, describe=0, partition_id=-1):
-    """POST rebuild with optional parameters."""
+                     drop_before_rebuild=False, describe=0, partition_id=-1,
+                     ensure_indexed=True):
+    """POST rebuild with optional parameters.
+
+    ensure_indexed: gate on every partition reaching index_status==INDEXED
+        before triggering. waiting_index_finish() only waits the *aggregate*
+        index_num to reach total — it does NOT guarantee per-partition
+        index_status has flipped to INDEXED. There is a window (wider for
+        range-partitioned spaces, where index build is more staggered) in
+        which the doc count is complete but some partition is still
+        UNINDEXED. Triggering then is rejected by the server with
+        "rebuild requires an existing index", the rebuild never starts, and
+        the progress poller times out. Gating here makes every trigger
+        deterministic. Pass ensure_indexed=False only when the space is
+        intentionally not (yet) fully indexed at trigger time.
+    """
+    if ensure_indexed:
+        _wait_index_status_indexed(db, space)
     payload = {}
     if field_name and index_type:
         url = f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}/fields/{field_name}/indexes/{index_type}"
@@ -233,7 +249,6 @@ def _hnsw_range_partition_cfg(name, pn=1, rn=2):
                 "ranges": [
                     {"name": "p0", "value": "2026-01-02"},
                     {"name": "p1", "value": "2026-01-03"},
-                    {"name": "p2", "value": "2026-01-04"},
                 ],
             }}
 
@@ -517,7 +532,9 @@ class TestRebuildReplicaSerialization:
         searcher.start()
 
         resp = _trigger_rebuild(db_name, case_space)
-        assert resp.json().get("code") == 0
+        trigger_body = resp.json()
+        assert trigger_body.get("code") == 0, trigger_body
+        assert trigger_body.get("data", {}).get("failed", 0) == 0, trigger_body
         _wait_rebuild_completed(db_name, case_space, timeout=600)
 
         stop_evt.set()
@@ -1529,40 +1546,40 @@ class TestRebuildIndexTypeMatrix:
             except Exception:
                 pass
 
-    # def test_rebuild_scann(self):
-    #     """6.6: SCANN — accelerated quantization-based index. Requires
-    #     engine compiled with USE_SCANN. Skips cleanly if either master
-    #     rejects the type or PS engine returns an init failure.
-    #     """
-    #     case_space = space_name + "_comp_scann"
-    #     embedding_size = xb.shape[1]
-    #     cfg = {
-    #         "name": case_space, "partition_num": 1, "replica_num": 1,
-    #         "fields": [
-    #             {"name": "field_int", "type": "integer"},
-    #             {"name": "field_vector", "type": "vector",
-    #              "index": {"name": "gamma", "type": "SCANN",
-    #                        "params": {"metric_type": "InnerProduct",
-    #                                   "ncentroids": 256, "nsubvector": 64,
-    #                                   "nprobe": 10,
-    #                                   "training_threshold": 3999}},
-    #              "dimension": embedding_size},
-    #         ],
-    #     }
-    #     resp = create_space(router_url, db_name, cfg)
-    #     body = resp.json()
-    #     if body.get("code") != 0:
-    #         pytest.skip(
-    #             f"SCANN not supported on this cluster build: "
-    #             f"code={body.get('code')} msg={body.get('msg')}")
-    #     try:
-    #         self._run_lifecycle_existing_space(case_space, total=10000,
-    #                                             rebuild_timeout=900)
-    #     finally:
-    #         try:
-    #             drop_space(router_url, db_name, case_space)
-    #         except Exception:
-    #             pass
+    def test_rebuild_scann(self):
+        """6.6: SCANN — accelerated quantization-based index. Requires
+        engine compiled with USE_SCANN. Skips cleanly if either master
+        rejects the type or PS engine returns an init failure.
+        """
+        case_space = space_name + "_comp_scann"
+        embedding_size = xb.shape[1]
+        cfg = {
+            "name": case_space, "partition_num": 1, "replica_num": 1,
+            "fields": [
+                {"name": "field_int", "type": "integer"},
+                {"name": "field_vector", "type": "vector",
+                 "index": {"name": "gamma", "type": "SCANN",
+                           "params": {"metric_type": "InnerProduct",
+                                      "ncentroids": 256, "nsubvector": 64,
+                                      "nprobe": 10,
+                                      "training_threshold": 3999}},
+                 "dimension": embedding_size},
+            ],
+        }
+        resp = create_space(router_url, db_name, cfg)
+        body = resp.json()
+        if body.get("code") != 0:
+            pytest.skip(
+                f"SCANN not supported on this cluster build: "
+                f"code={body.get('code')} msg={body.get('msg')}")
+        try:
+            self._run_lifecycle_existing_space(case_space, total=10000,
+                                                rebuild_timeout=900)
+        finally:
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception:
+                pass
 
     def _run_lifecycle_existing_space(self, case_space, total=10000,
                                       rebuild_timeout=600,
@@ -1936,6 +1953,9 @@ class TestRebuildLifecycle:
                 requests.post(url_upsert, auth=(username, password),
                                json={"db_name": local_db, "space_name": sp, "documents": docs})
             waiting_index_finish(total, space_name=sp, db_name=local_db)
+            # Same per-partition INDEXED gate as _trigger_rebuild; this test
+            # POSTs the DB-level rebuild directly so it can't piggyback on it.
+            _wait_index_status_indexed(local_db, sp)
 
         # Trigger DB-level rebuild.
         rs = requests.post(f"{router_url}/rebuild/index/dbs/{local_db}",
