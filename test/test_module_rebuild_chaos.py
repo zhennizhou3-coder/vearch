@@ -1275,7 +1275,9 @@ class TestRebuildReplicaRoutingChaos:
         if resp.json().get("code") != 0:
             pytest.skip(f"cluster cannot host pn=2 rn=2: {resp.json()}")
         try:
-            _populate(case_space, total=5000)
+            # 数据量大些 → p1 rebuild 窗口更长,给 kill Z 之后的 p2 采样留出
+            # 足够时间(随机路由需要多打几次才会命中 X.r2)。
+            _populate(case_space, total=min(xb.shape[0], 10000))
 
             # 2. 拿 partition 布局, 选择 (p1, p2, X) 与可能的 kill 目标 Z
             #   首选: (replicas(p2) - {X}) ∩ replicas(p1) == ∅ → 可 kill
@@ -1380,7 +1382,12 @@ class TestRebuildReplicaRoutingChaos:
             #   document_ids 给一个一定存在的 ID; 即使 hash 后不在该 partition,
             #   getDocsByPartition 仍会以 code=0 返回(items 中带 not_found),
             #   我们只关心传输/路由是否成功。
-            query_url = router_url + "/document/query?timeout=5000"
+            #   超时取小(1.5s):这是随机路由,候选含刚被 kill 的 Z,打到 Z
+            #   的查询会卡住;超时太长(原 5s)会让单次卡顿吃光整个 rebuild
+            #   窗口、只采到 1 个样本。短超时 → 死 Z 快速失败、循环继续,
+            #   随机路由很快会命中存活的 X.r2。点查 doc_id 是 RocksDB get,
+            #   X.r2 即使在 rebuild 负载下也能在 1.5s 内返回。
+            query_url = router_url + "/document/query?timeout=1500"
 
             def _qpart(pid):
                 data = {
@@ -1392,7 +1399,7 @@ class TestRebuildReplicaRoutingChaos:
                 try:
                     rs = requests.post(query_url,
                                        auth=(username, password),
-                                       json=data, timeout=5)
+                                       json=data, timeout=2)
                     if rs.status_code != 200:
                         return False, rs.text[:200]
                     body = rs.json()
