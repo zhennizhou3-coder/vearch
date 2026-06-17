@@ -503,7 +503,7 @@ class TestRebuildReplicaSerialization:
 
         # === 第 2 阶段:rebuild + 并发 search,实时记录 ReStatusMap ===
         rebuild_latencies = []
-        restatus_snapshots = []  # list of (ts, {pid: {nodeID: state}})
+        restatus_snapshots = []  # list of (ts, {pid: {nodeID: state_str}})
         stop_evt = threading.Event()
 
         def _restatus_poller():
@@ -512,8 +512,12 @@ class TestRebuildReplicaSerialization:
                     d = _get_space_detail(db_name, case_space)
                     snap = {}
                     for p in d.get("partitions", []):
-                        rsm = p.get("status_map") or p.get("re_status_map") or {}
-                        snap[p.get("pid")] = {int(k): int(v) for k, v in rsm.items()}
+                        # detail API exposes per-replica rebuild state under
+                        # "replica_status" with string values
+                        # (ReplicasOK / ReplicasRebuilding / ReplicasNotReady),
+                        # NOT a numeric "status_map".
+                        rsm = p.get("replica_status") or {}
+                        snap[p.get("pid")] = {int(k): v for k, v in rsm.items()}
                     restatus_snapshots.append((time.time(), snap))
                 except Exception:
                     pass
@@ -542,9 +546,9 @@ class TestRebuildReplicaSerialization:
         searcher.join(timeout=5)
 
         # === 第 3 阶段:断言 ===
-        # 3a. 至少观察到一帧 Rebuilding(=3)状态(否则集群没经过被验证的状态)
+        # 3a. 至少观察到一帧 Rebuilding 状态(否则集群没经过被验证的状态)
         seen_rebuilding = any(
-            any(s == 3 for nodes in snap.values() for s in nodes.values())
+            any(s == "ReplicasRebuilding" for nodes in snap.values() for s in nodes.values())
             for _, snap in restatus_snapshots)
         assert seen_rebuilding, (
             "ReStatusMap 全程没出现 Rebuilding 状态;rebuild 太快或 polling "
@@ -566,12 +570,12 @@ class TestRebuildReplicaSerialization:
             f"rebuild={rebuild_p99:.1f}ms (>5x);疑似 search 被路由到了 "
             f"Rebuilding 副本")
 
-        # 3d. 终态后所有 ReStatusMap 应回到 OK(=1)
+        # 3d. 终态后所有 replica_status 应回到 ReplicasOK
         post_detail = _get_space_detail(db_name, case_space)
         for p in post_detail.get("partitions", []):
-            rsm = p.get("status_map") or p.get("re_status_map") or {}
+            rsm = p.get("replica_status") or {}
             for nid, st in rsm.items():
-                assert int(st) == 1, (
+                assert st == "ReplicasOK", (
                     f"rebuild 完成后 pid={p.get('pid')} node={nid} "
                     f"state={st} 仍未回到 ReplicasOK")
 
@@ -639,10 +643,10 @@ class TestRebuildReplicaSerialization:
                 try:
                     d = _get_space_detail(db_name, case_space)
                     for p in d.get("partitions", []):
-                        rsm = p.get("status_map") or p.get("re_status_map") or {}
+                        rsm = p.get("replica_status") or {}
                         if leader_id is not None:
                             st = rsm.get(str(leader_id)) or rsm.get(int(leader_id))
-                            if st is not None and int(st) == 3:
+                            if st == "ReplicasRebuilding":
                                 leader_seen_rebuilding[0] = True
                 except Exception:
                     pass
