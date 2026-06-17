@@ -843,3 +843,77 @@ def list_registered_pses():
         except Exception:
             continue
     return []
+
+
+def _query_servers():
+    """返回 master /servers 里的 server 条目列表(每项形如 {"server": {...}}
+    或直接是 server dict),查不到返回 []。遍历 MASTERS 找第一个 host 上可达
+    的 api 端口(docker mode 只有 m1 暴露)。"""
+    for ports in MASTERS.values():
+        api_port = ports.get("api")
+        if api_port is None:
+            continue
+        try:
+            r = requests.get(
+                f"http://127.0.0.1:{api_port}/servers",
+                auth=AUTH, timeout=2)
+            if r.status_code == 200 and r.json().get("code") == 0:
+                data = r.json().get("data") or {}
+                return data.get("servers") or []
+        except Exception:
+            continue
+    return []
+
+
+def _docker_container_ip(container_name):
+    """容器在 docker 网络里的 IP;失败返回 ""。"""
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", "--format",
+             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+             container_name],
+            capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+    return ""
+
+
+def ps_idx_for_node(node_id):
+    """把 master /servers 里的 PS nodeID 映射到本地 PS 实例号(idx)。
+    映射不出来返回 None — caller 应据此优雅降级(skip / weak 模式)。
+
+    bare:   按 rpc_port 匹配(server.rpc_port == PSES[idx]['rpc'])。
+    docker: PS 容器内 rpc_port 都是 8081 无法区分,改用容器 IP 匹配
+            (server.ip == 该 PS 容器在 compose 网络里的 IP)。
+    """
+    target = None
+    for item in _query_servers():
+        server = item.get("server") if isinstance(item, dict) and "server" in item else item
+        if not isinstance(server, dict):
+            continue
+        try:
+            if int(server.get("name", -1)) == int(node_id):
+                target = server
+                break
+        except (TypeError, ValueError):
+            continue
+    if target is None:
+        return None
+
+    if CLUSTER_MODE == "docker":
+        ip = target.get("ip", "")
+        if not ip:
+            return None
+        for idx, info in PSES.items():
+            if _docker_container_ip(info["container_name"]) == ip:
+                return idx
+        return None
+
+    rpc = target.get("rpc_port")
+    for idx, info in PSES.items():
+        if info.get("rpc") == rpc:
+            return idx
+    return None
+

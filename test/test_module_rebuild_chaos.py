@@ -164,8 +164,20 @@ def _ensure_all_ps_alive(timeout=30, expected_count=None, settle_timeout=30):
         except Exception as e:
             logger.warning("pre-test start_ps(%d) failed: %s", idx, e)
 
-    # 拿 master 当前认的 RPC ports,反查哪些 PS idx 没被认上。
+    # 拿 master 当前认的情况,反查哪些 PS idx 没被认上。
     def _missing_idxs():
+        if cl.CLUSTER_MODE == "docker":
+            # docker 模式没法用 rpc 端口区分 PS(容器内端口都是 8081,host
+            # 不可见)。先看容器是否 running;容器都在但 master 认的数量不够
+            # → lease 丢失,无法精确定位,返回全部让上层逐个 kill+restart。
+            not_running = [idx for idx in cl.PSES
+                           if not cl._docker_inspect_running(
+                               cl.PSES[idx]["container_name"])]
+            if not_running:
+                return not_running
+            if len(cl.list_registered_pses()) < expected:
+                return list(cl.PSES.keys())
+            return []
         registered_ports = set(cl.list_registered_pses())
         missing = []
         for idx, info in cl.PSES.items():
@@ -1355,19 +1367,7 @@ class TestRebuildReplicaRoutingChaos:
             kill_ps_idx = None
             if mode == "strong":
                 try:
-                    srv_resp = requests.get(
-                        f"http://127.0.0.1:{cl.MASTERS['m1']['api']}/servers",
-                        auth=cl.AUTH, timeout=5,
-                    ).json()
-                    for item in (srv_resp.get("data") or {}).get("servers", []):
-                        server = item.get("server") or {}
-                        rpc = server.get("rpc_port")
-                        if int(server.get("name", 0)) == int(kill_node):
-                            for idx, info in cl.PSES.items():
-                                if info["rpc"] == rpc:
-                                    kill_ps_idx = idx
-                                    break
-                            break
+                    kill_ps_idx = cl.ps_idx_for_node(kill_node)
                 except Exception as e:
                     logger.warning("server lookup for kill_node failed: %s", e)
                 if kill_ps_idx is None:
@@ -1907,18 +1907,7 @@ class TestRebuildPSFailureExtras:
             assert our_node is not None, (
                 f"cannot locate partition for {case_space}: "
                 f"detail_pids={our_pids}")
-            srv = requests.get(
-                f"http://127.0.0.1:{cl.MASTERS['m1']['api']}/servers",
-                auth=cl.AUTH, timeout=5).json()
-            for item in (srv.get("data") or {}).get("servers", []):
-                server = item.get("server") or {}
-                if int(server.get("name", 0)) == our_node:
-                    rpc = server.get("rpc_port")
-                    for idx, info in cl.PSES.items():
-                        if info["rpc"] == rpc:
-                            kill_ps_idx = idx
-                            break
-                    break
+            kill_ps_idx = cl.ps_idx_for_node(our_node)
         except Exception as e:
             logger.warning("PS lookup failed: %s", e)
         if kill_ps_idx is None:
@@ -2022,18 +2011,7 @@ class TestRebuildPSFailureExtras:
                     if reps:
                         our_node = int(reps[0])
                     break
-            srv = requests.get(
-                f"http://127.0.0.1:{cl.MASTERS['m1']['api']}/servers",
-                auth=cl.AUTH, timeout=5).json()
-            for item in (srv.get("data") or {}).get("servers", []):
-                server = item.get("server") or {}
-                if int(server.get("name", 0)) == our_node:
-                    rpc = server.get("rpc_port")
-                    for idx, info in cl.PSES.items():
-                        if info["rpc"] == rpc:
-                            kill_ps_idx = idx
-                            break
-                    break
+            kill_ps_idx = cl.ps_idx_for_node(our_node)
             if kill_ps_idx is None:
                 pytest.skip("cannot map partition replica to a known PS")
 
