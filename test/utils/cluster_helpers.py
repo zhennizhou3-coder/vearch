@@ -284,20 +284,22 @@ def _docker_logs_tail(container_name, n=30):
 
 
 def _docker_exec_cat_logs(container_name, timeout=15):
-    """docker 模式下 vearch 把日志写在容器内 /vearch/logs/*.log(见
-    config_cluster.toml `log = "logs/"` + 容器 WORKDIR /vearch);日志目录没
-    挂载到 host,所以 host 文件系统读不到,`docker logs` 拿到的是 stdout 而非
-    文件日志。这里用 `docker exec ... cat` 把容器内全部日志文件读出来。
+    """docker 模式下 vearch 把日志写成文件(config_cluster.toml `log = "logs/"`,
+    且 toConsole=false 不走 stdout)。这个路径是 *相对* 的 —— 最终运行镜像
+    (cloud/Dockerfile 的 centos stage)没有设 WORKDIR,容器 CWD 是 `/`,所以
+    日志实际落在 `/logs/`(不是 `/vearch/logs/`;后者只是 builder 阶段的
+    WORKDIR)。这里两个候选路径都 cat,谁有内容算谁。
 
-    容器必须 running(被 kill 掉的节点读不到)。任何失败都返回 "",因为
-    日志扫描是 best-effort,不应让诊断逻辑把测试带挂。
+    `docker logs` 拿到的是 stdout,而这里是文件日志,所以必须 exec 进容器读文件。
+    容器必须 running(被 kill 掉的节点读不到)。任何失败都返回 "",因为日志
+    扫描是 best-effort,不应让诊断逻辑把测试带挂。
     """
     if not _docker_inspect_running(container_name):
         return ""
     try:
         out = subprocess.run(
             ["docker", "exec", container_name, "sh", "-c",
-             "cat /vearch/logs/*.log 2>/dev/null"],
+             "cat /logs/*.log /vearch/logs/*.log 2>/dev/null"],
             capture_output=True, text=True, timeout=timeout)
         return out.stdout or ""
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
