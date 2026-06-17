@@ -1576,15 +1576,15 @@ class TestRebuildIndexTypeMatrix:
         _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
 
-    def test_multi_target_fail_first_aborts_rest(self):
-        """6.8: When the first IndexTarget fails its retries, subsequent
-        targets must NOT be attempted (per design: surface failures).
+    # def test_multi_target_fail_first_aborts_rest(self):
+    #     """6.8: When the first IndexTarget fails its retries, subsequent
+    #     targets must NOT be attempted (per design: surface failures).
 
-        Real implementation lives in test_module_rebuild_chaos.py
-        (TestRebuildPSFailureExtras.test_multi_target_fail_first_aborts_rest)
-        because it needs PS-kill fault injection. Skipping here.
-        """
-        pytest.skip("see chaos: test_multi_target_fail_first_aborts_rest")
+    #     Real implementation lives in test_module_rebuild_chaos.py
+    #     (TestRebuildPSFailureExtras.test_multi_target_fail_first_aborts_rest)
+    #     because it needs PS-kill fault injection. Skipping here.
+    #     """
+    #     pytest.skip("see chaos: test_multi_target_fail_first_aborts_rest")
 
     def test_destroy_db_6(self):
         drop_db(router_url, db_name)
@@ -1801,16 +1801,16 @@ class TestRebuildStateMachineEdges:
             _wait_rebuild_completed(db_name, case_space, timeout=300, allow_failed=True)
         drop_space(router_url, db_name, case_space)
 
-    def test_failed_record_overwrite(self):
-        """8.2: Failed records can be overwritten — requires fault
-        injection to deterministically produce a failed state.
+    # def test_failed_record_overwrite(self):
+    #     """8.2: Failed records can be overwritten — requires fault
+    #     injection to deterministically produce a failed state.
 
-        Real implementation lives in test_module_rebuild_chaos.py
-        (TestRebuildPSFailureExtras.
-         test_failed_record_can_be_overwritten_by_new_request)
-        because it needs PS-kill fault injection. Skipping here.
-        """
-        pytest.skip("see chaos: test_failed_record_can_be_overwritten_by_new_request")
+    #     Real implementation lives in test_module_rebuild_chaos.py
+    #     (TestRebuildPSFailureExtras.
+    #      test_failed_record_can_be_overwritten_by_new_request)
+    #     because it needs PS-kill fault injection. Skipping here.
+    #     """
+    #     pytest.skip("see chaos: test_failed_record_can_be_overwritten_by_new_request")
 
     def test_destroy_db_8(self):
         drop_db(router_url, db_name)
