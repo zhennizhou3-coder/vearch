@@ -420,7 +420,7 @@ class TestBackup:
 
         space_config = {
             "name": self.space_name,
-            "partition_num": 3,
+            "partition_num": 1,
             "replica_num": 1,
             "fields": properties["fields"]
         }

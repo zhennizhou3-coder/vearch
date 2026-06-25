@@ -37,11 +37,20 @@ jobs:
         else
           pytest test_document_* -k "not test_vearch_document_upsert_benchmark" -x --log-cli-level=INFO
         fi
-        pytest test_module_* -x --log-cli-level=INFO
-        # test_index_rebuild.py is skipped on arm64 because DiskANN is not supported on this platform.
-        if [[ "${{ matrix.platform }}" != "arm64" ]]; then
-          pytest test_index_rebuild.py -x --log-cli-level=INFO
-        fi
+        # rebuild module tests are exercised by the dedicated CI_rebuild workflow;
+        # exclude them here to keep the standalone CI focused and avoid duplicate runs.
+        pytest test_module_* -x --log-cli-level=INFO \
+          --ignore=test_module_rebuild_smoke.py \
+          --ignore=test_module_rebuild_index.py \
+          --ignore=test_module_rebuild_comprehensive.py \
+          --ignore=test_module_rebuild_chaos.py
+        # test_index_rebuild.py exercises the legacy /index/rebuild endpoint
+        # that PR 2 removes — the new rebuild path lives under /rebuild/index/...
+        # and is covered by CI_rebuild. Keep this disabled until the old
+        # test file is rewritten or deleted upstream.
+        # if [[ "${{ matrix.platform }}" != "arm64" ]]; then
+        #   pytest test_index_rebuild.py -x --log-cli-level=INFO
+        # fi
 
     - name: Test Go SDK
       run: |
