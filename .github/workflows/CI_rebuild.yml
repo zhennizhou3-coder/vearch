@@ -83,7 +83,7 @@ jobs:
   # ---------------------------------------------------------------------------
   rebuild-chaos:
     name: 'Chaos rebuild (PS kill, master failover)'
-    needs: rebuild-fast
+    # needs: rebuild-fast
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
