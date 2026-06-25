@@ -13,6 +13,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <random>
+#include <vector>
+
 #include "third_party/nlohmann/json.hpp"
 #include "util/log.h"
 #include "util/utils.h"
@@ -151,6 +154,42 @@ Status StoreParams::Parse(const char *str) {
     return Status::ParamError(e.what());
   }
   return Status::OK();
+}
+
+int RawVector::SampleTrainingVectorIds(const size_t num,
+                                       std::vector<int64_t> &reservoir,
+                                       size_t &valid_count) {
+  size_t total = meta_info_->Size();
+  reservoir.clear();
+  valid_count = 0;
+  if (num == 0) {
+    LOG(ERROR) << desc_ << "sample training vector ids failed: num is zero";
+    return -1;
+  }
+  reservoir.reserve(num);
+  std::mt19937 rng(std::random_device{}());
+  size_t seen = 0;
+
+  for (int64_t vid = 0; vid < (int64_t)total; ++vid) {
+    if (docids_bitmap_->Test(vid)) continue;  // skip deleted
+    if (reservoir.size() < num) {
+      reservoir.push_back(vid);
+    } else {
+      std::uniform_int_distribution<size_t> dist(0, seen);
+      size_t r = dist(rng);
+      if (r < num) reservoir[r] = vid;
+    }
+    ++seen;
+  }
+  valid_count = seen;
+  if (reservoir.empty()) {
+    LOG(ERROR) << desc_
+               << "sample training vector ids failed: no valid (non-deleted) "
+                  "vectors, total="
+               << total;
+    return -1;
+  }
+  return 0;
 }
 
 }  // namespace vearch

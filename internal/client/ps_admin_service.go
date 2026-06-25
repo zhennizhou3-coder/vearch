@@ -343,13 +343,7 @@ func UpdateMemoryLimitCfg(addr string, cfg *entity.MemoryLimitCfg) error {
 	return operatePsMemLimitCfg(MemoryLimitHandler, addr, cfg)
 }
 
-// ExecuteRebuildIndex executes rebuild index on a partition server.
-//
-// fieldName + indexType identify which (field, indexType) target this RPC
-// is rebuilding. They are part of the PS-side task identity so the master
-// can dispatch and poll multiple targets per (space, pid) without name
-// collision (one space at a time per PS still — that invariant is
-// enforced upstream by the scheduler).
+// ExecuteRebuildIndex starts a rebuild task on PS.
 func ExecuteRebuildIndex(addr string, spaceKey, fieldName, indexType string,
 	pid entity.PartitionID, dropBefore int, limitCPU int, describe int) error {
 	param := &entity.RebuildIndexParam{
@@ -382,9 +376,7 @@ func ExecuteRebuildIndex(addr string, spaceKey, fieldName, indexType string,
 	return nil
 }
 
-// GetRebuildStatus queries partition rebuild status for a specific
-// (field, indexType) target. The (spaceKey, pid, fieldName, indexType)
-// tuple is the PS-side task identity key.
+// GetRebuildStatus queries one PS rebuild task.
 func GetRebuildStatus(addr string, spaceKey, fieldName, indexType string,
 	pid entity.PartitionID) (*entity.RebuildStatusResponse, error) {
 	query := &entity.RebuildStatusQuery{

@@ -100,7 +100,7 @@ class TableTest : public ::testing::Test {
 
   int CreateTable(struct Options &opt, bool is_index = false) {
     table_info = CreateTableInfo(opt, is_index);
-    Status status = table->CreateTable(*table_info, docids_bitmap);
+    Status status = table->CreateTable(*table_info);
     return status.ok();
   }
 

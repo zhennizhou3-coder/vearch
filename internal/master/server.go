@@ -115,19 +115,6 @@ func (s *Server) Start() (err error) {
 	service.Backup().Start()
 
 	// start rebuild service (including rebuild manager)
-	//
-	// P0-#1 / P1-#3: a rebuild scheduler must run on exactly one master
-	// at a time. We pick the leader-checker based on deployment mode:
-	//
-	//   - Embedded etcd: consult the local etcdserver for raft leadership.
-	//     This is essentially free (no extra etcd traffic) and always
-	//     consistent with raft itself.
-	//   - User-managed etcd (SelfManageEtcd=true): the master has no
-	//     embedded etcdserver, so we elect via a cluster-wide etcd lock.
-	//     The campaign goroutine acquires the lock, holds it via
-	//     KeepAlive, and surfaces "am I the lock holder?" to the
-	//     scheduler. A dying leader's lease expires within ttl seconds
-	//     and another replica takes over.
 	if config.Conf().Global.SelfManageEtcd {
 		isLeader := service.Rebuild().StartEtcdLeaderCampaign(s.ctx, 30*time.Second)
 		service.Rebuild().SetLeaderChecker(isLeader)

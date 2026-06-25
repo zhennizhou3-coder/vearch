@@ -1004,35 +1004,31 @@ int Engine::BuildIndex() {
 }
 
 // TODO set limit for cpu
-int Engine::RebuildIndex(int drop_before_rebuild, int limit_cpu, int describe) {
-  int ret = 0;
+bool Engine::PrepareRebuild(const char *tag) {
   // If the index does not exist (UNINDEXED), there is nothing to rebuild.
-  // Return an error so the caller knows this is invalid.
+  // Return false so the caller knows this is invalid.
   if (index_status_ == IndexStatus::UNINDEXED) {
-    LOG(WARNING) << space_name_
-                 << " RebuildIndex: index does not exist (UNINDEXED), "
-                    "cannot rebuild";
-    return -1;
+    LOG(WARNING) << space_name_ << " " << tag
+                 << ": index does not exist (UNINDEXED), cannot rebuild";
+    return false;
   }
 
-  // If a background indexing thread is running, we must stop it first
-  // before touching the index. If no indexing is in progress (IDLE, etc.),
-  // we skip the stop and proceed directly to the rebuild itself.
+  // If a background indexing thread is running, stop it before touching the
+  // index. If no indexing is in progress (IDLE, etc.), proceed directly.
   IndexingState expected = IndexingState::RUNNING;
   if (indexing_state_.compare_exchange_strong(expected,
                                               IndexingState::STOPPING)) {
-    LOG(INFO) << space_name_
-              << " stopping current indexing process for rebuild...";
+    LOG(INFO) << space_name_ << " stopping current indexing process for "
+              << tag << "...";
     if (WaitForIndexingComplete()) {
-      LOG(INFO) << space_name_
-                << " indexing process stopped, proceeding with rebuild";
+      LOG(INFO) << space_name_ << " indexing process stopped, proceeding with "
+                << tag;
     } else {
-      LOG(WARNING)
-          << space_name_
-          << " timeout waiting for indexing to stop, proceeding anyway";
+      LOG(WARNING) << space_name_
+                   << " timeout waiting for indexing to stop, proceeding anyway";
     }
   } else if (expected == IndexingState::STARTING) {
-    // Wait for starting to complete
+    // Wait for STARTING to transition to RUNNING, then stop.
     LOG(INFO) << space_name_
               << " waiting for indexing to start before stopping...";
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1046,50 +1042,62 @@ int Engine::RebuildIndex(int drop_before_rebuild, int limit_cpu, int describe) {
   if (indexing_thread_.joinable()) {
     indexing_thread_.join();
   }
+  return true;
+}
+
+int Engine::FinishRebuild(const char *tag) {
+  if (refresh_interval_ >= 0 &&
+      indexing_state_.load() == IndexingState::IDLE &&
+      max_docid_ - delete_num_ >= training_threshold_) {
+    int ret = BuildIndex();
+    if (ret) {
+      LOG(ERROR) << space_name_ << " " << tag
+                 << " BuildIndex failed, ret: " << ret;
+      return ret;
+    }
+  }
+
+  Status status = vec_manager_->CompactVector();
+  if (!status.ok()) {
+    LOG(ERROR) << space_name_ << " " << tag
+               << " compact vector error: " << status.ToString();
+    return -1;
+  }
+  return 0;
+}
+
+int Engine::RebuildIndex(int drop_before_rebuild, int limit_cpu, int describe) {
+  if (!PrepareRebuild("RebuildIndex")) return -1;
 
   if (describe) {
     vec_manager_->DescribeVectorIndexes();
-    return ret;
+    return 0;
   }
 
   if (!drop_before_rebuild) {
+    // Build new indexes alongside the live ones, train, then swap in.
     std::map<std::string, IndexModel *> vector_indexes;
     Status status =
         vec_manager_->CreateVectorIndexes(training_threshold_, vector_indexes);
     if (!status.ok()) {
       LOG(ERROR) << space_name_ << " RebuildIndex CreateVectorIndexes failed: "
                  << status.ToString();
-      // Clean up partial indexes in the LOCAL map first to avoid
-      // leaking them — CreateVectorIndexes may have created some
-      // IndexModel* before failing mid-way, and those are not in the
-      // member vector_indexes_ so DestroyVectorIndexes() won't free
-      // them.
       for (auto &[name, idx] : vector_indexes) {
         if (idx != nullptr) delete idx;
       }
-      // Now destroy the member vector_indexes_ — this is a whole-
-      // partition rebuild, so failing means the partition has no
-      // valid index state.
       vec_manager_->DestroyVectorIndexes();
       return -1;
     }
 
     if (indexing_state_.load() == IndexingState::IDLE &&
         max_docid_ - delete_num_ > training_threshold_) {
-      ret = vec_manager_->TrainIndex(vector_indexes);
+      int ret = vec_manager_->TrainIndex(vector_indexes);
       if (ret) {
         LOG(ERROR) << space_name_
                    << " RebuildIndex TrainIndex failed ,ret=" << ret;
-        // TrainIndex failed on the NEW indexes.  Clean up the local
-        // map to avoid leaking partial indexes — they are not in the
-        // member vector_indexes_ yet (ResetVectorIndexes hasn't been
-        // called).
         for (auto &[name, idx] : vector_indexes) {
           if (idx != nullptr) delete idx;
         }
-        // Destroy member indexes and mark UNINDEXED — this is a
-        // whole-partition rebuild failure; the partition has no valid
-        // index state.
         vec_manager_->DestroyVectorIndexes();
         index_status_ = IndexStatus::UNINDEXED;
         return -1;
@@ -1098,35 +1106,19 @@ int Engine::RebuildIndex(int drop_before_rebuild, int limit_cpu, int describe) {
 
     vec_manager_->ResetVectorIndexes(vector_indexes);
   } else {
+    // Drop existing indexes first, then re-create.
     Status status = vec_manager_->ReCreateVectorIndexes(training_threshold_);
     if (!status.ok()) {
       LOG(ERROR) << space_name_
                  << " RebuildIndex ReCreateVectorIndexes failed: "
                  << status.ToString();
       vec_manager_->DestroyVectorIndexes();
-      // return ret;
       return -1;
     }
     index_status_ = IndexStatus::UNINDEXED;
   }
 
-  if (refresh_interval_ >= 0 and
-      indexing_state_.load() == IndexingState::IDLE &&
-      max_docid_ - delete_num_ >= training_threshold_) {
-    ret = BuildIndex();
-    if (ret) {
-      LOG(ERROR) << space_name_
-                 << " ReBuildIndex BuildIndex failed, ret: " << ret;
-      return ret;
-    }
-  }
-
-  Status status = vec_manager_->CompactVector();
-  if (!status.ok()) {
-    LOG(ERROR) << space_name_ << "compact vector error: " << status.ToString();
-    return -1;
-  }
-
+  if (int ret = FinishRebuild("RebuildIndex")) return ret;
   LOG(INFO) << space_name_ << " vector manager RebuildIndex success!";
   return 0;
 }
@@ -1148,44 +1140,7 @@ int Engine::RebuildFieldIndex(const std::string &field_name,
             << " drop_before_rebuild=" << drop_before_rebuild
             << " limit_cpu=" << limit_cpu << " describe=" << describe;
 
-  // If the index does not exist (UNINDEXED), there is nothing to rebuild.
-  // Return an error so the caller knows this is invalid.
-  if (index_status_ == IndexStatus::UNINDEXED) {
-    LOG(WARNING) << space_name_
-                 << " RebuildFieldIndex: index does not exist (UNINDEXED), "
-                    "cannot rebuild";
-    return -1;
-  }
-
-  // If a background indexing thread is running, we must stop it first
-  // before touching the index. If no indexing is in progress (IDLE, etc.),
-  // we skip the stop and proceed directly to the rebuild itself.
-  IndexingState expected = IndexingState::RUNNING;
-  if (indexing_state_.compare_exchange_strong(expected,
-                                              IndexingState::STOPPING)) {
-    LOG(INFO) << space_name_
-              << " stopping current indexing process for field-level rebuild...";
-    if (WaitForIndexingComplete()) {
-      LOG(INFO) << space_name_
-                << " indexing process stopped, proceeding with field rebuild";
-    } else {
-      LOG(WARNING) << space_name_
-                   << " timeout waiting for indexing to stop, proceeding anyway";
-    }
-  } else if (expected == IndexingState::STARTING) {
-    LOG(INFO) << space_name_
-              << " waiting for indexing to start before stopping...";
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    expected = IndexingState::RUNNING;
-    if (indexing_state_.compare_exchange_strong(expected,
-                                                IndexingState::STOPPING)) {
-      WaitForIndexingComplete();
-    }
-  }
-
-  if (indexing_thread_.joinable()) {
-    indexing_thread_.join();
-  }
+  if (!PrepareRebuild("RebuildFieldIndex")) return -1;
 
   if (describe) {
     vec_manager_->DescribeVectorIndexes();
@@ -1195,8 +1150,7 @@ int Engine::RebuildFieldIndex(const std::string &field_name,
   // Only vector fields need a rebuild. Scalar indexes are updated
   // continuously in the background and do not require an explicit rebuild.
   if (vec_manager_->RawVectors().count(field_name) == 0) {
-    LOG(INFO) << space_name_
-              << " RebuildFieldIndex: field " << field_name
+    LOG(INFO) << space_name_ << " RebuildFieldIndex: field " << field_name
               << " is not a vector field, nothing to rebuild";
     return 0;
   }
@@ -1235,31 +1189,12 @@ int Engine::RebuildFieldIndex(const std::string &field_name,
       // RebuildVectorIndex already cleaned up internally (it deletes
       // the partial new_indexes on failure and never touched the
       // member vector_indexes_). Calling DestroyVectorIndexes() here
-      // would destroy OTHER fields' valid indexes — exactly the P0
-      // bug: cleaning the wrong object.
+      // would destroy OTHER fields' valid indexes.
       return -1;
     }
   }
 
-  // Trigger BuildIndex after the new index is in place.
-  if (refresh_interval_ >= 0 &&
-      indexing_state_.load() == IndexingState::IDLE &&
-      max_docid_ - delete_num_ >= training_threshold_) {
-    int ret = BuildIndex();
-    if (ret) {
-      LOG(ERROR) << space_name_
-                 << " RebuildFieldIndex BuildIndex failed, ret: " << ret;
-      return ret;
-    }
-  }
-
-  Status status = vec_manager_->CompactVector();
-  if (!status.ok()) {
-    LOG(ERROR) << space_name_
-               << " compact vector error: " << status.ToString();
-    return -1;
-  }
-
+  if (int ret = FinishRebuild("RebuildFieldIndex")) return ret;
   LOG(INFO) << space_name_ << " RebuildFieldIndex for " << field_name << ":"
             << index_type << " success!";
   return 0;

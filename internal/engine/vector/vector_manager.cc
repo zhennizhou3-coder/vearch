@@ -340,6 +340,34 @@ Status VectorManager::ReCreateVectorIndexes(int training_threshold) {
   return status;
 }
 
+Status VectorManager::ResolveRebuildTarget(const std::string &field_name,
+                                           const std::string &index_type,
+                                           RawVector *&vec,
+                                           std::string &index_param) {
+  // Look up the RawVector for this field.
+  auto vec_it = raw_vectors_.find(field_name);
+  if (vec_it == raw_vectors_.end() || vec_it->second == nullptr) {
+    std::string msg = "raw vector not found for field: " + field_name;
+    LOG(ERROR) << desc_ << msg;
+    return Status::ParamError(msg);
+  }
+  vec = vec_it->second;
+
+  // Find the index_params_ entry matching the requested index_type.
+  index_param.clear();
+  for (size_t i = 0; i < index_types_.size(); ++i) {
+    if (index_types_[i] == index_type) {
+      index_param = index_params_[i];
+      break;
+    }
+  }
+  if (index_param.empty() && !index_params_.empty()) {
+    // Fallback: use the first index_params_ entry if no exact match.
+    index_param = index_params_[0];
+  }
+  return Status::OK();
+}
+
 Status VectorManager::ReCreateVectorIndex(const std::string &field_name,
                                           const std::string &index_type,
                                           int training_threshold) {
@@ -360,34 +388,18 @@ Status VectorManager::ReCreateVectorIndex(const std::string &field_name,
               << target_index_name << ", will create new one";
   }
 
-  // Look up the RawVector for this field.
-  auto vec_it = raw_vectors_.find(field_name);
-  if (vec_it == raw_vectors_.end() || vec_it->second == nullptr) {
-    pthread_rwlock_unlock(&index_rwmutex_);
-    std::string msg = "raw vector not found for field: " + field_name;
-    LOG(ERROR) << desc_ << msg;
-    return Status::ParamError(msg);
-  }
-
-  RawVector *vec = vec_it->second;
-
-  // Find the index_params_ entry matching the requested index_type.
+  RawVector *vec = nullptr;
   std::string index_param;
-  for (size_t i = 0; i < index_types_.size(); ++i) {
-    if (index_types_[i] == index_type) {
-      index_param = index_params_[i];
-      break;
-    }
-  }
-  if (index_param.empty() && !index_params_.empty()) {
-    // Fallback: use the first index_params_ entry if no exact match.
-    index_param = index_params_[0];
+  Status status = ResolveRebuildTarget(field_name, index_type, vec, index_param);
+  if (!status.ok()) {
+    pthread_rwlock_unlock(&index_rwmutex_);
+    return status;
   }
 
   // Create the new index for this specific (field, type).
   std::map<std::string, IndexModel *> new_indexes;
-  Status status = CreateVectorIndex(index_type, index_param, vec,
-                                    training_threshold, false, new_indexes);
+  status = CreateVectorIndex(index_type, index_param, vec, training_threshold,
+                             false, new_indexes);
   if (!status.ok()) {
     LOG(ERROR) << desc_ << "CreateVectorIndex for " << target_index_name
                << " failed: " << status.ToString();
@@ -417,32 +429,17 @@ Status VectorManager::RebuildVectorIndex(const std::string &field_name,
                                          bool do_train) {
   std::string target_index_name = IndexName(field_name, index_type);
 
-  // Look up the RawVector for this field.
-  auto vec_it = raw_vectors_.find(field_name);
-  if (vec_it == raw_vectors_.end() || vec_it->second == nullptr) {
-    std::string msg = "raw vector not found for field: " + field_name;
-    LOG(ERROR) << desc_ << msg;
-    return Status::ParamError(msg);
-  }
-  RawVector *vec = vec_it->second;
-
-  // Find the index_params entry matching the requested index_type.
+  RawVector *vec = nullptr;
   std::string index_param;
-  for (size_t i = 0; i < index_types_.size(); ++i) {
-    if (index_types_[i] == index_type) {
-      index_param = index_params_[i];
-      break;
-    }
-  }
-  if (index_param.empty() && !index_params_.empty()) {
-    // Fallback: use the first index_params entry if no exact match.
-    index_param = index_params_[0];
+  Status status = ResolveRebuildTarget(field_name, index_type, vec, index_param);
+  if (!status.ok()) {
+    return status;
   }
 
   // Step 1: Create a new index model (without destroying the old one).
   std::map<std::string, IndexModel *> new_indexes;
-  Status status = CreateVectorIndex(index_type, index_param, vec,
-                                    training_threshold, false, new_indexes);
+  status = CreateVectorIndex(index_type, index_param, vec, training_threshold,
+                             false, new_indexes);
   if (!status.ok()) {
     LOG(ERROR) << desc_ << "RebuildVectorIndex CreateVectorIndex for "
                << target_index_name << " failed: " << status.ToString();

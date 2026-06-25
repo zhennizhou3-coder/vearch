@@ -1277,14 +1277,7 @@ func (bh *IncrementBackupHandler) initBackupManagerFromRequest(backup *entity.Ba
 	return shardMgr, nil
 }
 
-// RebuildIndexHandler handles asynchronous rebuild-index requests issued by
-// the master scheduler. It registers a task in PSRebuildManager and returns
-// immediately; the caller polls progress via RebuildStatusHandler.
-//
-// Unlike the legacy synchronous rebuild path (still living on the document
-// RPC channel for backward compatibility), this handler is the one used by
-// the master-side RebuildService and is the contract that GetRebuildStatus
-// expects (same spaceKey + partitionID lookup key).
+// RebuildIndexHandler accepts async rebuild requests from the master scheduler.
 type RebuildIndexHandler struct {
 	server *Server
 }
@@ -1303,9 +1296,7 @@ func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.Parti
 		param.SpaceKey, param.FieldName, param.IndexType, pid,
 		param.DropBefore, param.LimitCPU, param.Describe, rih.server.nodeID)
 
-	// Validate that the partition actually lives on this PS. Without this
-	// check StartRebuildTask would still register the task but executeRebuild
-	// would fail later, leaving a stale Failed entry — refuse early instead.
+	// Ensure the target partition lives on this PS.
 	store := rih.server.GetPartition(pid)
 	if store == nil {
 		log.Error("Partition %d not found on this PS", pid)
@@ -1313,9 +1304,7 @@ func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.Parti
 			fmt.Errorf("partition %d not found", pid))
 	}
 
-	// SpaceKey is mandatory: the status lookup key is (spaceKey, pid,
-	// field, indexType). Old clients may not send it; fall back to the
-	// partition's own space metadata so the task is still routable.
+	// Derive spaceKey for old clients that do not send it.
 	spaceKey := param.SpaceKey
 	if spaceKey == "" {
 		space := store.GetSpace()
@@ -1328,12 +1317,7 @@ func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.Parti
 		log.Warn("rebuild index request missing spaceKey, derived %s for pid=%d", spaceKey, pid)
 	}
 
-	// (field, indexType) validation. The two values must come together —
-	// the master always sends both for the new path. We additionally
-	// re-check against the partition's space schema as a defence-in-depth
-	// layer: a buggy client (or a master out of sync with the latest
-	// space schema) shouldn't be able to enqueue a rebuild for a target
-	// the engine cannot actually execute.
+	// Validate the requested rebuild target against the local space schema.
 	if _, _, nerr := entity.NormalizeRebuildTarget(param.FieldName, param.IndexType); nerr != nil {
 		log.Warn("rebuild index request rejected (pid=%d): %v", pid, nerr)
 		return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, nerr)
@@ -1353,9 +1337,7 @@ func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.Parti
 		}
 	}
 
-	// Get the rebuild manager. GetRebuildManager() now lazily initializes
-	// PSRebuildManager via sync.Once, so it never returns nil and there is
-	// no last-writer-wins race between concurrent Execute/Status handlers.
+	// GetRebuildManager is lazily initialized and safe for concurrent handlers.
 	rebuildMgr := rih.server.GetRebuildManager()
 
 	if err := rebuildMgr.StartRebuildTask(spaceKey, param.FieldName, param.IndexType,

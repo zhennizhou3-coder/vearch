@@ -151,7 +151,7 @@ int Dump() {
 }
 
 int Load() {
-  int num;
+  int64_t num;
   int ret = gamma_index->load(test::path, num).code();
   return ret;
 }

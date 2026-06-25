@@ -39,7 +39,7 @@ const (
 const (
 	ReplicasOK       = 1
 	ReplicasNotReady = 2
-	// replica is currently being rebuilt; queries MUST NOT be routed to it
+	// replica is currently being rebuilt
 	ReplicasRebuilding = 3
 )
 

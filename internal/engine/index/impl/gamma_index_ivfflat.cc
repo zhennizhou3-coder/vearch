@@ -344,53 +344,17 @@ int GammaIVFFlatIndex::Indexing() {
     LOG(INFO) << "gamma GammaIVFFlatIndex is already trained, skip indexing";
     return 0;
   }
-  RawVector *raw_vec = dynamic_cast<RawVector *>(vector_);
 
-  size_t num;
-  if ((size_t)training_threshold_ < nlist) {
-    num = nlist * 39;
-    LOG(WARNING) << "Because training_threshold[" << training_threshold_
-                 << "] < ncentroids[" << nlist
-                 << "], training_threshold becomes ncentroids * 39[" << num
-                 << "].";
-  } else if ((size_t)training_threshold_ <= nlist * 256) {
-    if ((size_t)training_threshold_ < nlist * 39) {
-      LOG(WARNING)
-          << "training_threshold[" << training_threshold_ << "] is too small. "
-          << "The appropriate range is [ncentroids * 39, ncentroids * 256]";
-    }
-    num = training_threshold_;
-  } else {
-    num = nlist * 256;
-    LOG(WARNING)
-        << "training_threshold[" << training_threshold_ << "] is too big. "
-        << "The appropriate range is [ncentroids * 39, ncentroids * 256]."
-        << "training_threshold becomes ncentroids * 256[" << num << "].";
-  }
+  size_t num = ComputeIVFTrainingNum(nlist);
 
-  // Use GetRandomTrainVectors instead of GetVectorHeader:
-  //   - Filters out deleted vectors (bitmap check)
-  //   - Randomly samples training data for better cluster quality
-  //   - valid_count = total non-deleted vectors (for threshold check)
-  ScopeVectors headers;
-  size_t n_get = 0;
-  size_t valid_count = 0;
-  int ret = raw_vec->GetRandomTrainVectors(num, headers, n_get, valid_count);
-  if (ret != 0) {
-    LOG(ERROR) << "GetRandomTrainVectors failed, ret=" << ret;
-    return ret;
-  }
+  std::unique_ptr<const uint8_t[]> train_data;
+  size_t num_got = 0;
+  int ret = GetTrainingVectors(num, train_data, num_got);
+  if (ret != 0) return ret;
+  const uint8_t *train_raw_vec = train_data.get();
+  LOG(INFO) << "train vector wanted num=" << num << ", real num=" << num_got;
 
-  if (num > valid_count) {
-    LOG(ERROR) << "valid vector count [" << valid_count
-               << "] less then training_threshold[" << num << "], failed!";
-    return -1;
-  }
-
-  const uint8_t *train_raw_vec = headers.Get(0);
-  LOG(INFO) << "train vector wanted num=" << num << ", real num=" << n_get;
-
-  IndexIVFFlat::train(n_get, (const float *)train_raw_vec);
+  IndexIVFFlat::train(num_got, (const float *)train_raw_vec);
 
   LOG(INFO) << "train successed!";
   return 0;

@@ -196,10 +196,7 @@ func (s *Space) GetFieldIndexType(fieldName string) string {
 	return ""
 }
 
-// HasField reports whether fieldName is defined either in the explicit
-// Indexes list (multi-index aware) or in SpaceProperties (single-index
-// path). Used by the rebuild API to reject targets that name a field the
-// space doesn't actually have before any work is enqueued.
+// HasField reports whether fieldName exists in indexes or space properties
 func (s *Space) HasField(fieldName string) bool {
 	if fieldName == "" {
 		return false
@@ -220,15 +217,7 @@ func (s *Space) HasField(fieldName string) bool {
 	return false
 }
 
-// GetIndexByFieldAndType returns the *Index whose (FieldName == fieldName
-// AND Type matches indexType case-insensitively). Multi-field indexes are
-// matched by membership in FieldNames. Returns nil when no such index is
-// declared on the space.
-//
-// This is the single source of truth for "does this (field, indexType)
-// pair really exist on this space?" used by both the master HTTP layer and
-// the PS-side handler so a bypassed validation in one layer cannot let an
-// unsupported target slip through.
+// GetIndexByFieldAndType returns the matching index for a field and type.
 func (s *Space) GetIndexByFieldAndType(fieldName, indexType string) *Index {
 	if fieldName == "" || indexType == "" {
 		return nil
@@ -246,13 +235,9 @@ func (s *Space) GetIndexByFieldAndType(fieldName, indexType string) *Index {
 			}
 		}
 	}
-	// Fallback to per-property index declarations (single-index legacy
-	// shape). SpaceProperties[fieldName].Index is the authoritative
-	// per-field index when Indexes is empty.
+	// Fallback for legacy per-field index definitions
 	if pro, ok := s.SpaceProperties[fieldName]; ok && pro != nil && pro.Index != nil {
 		if strings.EqualFold(pro.Index.Type, indexType) {
-			// Synthesise an Index view so callers always get a
-			// non-nil result with FieldName set.
 			return &Index{
 				Name:      pro.Index.Name,
 				Type:      pro.Index.Type,
@@ -264,11 +249,7 @@ func (s *Space) GetIndexByFieldAndType(fieldName, indexType string) *Index {
 	return nil
 }
 
-// IsVectorField reports whether the named field is a vector field.
-// Only vector fields need a rebuild; scalar indexes (SCALAR, INVERTED,
-// BITMAP, COMPOSITE, etc.) are updated continuously in the background
-// and do not require an explicit rebuild — the C++ Engine::RebuildFieldIndex
-// short-circuits them by returning 0 immediately.
+// IsVectorField reports whether fieldName is a vector field.
 func (s *Space) IsVectorField(fieldName string) bool {
 	if pro, ok := s.SpaceProperties[fieldName]; ok && pro != nil {
 		return pro.FieldType == vearchpb.FieldType_VECTOR
@@ -276,10 +257,7 @@ func (s *Space) IsVectorField(fieldName string) bool {
 	return false
 }
 
-// AllIndexTargets returns the (field, indexType) tuples that the rebuild
-// scheduler should process. Only vector fields are included — scalar
-// indexes are updated continuously in the background and do not require
-// an explicit rebuild.
+// AllIndexTargets returns vector index targets for rebuild.
 func (s *Space) AllIndexTargets() []IndexTarget {
 	out := make([]IndexTarget, 0, len(s.Indexes))
 	seen := make(map[string]struct{})

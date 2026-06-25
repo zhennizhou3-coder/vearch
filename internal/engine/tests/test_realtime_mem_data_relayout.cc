@@ -162,7 +162,7 @@ TEST_F(RealTimeMemDataRelayoutTest, CompactBucket) {
   CreateData(num, keys, codes, code_byte_size);
   ASSERT_TRUE(realtime_data->AddKeys(bucket_no, num, keys, codes));
   ASSERT_EQ(num, GetRetrievePos(bucket_no));
-  vector<int> deleted_vids;
+  vector<int64_t> deleted_vids;
   for (int i = 0; i < 10; i++) {
     int pos = random_generator->Rand(num);
     if (!docids_bitmap->Test(pos)) {

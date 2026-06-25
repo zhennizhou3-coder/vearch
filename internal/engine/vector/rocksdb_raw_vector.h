@@ -10,8 +10,6 @@
 #include <string>
 #include <vector>
 
-#include <random>
-
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"
 #include "vector/raw_vector.h"
@@ -33,11 +31,8 @@ class RocksDBRawVector : public RawVector {
 
   int DeleteFromStore(int64_t vid) override;
 
-  int GetVectorHeader(int64_t start, int n, ScopeVectors &vecs,
-                      std::vector<int> &lens) override;
-
-  int GetRandomTrainVectors(int num, ScopeVectors &vecs,
-                            size_t &n_get, size_t &valid_count) override;
+  int SampleTrainingVectors(const size_t num, ScopeVectors &vecs,
+                            size_t &num_got, size_t &valid_count) override;
 
   int UpdateToStore(int64_t vid, uint8_t *v, int len) override;
 

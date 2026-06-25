@@ -29,9 +29,9 @@
 #include <vector>
 
 #include "c_api/gamma_api.h"
+#include "common/gamma_common_data.h"
 #include "util/bitmap.h"
 #include "util/utils.h"
-#include "common/gamma_common_data.h"
 
 using faiss::idx_t;
 using std::string;
@@ -196,48 +196,16 @@ int GammaIVFFlatGPUIndex::Indexing() {
   if (!is_trained_) {
     gpu_index_ = CreateGPUIndex();
     {
-      RawVector *raw_vec = dynamic_cast<RawVector *>(vector_);
+      size_t num = ComputeIVFTrainingNum(nlist_);
 
-      size_t num;
-      size_t vectors_count = raw_vec->MetaInfo()->Size();
-      if (vectors_count <= (size_t)training_threshold_) {
-        num = vectors_count;
-        LOG(INFO) << "force merge all vectors for training, num=" << num;
-      } else {
-        if ((size_t)training_threshold_ < nlist_ * 39) {
-          num = nlist_ * 39;
-          LOG(WARNING) << "Because training_threshold[" << training_threshold_
-                       << "] < ncentroids[" << nlist_
-                       << "], training_threshold becomes ncentroids * 39[" << num
-                       << "].";
-        } else {
-          num = training_threshold_;
-        }
-      }
+      std::unique_ptr<const uint8_t[]> train_data;
+      size_t num_got = 0;
+      int ret = GetTrainingVectors(num, train_data, num_got);
+      if (ret != 0) return ret;
+      const uint8_t *train_raw_vec = train_data.get();
+      LOG(INFO) << "train vector wanted num=" << num << ", real num=" << num_got;
 
-      // Use GetRandomTrainVectors instead of GetVectorHeader:
-      //   - Filters out deleted vectors (bitmap check)
-      //   - Randomly samples training data for better cluster quality
-      ScopeVectors headers;
-      size_t n_get = 0;
-      size_t valid_count = 0;
-      int ret = raw_vec->GetRandomTrainVectors(num, headers, n_get,
-                                               valid_count);
-      if (ret != 0) {
-        LOG(ERROR) << "GetRandomTrainVectors failed, ret=" << ret;
-        return ret;
-      }
-
-      if (num > valid_count) {
-        LOG(ERROR) << "valid vector count [" << valid_count
-                   << "] less then training_threshold[" << num << "], failed!";
-        return -1;
-      }
-
-      const uint8_t *train_raw_vec = headers.Get(0);
-      LOG(INFO) << "train vector wanted num=" << num << ", real num=" << n_get;
-
-      gpu_index_->train(n_get, reinterpret_cast<const float *>(train_raw_vec));
+      gpu_index_->train(num_got, reinterpret_cast<const float *>(train_raw_vec));
     }
     is_trained_ = true;
   }
@@ -278,7 +246,7 @@ bool GammaIVFFlatGPUIndex::Add(int n, const uint8_t *vec) {
 
   gpu_index_->add_with_ids(n_add, reinterpret_cast<const float *>(new_codes.data()), new_keys.data());
   vectors_added_since_last_log_ += n;
-  if (vectors_added_since_last_log_ >= 10000) {
+  if (vectors_added_since_last_log_ >= ADD_COUNT_THRESHOLD) {
     LOG(DEBUG) << "GPU indexed count: " << indexed_count_;
     vectors_added_since_last_log_ = 0;
   }

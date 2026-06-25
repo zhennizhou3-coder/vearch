@@ -10,9 +10,8 @@
 
 #include <unistd.h>
 
-#include <algorithm>
 #include <functional>
-#include <random>
+#include <memory>
 
 using std::string;
 namespace vearch {
@@ -189,83 +188,42 @@ int MemoryRawVector::ExtendSegments() {
   return 0;
 }
 
-int MemoryRawVector::GetVectorHeader(int64_t start, int n, ScopeVectors &vecs,
-                                     std::vector<int> &lens) {
-  if (start + n > meta_info_->Size()) return -1;
-
-  while (n) {
-    uint8_t *vec = segments_[start / segment_size_] +
-                   (size_t)start % segment_size_ * vector_byte_size_;
-    int len = segment_size_ - start % segment_size_;
-    if (len > n) len = n;
-
-    bool deletable = false;
-    vecs.Add(vec, deletable);
-    lens.push_back(len);
-    start += len;
-    n -= len;
-  }
-  return 0;
-}
-
-int MemoryRawVector::GetRandomTrainVectors(int num, ScopeVectors &vecs,
-                                            size_t &n_get,
+int MemoryRawVector::SampleTrainingVectors(const size_t num,
+                                            ScopeVectors &vecs,
+                                            size_t &num_got,
                                             size_t &valid_count) {
-  size_t total = meta_info_->Size();
-
-  // Use Reservoir Sampling (Algorithm R) to select up to `num` random
-  // non-deleted vectors in a single pass with O(num) memory.
-  // This avoids the O(valid_count) memory overhead of collecting all
-  // valid IDs first, which would be ~8GB for 1B docs.
-  //
-  // Correctness: each valid vector has exactly num/valid_count
-  // probability of being in the final reservoir, ensuring uniformity.
+  // Reservoir sampling lives in the base class (shared with RocksDB).
   std::vector<int64_t> reservoir;
-  reservoir.reserve(num);
-  std::mt19937 rng(std::random_device{}());
-  size_t seen = 0;
-
-  for (int64_t vid = 0; vid < (int64_t)total; ++vid) {
-    if (docids_bitmap_->Test(vid)) continue;  // skip deleted
-
-    if (reservoir.size() < (size_t)num) {
-      reservoir.push_back(vid);
-    } else {
-      std::uniform_int_distribution<size_t> dist(0, seen);
-      size_t r = dist(rng);
-      if (r < (size_t)num) reservoir[r] = vid;
-    }
-    ++seen;
-  }
-
-  valid_count = seen;
-  n_get = reservoir.size();
-  if (n_get == 0) {
-    LOG(ERROR) << desc_ << "no valid vectors for training";
+  if (SampleTrainingVectorIds(num, reservoir, valid_count) != 0) {
+    LOG(ERROR) << desc_ << "no training vectors requested or available";
+    num_got = 0;
     return -1;
   }
+  num_got = reservoir.size();
 
-  // Copy selected vectors into a contiguous memory block.
-  // For MemoryRawVector the data is already in memory segments,
-  // so we can memcpy directly — this is fast and produces the
-  // contiguous layout that faiss::Index::train() expects.
-  int dimension = meta_info_->Dimension();
-  size_t byte_size = (size_t)dimension * data_size_ * n_get;
-  uint8_t *train_vecs = new uint8_t[byte_size];
-  utils::ScopeDeleter<uint8_t> del_train_vecs(train_vecs);
+  // Allocate one contiguous block sized exactly for the sample.  Memory
+  // backend: data already lives in segments, so we just memcpy each one
+  // in.  Total = vector_byte_size_ * num_got, bounded by the per-index
+  // training threshold (typical IVF ~ ncentroids * 256, tens of MB).
+  size_t byte_size = vector_byte_size_ * num_got;
+  std::unique_ptr<uint8_t[]> train_vecs(new (std::nothrow) uint8_t[byte_size]);
+  if (!train_vecs) {
+    LOG(ERROR) << desc_ << "alloc failed for training block, bytes="
+               << byte_size;
+    return -2;
+  }
 
-  for (size_t i = 0; i < n_get; ++i) {
+  for (size_t i = 0; i < num_got; ++i) {
     int64_t vid = reservoir[i];
     const uint8_t *src = GetFromMem(vid);
     if (src == nullptr) {
       LOG(ERROR) << desc_ << "GetFromMem returned null for vid=" << vid;
       return -2;
     }
-    memcpy(train_vecs + i * vector_byte_size_, src, vector_byte_size_);
+    memcpy(train_vecs.get() + i * vector_byte_size_, src, vector_byte_size_);
   }
 
-  del_train_vecs.release();
-  vecs.Add(train_vecs, true);
+  vecs.Add(train_vecs.release(), true);  // ownership transferred
   return 0;
 }
 

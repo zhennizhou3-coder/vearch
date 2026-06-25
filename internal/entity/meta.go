@@ -71,10 +71,7 @@ func LockRoleKey(rolename string) string {
 	return fmt.Sprintf("%s%s", PrefixLock, rolename)
 }
 
-// LockRebuildScheduler is the cluster-wide lock key used by the rebuild
-// scheduler to elect a single leader among multiple master replicas. Used
-// for the SelfManageEtcd code path where we don't have access to an
-// embedded etcdserver to consult for raft leadership (P1-#3).
+// LockRebuildScheduler returns the lock key for rebuild scheduler election
 func LockRebuildScheduler() string {
 	return fmt.Sprintf("%srebuild_scheduler", PrefixLock)
 }
@@ -101,8 +98,7 @@ func MasterMemberKey(ID uint64) string {
 	return fmt.Sprintf("%s%d", PrefixMasterMember, ID)
 }
 
-// RebuildSpaceKey returns the etcd key holding the SpaceRebuildRecord
-// for the given (dbName, spaceName) pair.
+// RebuildSpaceKey returns the etcd key for a space rebuild record
 func RebuildSpaceKey(dbName, spaceName string) string {
 	return fmt.Sprintf("%s%s/%s", PrefixRebuild, dbName, spaceName)
 }

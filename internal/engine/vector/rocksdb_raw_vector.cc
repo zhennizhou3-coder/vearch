@@ -9,8 +9,7 @@
 
 #include <stdio.h>
 
-#include <algorithm>
-#include <random>
+#include <memory>
 
 #include "rocksdb/table.h"
 #include "util/log.h"
@@ -195,121 +194,50 @@ int RocksDBRawVector::DeleteFromStore(int64_t vid) {
 }
 
 // get n valid vectors from start
-int RocksDBRawVector::GetVectorHeader(int64_t start, int n, ScopeVectors &vecs,
-                                      std::vector<int> &lens) {
-  if (start < 0 || start + n > meta_info_->Size()) {
-    return -1;
-  }
-
-  std::unique_ptr<rocksdb::Iterator> it = storage_mgr_->NewIterator(cf_id_);
-  std::string start_key, end_key;
-  start_key = utils::ToRowKey(start);
-  end_key = utils::ToRowKey(meta_info_->Size());
-  it->Seek(rocksdb::Slice(start_key));
-  int dimension = meta_info_->Dimension();
-  uint8_t *vectors = new uint8_t[(uint64_t)dimension * n * data_size_];
-  uint8_t *dst = vectors;
-  int c = 0;
-  for (; c < n; c++, it->Next()) {
-    rocksdb::Slice current_key = it->key();
-    if (current_key.compare(end_key) >= 0) {
-      break;
-    }
-    if (!it->Valid()) {
-      LOG(WARNING) << desc_ << "rocksdb iterator error, current_key="
-                   << current_key.ToString() << ", start_key=" << start_key
-                   << ", end_key=" << end_key << ", c=" << c;
-      break;
-    }
-
-    rocksdb::Slice value = it->value();
-    std::string vstr = value.ToString();
-    if ((size_t)vector_byte_size_ == vstr.size()) {
-      memcpy(dst, vstr.c_str(), vector_byte_size_);
-    } else {
-      LOG(ERROR) << desc_
-                 << "rocksdb get error: invalid vector size=" << vstr.size()
-                 << ", expect=" << vector_byte_size_;
-      continue;
-    }
-
-#ifdef DEBUG
-    std::string expect_key = utils::ToRowKey(c + start);
-    std::string key = it->key().ToString();
-    if (key != expect_key) {
-      LOG(ERROR) << "vid=" << c + start << ", invalid key=" << key
-                 << ", expect=" << expect_key;
-    }
-#endif
-    dst += (size_t)dimension * data_size_;
-  }
-  vecs.Add(vectors);
-  lens.push_back(c);
-  return 0;
-}
-
-int RocksDBRawVector::GetRandomTrainVectors(int num, ScopeVectors &vecs,
-                                             size_t &n_get,
+int RocksDBRawVector::SampleTrainingVectors(const size_t num,
+                                             ScopeVectors &vecs,
+                                             size_t &num_got,
                                              size_t &valid_count) {
-  size_t total = meta_info_->Size();
-
-  // Use Reservoir Sampling (Algorithm R) to select up to `num` random
-  // non-deleted vectors in a single pass with O(num) memory.
-  // This avoids the O(valid_count) memory overhead of collecting all
-  // valid IDs first, which would be ~8GB for 1B docs.
-  //
-  // Correctness: each valid vector has exactly num/valid_count
-  // probability of being in the final reservoir, ensuring uniformity.
+  // Reservoir sampling lives in the base class (shared with Memory).
   std::vector<int64_t> reservoir;
-  reservoir.reserve(num);
-  std::mt19937 rng(std::random_device{}());
-  size_t seen = 0;
-
-  for (int64_t vid = 0; vid < (int64_t)total; ++vid) {
-    if (docids_bitmap_->Test(vid)) continue;  // skip deleted
-
-    if (reservoir.size() < (size_t)num) {
-      reservoir.push_back(vid);
-    } else {
-      std::uniform_int_distribution<size_t> dist(0, seen);
-      size_t r = dist(rng);
-      if (r < (size_t)num) reservoir[r] = vid;
-    }
-    ++seen;
-  }
-
-  valid_count = seen;
-  n_get = reservoir.size();
-  if (n_get == 0) {
-    LOG(ERROR) << desc_ << "no valid vectors for training";
+  if (SampleTrainingVectorIds(num, reservoir, valid_count) != 0) {
+    LOG(ERROR) << desc_ << "no training vectors requested or available";
+    num_got = 0;
     return -1;
   }
+  num_got = reservoir.size();
 
-  // Batch-fetch the selected vectors via RocksDB MultiGet,
-  // then copy them into a contiguous memory block.
-  int dimension = meta_info_->Dimension();
+  // Batch-fetch from RocksDB.  scope_vecs holds num_got owning buffers
+  // until it goes out of scope; the next loop copies into one
+  // contiguous block.  Peak overhead is therefore ~2 * vector_byte_size_
+  // * num_got, still bounded by the per-index training threshold (typical
+  // IVF ~ ncentroids * 256, tens of MB).
   ScopeVectors scope_vecs;
   if (Gets(reservoir, scope_vecs)) {
     LOG(ERROR) << desc_ << "RocksDB MultiGet failed for training vectors";
     return -2;
   }
 
-  size_t byte_size = (size_t)dimension * data_size_ * n_get;
-  uint8_t *train_vecs = new uint8_t[byte_size];
-  utils::ScopeDeleter<uint8_t> del_train_vecs(train_vecs);
+  size_t byte_size = vector_byte_size_ * num_got;
+  std::unique_ptr<uint8_t[]> train_vecs(new (std::nothrow) uint8_t[byte_size]);
+  if (!train_vecs) {
+    LOG(ERROR) << desc_ << "alloc failed for training block, bytes="
+               << byte_size;
+    return -2;
+  }
 
-  for (size_t i = 0; i < n_get; ++i) {
+  for (size_t i = 0; i < num_got; ++i) {
     if (scope_vecs.Get(i) == nullptr) {
       LOG(ERROR) << desc_ << "Gets returned null for sampled vid="
-                 << reservoir[i] << " (consistency violation between bitmap and storage)";
+                 << reservoir[i]
+                 << " (bitmap/storage inconsistency)";
       return -2;
     }
-    memcpy(train_vecs + i * vector_byte_size_, scope_vecs.Get(i),
+    memcpy(train_vecs.get() + i * vector_byte_size_, scope_vecs.Get(i),
            vector_byte_size_);
   }
 
-  del_train_vecs.release();
-  vecs.Add(train_vecs, true);
+  vecs.Add(train_vecs.release(), true);
   return 0;
 }
 

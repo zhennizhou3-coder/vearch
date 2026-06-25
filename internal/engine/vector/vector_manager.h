@@ -185,6 +185,25 @@ class VectorManager {
     index_type = index_name.substr(pos + 1);
   }
 
+  /**
+   * @brief Resolve (RawVector*, index_param) for a (field_name, index_type)
+   * rebuild target. Shared by ReCreateVectorIndex / RebuildVectorIndex.
+   *
+   * Looks up `raw_vectors_[field_name]`, then scans `index_types_` /
+   * `index_params_` for a matching index_type; falls back to the first
+   * index_param entry when no exact match exists (legacy behaviour).
+   *
+   * @param field_name   target field
+   * @param index_type   target index type
+   * @param vec          [out] RawVector pointer; set on success only
+   * @param index_param  [out] resolved index param string
+   * @return Status::OK() on success; ParamError when the field has no
+   *         RawVector entry.
+   */
+  Status ResolveRebuildTarget(const std::string &field_name,
+                              const std::string &index_type,
+                              RawVector *&vec, std::string &index_param);
+
  private:
   VectorStorageType default_store_type_;
   bitmap::BitmapManager *docids_bitmap_;

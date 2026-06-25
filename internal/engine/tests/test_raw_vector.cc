@@ -126,27 +126,6 @@ void ValidateVector(RawVector *raw_vector, int start_id, int num, int dimension,
   }
 }
 
-void ValidateVectorHeader(RawVector *raw_vector, int start_id, int num,
-                          int dimension, float addition = 0.0f) {
-  ScopeVectors scope_vecs;
-  std::vector<int> lens;
-  raw_vector->GetVectorHeader(start_id, num, scope_vecs, lens);
-  int vid = start_id;
-  for (size_t i = 0; i < scope_vecs.Size(); ++i) {
-    const float *vecs = (const float *)scope_vecs.Get(i);
-    for (int j = 0; j < lens[i]; ++j) {
-      const float *expect = BuildVector(dimension, vid + addition);
-      const float *peek_vector = vecs + j * dimension;
-      ASSERT_TRUE(floatArrayEquals(expect, dimension, peek_vector, dimension))
-          << "******GetVectorHeader float array equal error, vid=" << vid
-          << ", peek=[" << peek_vector[0] << ", " << peek_vector[1] << "]"
-          << ", expect=[" << expect[0] << ", " << expect[1] << "]";
-      delete[] expect;
-      ++vid;
-    }
-  }
-}
-
 static int Dump(RawVector *raw_vector, int start, int end) {
   if (raw_vector->WithIO()) {
     return raw_vector->Dump(start, end).code();
@@ -156,7 +135,8 @@ static int Dump(RawVector *raw_vector, int start, int end) {
 
 static int Load(RawVector *raw_vector, int num) {
   if (raw_vector->WithIO()) {
-    return raw_vector->Load(num).code();
+    int64_t disk_vec_num = 0;
+    return raw_vector->Load(num, disk_vec_num).code();
   }
   return 0;
 }
@@ -177,7 +157,8 @@ void TestRawVectorNormal(VectorStorageType store_type) {
 
   VectorMetaInfo *meta_info =
       new VectorMetaInfo(name, dimension, VectorValueType::FLOAT);
-  bitmap::BitmapManager *doc_bitmap = nullptr;
+  bitmap::BitmapManager *doc_bitmap = new bitmap::BitmapManager();
+  ASSERT_EQ(0, doc_bitmap->Init(nadd));
 
   StorageManager *storage_mgr = new StorageManager(root_path);
   int cf_id = storage_mgr->CreateColumnFamily(name);
@@ -185,7 +166,7 @@ void TestRawVectorNormal(VectorStorageType store_type) {
       meta_info, store_type, store_params, doc_bitmap, cf_id, storage_mgr);
   auto status = storage_mgr->Init(100);
   ASSERT_EQ(status.ok(), true);
-  assert(0 == raw_vector->Init(name, false));
+  assert(0 == raw_vector->Init(name));
   int doc_num = nadd;
   for (int i = 0; i < doc_num; i++) {
     if (i % 100 == 0) cerr << "add i=" << i << endl;
@@ -198,19 +179,14 @@ void TestRawVectorNormal(VectorStorageType store_type) {
   vector<int64_t> ids = {1, 314, 78, 173, 256};
   ValidateRandVectors(raw_vector, ids, dimension);
   ValidateVector(raw_vector, 0, doc_num, dimension);
-  ValidateVectorHeader(raw_vector, 0, doc_num, dimension);
-  std::srand(std::time(nullptr));
-  int start_vid = std::rand() % doc_num;
-  cerr << "validate vector header, start vid=" << start_vid << endl;
-  ValidateVectorHeader(raw_vector, start_vid, doc_num - start_vid, dimension);
 
   int update_num = 100;
   UpdateToRawVector(raw_vector, 50, update_num, dimension, 0.5f);
   ValidateVector(raw_vector, 50, update_num, dimension, 0.5f);
-  ValidateVectorHeader(raw_vector, 50, update_num, dimension, 0.5f);
 
   delete raw_vector;
   delete storage_mgr;
+  delete doc_bitmap;
 }
 
 void TestRawVectorDumpLoad(VectorStorageType store_type) {
@@ -229,7 +205,8 @@ void TestRawVectorDumpLoad(VectorStorageType store_type) {
 
   VectorMetaInfo *meta_info =
       new VectorMetaInfo(name, dimension, VectorValueType::FLOAT);
-  bitmap::BitmapManager *doc_bitmap = nullptr;
+  bitmap::BitmapManager *doc_bitmap = new bitmap::BitmapManager();
+  ASSERT_EQ(0, doc_bitmap->Init(1024));
 
   StorageManager *storage_mgr = new StorageManager(root_path);
   int cf_id = storage_mgr->CreateColumnFamily(name);
@@ -239,13 +216,12 @@ void TestRawVectorDumpLoad(VectorStorageType store_type) {
   auto status = storage_mgr->Init(100);
   ASSERT_EQ(status.ok(), true);
 
-  ASSERT_EQ(0, raw_vector->Init(name, false));
+  ASSERT_EQ(0, raw_vector->Init(name));
 
   int doc_num = 500;
   AddToRawVector(raw_vector, 0, doc_num, dimension);
 
   ASSERT_EQ(doc_num, raw_vector->GetVectorNum());
-  ValidateVectorHeader(raw_vector, 0, doc_num, dimension);
 
   int update_num = 100;
   UpdateToRawVector(raw_vector, 0, update_num, dimension, 0.5f);
@@ -266,7 +242,7 @@ void TestRawVectorDumpLoad(VectorStorageType store_type) {
   ASSERT_EQ(status.ok(), true);
 
   ASSERT_NE(nullptr, raw_vector);
-  ASSERT_EQ(0, raw_vector->Init(name, false));
+  ASSERT_EQ(0, raw_vector->Init(name));
   Load(raw_vector, load_num);
   ValidateVector(raw_vector, update_num, load_num - update_num * 2, dimension);
   ValidateVector(raw_vector, 0, update_num, dimension, 0.5f);
@@ -286,7 +262,7 @@ void TestRawVectorDumpLoad(VectorStorageType store_type) {
   status = storage_mgr->Init(100);
   ASSERT_EQ(status.ok(), true);
   ASSERT_NE(nullptr, raw_vector);
-  ASSERT_EQ(0, raw_vector->Init(name, false));
+  ASSERT_EQ(0, raw_vector->Init(name));
   ASSERT_EQ(0, Load(raw_vector, load_num));
   cout << "load some load_num=" << load_num << endl;
   ValidateVector(raw_vector, 0, update_num, dimension, 0.5f);
@@ -313,7 +289,7 @@ void TestRawVectorDumpLoad(VectorStorageType store_type) {
   ASSERT_EQ(status.ok(), true);
 
   ASSERT_NE(nullptr, raw_vector);
-  ASSERT_EQ(0, raw_vector->Init(name, false));
+  ASSERT_EQ(0, raw_vector->Init(name));
   ASSERT_EQ(0, Load(raw_vector, load_num));
   ValidateVector(raw_vector, 0, update_num, dimension, 0.5f);
   ValidateVector(raw_vector, 400, update_num, dimension, 0.8f);
@@ -322,6 +298,7 @@ void TestRawVectorDumpLoad(VectorStorageType store_type) {
   ASSERT_EQ(load_num, raw_vector->GetVectorNum());
   Delete(raw_vector);
   delete storage_mgr;
+  delete doc_bitmap;
 }
 
 TEST(MemoryRawVector, Normal) {

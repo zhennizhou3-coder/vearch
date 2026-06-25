@@ -228,7 +228,7 @@ func (handler *DocumentHandler) proxyMaster(group *gin.RouterGroup) error {
 	group.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
 	group.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s",
 		URLParamDbName, URLParamSpaceName, URLParamFieldName, URLParamIndexType), handler.handleMasterRequest)
-	
+
 	group.GET("/rebuild/index/dbs", handler.handleMasterRequest)
 	group.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/progress", URLParamDbName), handler.handleMasterRequest)
 	group.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/progress", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
@@ -237,8 +237,6 @@ func (handler *DocumentHandler) proxyMaster(group *gin.RouterGroup) error {
 	group.POST("/cancel/rebuild/index/dbs", handler.handleMasterRequest)
 	group.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s", URLParamDbName), handler.handleMasterRequest)
 	group.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
-	// group.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s",
-	// 	URLParamDbName, URLParamSpaceName, URLParamFieldName, URLParamIndexType), handler.handleMasterRequest)
 
 	// space handler
 	group.POST(fmt.Sprintf("/dbs/:%s/spaces", URLParamDbName), handler.handleMasterRequest)
@@ -340,7 +338,6 @@ func (handler *DocumentHandler) ExportInterfacesToServer(group *gin.RouterGroup)
 	// index
 	group.POST("/index/flush", handler.handleIndexFlush)
 	group.POST("/index/forcemerge", handler.handleIndexForceMerge)
-	// group.POST("/index/rebuild", handler.handleIndexRebuild)
 
 	// config
 	// trace: /config/trace
@@ -946,73 +943,3 @@ func (handler *DocumentHandler) handleIndexForceMerge(c *gin.Context) {
 
 	httpCode = response.New(c).JsonSuccess(result)
 }
-
-// // handleIndexRebuild rebuild index
-// func (handler *DocumentHandler) handleIndexRebuild(c *gin.Context) {
-// 	startTime := time.Now()
-// 	operateName := "handleIndexRebuild"
-// 	httpCode := http.StatusOK
-// 	dbName := ""
-// 	spaceName := ""
-// 	defer func() {
-// 		defer monitor.Profiler(operateName, startTime, httpCode, dbName, spaceName)
-// 	}()
-// 	args := &vearchpb.IndexRequest{}
-// 	var err error
-// 	args.Head, err = setRequestHeadFromGin(c)
-// 	if err != nil {
-// 		httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
-// 		return
-// 	}
-// 	indexRequest := &request.IndexRequest{}
-// 	err = c.ShouldBindJSON(indexRequest)
-// 	if err != nil {
-// 		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(err))
-// 		return
-// 	}
-
-// 	args.Head.DbName = indexRequest.DbName
-// 	args.Head.SpaceName = indexRequest.SpaceName
-// 	if indexRequest.DropBeforeRebuild {
-// 		args.DropBeforeRebuild = 1
-// 	} else {
-// 		args.DropBeforeRebuild = 0
-// 	}
-// 	args.LimitCpu = int64(indexRequest.LimitCPU)
-// 	args.Describe = int64(indexRequest.Describe)
-// 	args.PartitionId = indexRequest.PartitionId
-
-// 	space, err := handler.docService.getSpace(c.Request.Context(), args.Head)
-// 	if err != nil {
-// 		httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
-// 		return
-// 	}
-
-// 	dbName = args.Head.DbName
-// 	spaceName = args.Head.SpaceName
-
-// 	if space == nil {
-// 		err := vearchpb.NewError(vearchpb.ErrorEnum_SPACE_NOT_EXIST, nil)
-// 		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(err))
-// 		return
-// 	}
-// 	if args.PartitionId > 0 {
-// 		found := false
-// 		for _, partition := range space.Partitions {
-// 			if partition.Id == args.PartitionId {
-// 				found = true
-// 				break
-// 			}
-// 		}
-// 		if !found {
-// 			err := vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf("partition_id %d not belong to space %s", args.PartitionId, space.Name))
-// 			httpCode = response.New(c).JsonError(errors.NewErrBadRequest(err))
-// 			return
-// 		}
-// 	}
-
-// 	indexResponse := handler.docService.rebuildIndex(c.Request.Context(), args)
-// 	result := IndexResponseToContent(indexResponse.Shards)
-
-// 	httpCode = response.New(c).JsonSuccess(result)
-// }

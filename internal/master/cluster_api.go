@@ -1316,10 +1316,6 @@ func (ca *clusterAPI) getRebuildProgress(c *gin.Context) {
 	response.New(c).JsonSuccess(progress)
 }
 
-// listAllRebuildProgress lists rebuild status for all spaces across all
-// databases. The result is a snapshot of the etcd-persisted rebuild records
-// and is eventually consistent — individual space states may have changed
-// by the time the response is consumed.
 func (ca *clusterAPI) listAllRebuildProgress(c *gin.Context) {
 	log.Info("listAllRebuildProgress handler called: path=%s", c.Request.URL.Path)
 
@@ -1362,9 +1358,8 @@ func (ca *clusterAPI) listDBRebuildProgress(c *gin.Context) {
 	response.New(c).JsonSuccess(summary)
 }
 
-// cancelRebuildIndex cancels rebuild for the specified scope. Space is the
-// minimum cancellation unit. The handler resolves the target space list from
-// the URL parameters and calls CancelRebuild for each one.
+// cancelRebuildIndex cancels rebuild for the specified scope
+// Space is the minimum cancellation unit. The handler resolves the target space list from
 func (ca *clusterAPI) cancelRebuildIndex(c *gin.Context) {
 	startTime := time.Now()
 	operateName := "handleCancelRebuildIndex"

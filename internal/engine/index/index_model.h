@@ -9,6 +9,7 @@
 
 #include <tbb/concurrent_queue.h>
 
+#include <memory>
 #include <vector>
 
 #include "reflector.h"
@@ -336,4 +337,52 @@ class IndexModel {
   std::string name_;
   std::string desc_;
   bool support_increment_;
+
+ protected:
+  /** Compute the IVF training sample size, clamped to the standard
+   * faiss range [nlist*39, nlist*256].
+   *
+   * Shared by every IVF family (CPU IVFFLAT / IVFPQ / IVFPQFastScan /
+   * IVFRABITQ / BINARYIVF, plus GPU_IVFFLAT / GPU_IVFPQ) so the
+   * threshold-clamping logic cannot drift between them.
+   *
+   * Reads `training_threshold_` (the user-configured target) and
+   * snaps it into [nlist * min_points_per_centroid,
+   * nlist * max_points_per_centroid]. The bounds match faiss's
+   * Clustering defaults (39 / 256), so a caller that passes the
+   * returned `num` to GetTrainingVectors() will hand faiss exactly
+   * the sample size it wants — faiss does no internal subsampling.
+   *
+   * Logs a WARNING when `training_threshold_` is clamped.
+   *
+   * @param nlist  number of IVF centroids (caller's nlist / nlist_)
+   * @return clamped training sample size
+   */
+  size_t ComputeIVFTrainingNum(size_t nlist) const;
+
+  /** Sample `threshold` training vectors from `vector_` and gate on the
+   * per-index minimum.  Shared by every IVF-style family (IVFFLAT /
+   * IVFPQ / IVFPQFastScan / IVFRABITQ / BINARYIVF / GPU_* / SCANN) so
+   * the sample + threshold check cannot drift between them.
+   *
+   * The per-index `num` computation lives in ComputeIVFTrainingNum;
+   * this helper only does the cast, sample, and gate.
+   *
+   * On success `train_data` owns the contiguous block of `num_got`
+   * vectors and keeps it alive until reset/destroyed, so the caller can
+   * pass train_data.get() straight to the downstream train() call.
+   *
+   * @param threshold      desired sample size; also the minimum
+   *                       valid_count below which training fails
+   * @param train_data     [out] owns the sampled contiguous buffer
+   * @param num_got        [out] actual sample count for train(n, ...)
+   * @return 0 on success;
+   *         -1 if threshold is zero, vector_ is not a RawVector,
+   *            valid_count < threshold, or the sample is not a single
+   *            contiguous chunk;
+   *         the SampleTrainingVectors error code otherwise
+   */
+  int GetTrainingVectors(size_t threshold,
+                         std::unique_ptr<const uint8_t[]> &train_data,
+                         size_t &num_got);
 };

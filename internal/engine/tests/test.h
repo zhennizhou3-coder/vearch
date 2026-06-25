@@ -966,7 +966,7 @@ int GetCacheSizeTest(struct Options &opt) {
 }
 
 int LoadEngine(struct Options &opt) {
-  int bitmap_bytes_size = 0;
+  int64_t bitmap_bytes_size = 0;
   int ret =
       bitmap::create(opt.docids_bitmap_, bitmap_bytes_size, opt.max_doc_size);
   if (ret != 0) {

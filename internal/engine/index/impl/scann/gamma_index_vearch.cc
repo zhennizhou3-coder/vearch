@@ -389,35 +389,26 @@ int GammaVearchIndex::Indexing() {
     return -1;
   }
   RawVector *raw_vec = dynamic_cast<RawVector *>(vector_);
-
-  // Use GetRandomTrainVectors instead of GetVectorHeader:
-  //   - Filters out deleted vectors (bitmap check)
-  //   - Randomly samples training data for better cluster quality
-  ScopeVectors headers;
-  size_t n_get = 0;
-  size_t valid_count = 0;
-  int ret = raw_vec->GetRandomTrainVectors(training_threshold_, headers,
-                                           n_get, valid_count);
-  if (ret != 0) {
-    LOG(ERROR) << "GetRandomTrainVectors failed, ret=" << ret;
-    return ret;
-  }
-
-  if ((size_t)training_threshold_ > valid_count) {
-    LOG(ERROR) << "valid vector count [" << valid_count
-               << "] less then training_threshold[" << training_threshold_
-               << "], failed!";
+  if (raw_vec == nullptr) {
+    LOG(ERROR) << "Failed to cast vector_ to RawVector*";
     return -1;
   }
 
+  std::unique_ptr<const uint8_t[]> train_data;
+  size_t num_got = 0;
+  int ret = GetTrainingVectors((size_t)training_threshold_, train_data,
+                               num_got);
+  if (ret != 0) return ret;
+  const uint8_t *train_raw_vec_u8 = train_data.get();
+
   int raw_d = raw_vec->MetaInfo()->Dimension();
-  const char *train_raw_vec = (const char *)headers.Get(0);
-  int bytes_num = raw_d * n_get * sizeof(float);
+  const char *train_raw_vec = reinterpret_cast<const char *>(train_raw_vec_u8);
+  int bytes_num = raw_d * num_got * sizeof(float);
 
   ret = ScannTraining(vearch_index_, train_raw_vec, bytes_num, raw_d,
                       model_param_->n_thread);
 
-  indexed_count_ = n_get;
+  indexed_count_ = num_got;
   is_trained_ = true;
   CreateThreads(model_param_->n_thread);
   LOG(INFO) << "vearch index trained successful ! ! !";

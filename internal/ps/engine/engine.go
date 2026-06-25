@@ -61,16 +61,13 @@ type Engine interface {
 	NewSnapshot() (proto.Snapshot, error)
 	ApplySnapshot(peers []proto.Peer, iter proto.SnapIterator) error
 	Optimize() error
-	// RebuildFieldIndex is the single rebuild entry point for both
-	// whole-partition and per-(field, indexType) rebuilds. When field
-	// is empty it triggers a whole-partition rebuild (the C++ layer
-	// internally falls back to Engine::RebuildIndex); when field is
-	// specified it rebuilds only the given (field, indexType) target.
+
+	// RebuildFieldIndex rebuilds all indexes or one (field, indexType) target.
 	RebuildFieldIndex(field, indexType string, dropBefore, limitCPU, describe int) error
 	Load() error
 	IndexInfo() (int, int, int)
-	// IndexInfoWithErr is the error-aware variant of IndexInfo. Returns
-	// (status, indexedNum, maxDocid, err)
+
+	// IndexInfoWithErr returns index status, indexed count, max docid, and error.
 	IndexInfoWithErr() (int, int, int, error)
 	GetEngineStatus(status *entity.EngineStatus) error
 	Close()

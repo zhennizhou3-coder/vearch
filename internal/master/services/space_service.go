@@ -311,12 +311,7 @@ func (s *SpaceService) DeleteSpace(ctx context.Context, as *AliasService, dbName
 		return err
 	}
 
-	// Also drop any rebuild record bound to this space. Without this the
-	// scheduler's PrefixScan(PrefixRebuild) keeps surfacing the orphan
-	// record every tick; if its Status is still running, psBusy gets
-	// rebuilt with its NodeIDs marked busy, blocking dispatch of any
-	// future rebuild on those PSs until master is restarted. The space
-	// is gone — its rebuild record must go with it.
+	// Remove the space rebuild record to avoid stale PS busy state.
 	if err := masterClient.Delete(ctx, entity.RebuildSpaceKey(dbName, spaceName)); err != nil {
 		log.Error("delete rebuild record for space:[%s/%s] err:[%s]",
 			dbName, spaceName, err.Error())

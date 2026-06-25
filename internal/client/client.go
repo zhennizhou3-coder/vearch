@@ -563,9 +563,7 @@ func (r *routerRequest) searchFromPartition(ctx context.Context, partitionID ent
 	rpcEnd, rpcStart := time.Now(), time.Now()
 	nodeID, leaderFellBack := GetNodeIdsByClientType(clientType, partition, serverCache, r.client)
 	if leaderFellBack {
-		// Falling back to a follower while still asking PS for a
-		// leader-typed read would be rejected by checkReadable.
-		// Downgrade the request header so PS serves it.
+		// Downgrade leader reads after falling back to a follower.
 		pd.SearchRequest.Head.ClientType = ""
 	}
 
@@ -677,10 +675,7 @@ func (r *routerRequest) searchFromPartition(ctx context.Context, partitionID ent
 		if strings.Contains(retry_err.Error(), "connect: connection refused") {
 			r.client.PS().AddFaulty(nodeID, time.Second*30)
 		} else if clientType == request.Leader && isPartitionNotLeaderErr(retry_err) {
-			// Leader-typed read landed on a node that won't serve it
-			// (rebuild fallback that PS rejected, stale leader cache,
-			// or a leadership flip mid-request). Downgrade semantics
-			// and retry against a non-leader replica.
+			// Retry leader-read failure on a non-leader replica.
 			log.Warn("partition %d leader-typed read got PARTITION_NOT_LEADER from nodeID=%d, downgrading to non-leader and retrying", partitionID, nodeID)
 			clientType = request.NotLeader
 			pd.SearchRequest.Head.ClientType = ""
@@ -886,7 +881,12 @@ func (r *routerRequest) SearchFieldSortExecute(desc bool) *vearchpb.SearchRespon
 			}
 
 			for _, resp := range result {
-				quickSort(resp.ResultItems, desc, 0, len(resp.ResultItems)-1)
+				sort.Slice(resp.ResultItems, func(i, j int) bool {
+					if desc {
+						return resp.ResultItems[i].Score > resp.ResultItems[j].Score
+					}
+					return resp.ResultItems[i].Score < resp.ResultItems[j].Score
+				})
 				if len(resp.ResultItems) > 0 {
 					if searchReq.PageSize > 0 && searchReq.PageNum >= 1 {
 						start := searchReq.PageSize * (searchReq.PageNum - 1)
@@ -1205,43 +1205,6 @@ func (r *routerRequest) QueryFieldSortExecute() *vearchpb.SearchResponse {
 	}
 }
 
-func quickSort(items []*vearchpb.ResultItem, desc bool, low, high int) {
-	if low < high {
-		var pivot = partition(items, desc, low, high)
-		quickSort(items, desc, low, pivot)
-		quickSort(items, desc, pivot+1, high)
-	}
-}
-
-func partition(items []*vearchpb.ResultItem, desc bool, low, high int) int {
-	var pivot = items[low]
-	var i = low
-	var j = high
-	for i < j {
-		if desc {
-			for j > low && items[j].Score <= pivot.Score {
-				j--
-			}
-			for i < high && items[i].Score > pivot.Score {
-				i++
-			}
-		} else {
-			for j > low && items[j].Score >= pivot.Score {
-				j--
-			}
-			for i < high && items[i].Score < pivot.Score {
-				i++
-			}
-		}
-		if i < j {
-			items[i], items[j] = items[j], items[i]
-		}
-	}
-
-	items[low], items[j] = items[j], pivot
-	return j
-}
-
 func setDocs(keys []string) (docs []*vearchpb.Document, err error) {
 	docs = make([]*vearchpb.Document, 0)
 	for _, key := range keys {
@@ -1373,12 +1336,7 @@ func (r *routerRequest) SearchByPartitions(searchReq *vearchpb.SearchRequest) *r
 
 var replicaRoundRobin = newRoundRobin[entity.PartitionID, entity.NodeID]()
 
-// isReplicaRebuilding reports whether a replica is currently being
-// rebuilt and therefore must not receive query traffic. The state is
-// set by the master rebuild scheduler in partition.ReStatusMap and
-// cleared on rebuild terminal. Independent of RaftConsistent: any
-// deployment must skip rebuilding replicas because the engine layer
-// is mid-swap and may return inconsistent results.
+// isReplicaRebuilding reports whether a replica should be skipped for reads.
 func isReplicaRebuilding(partition *entity.Partition, nodeID entity.NodeID) bool {
 	if partition == nil || partition.ReStatusMap == nil {
 		return false
@@ -1386,9 +1344,7 @@ func isReplicaRebuilding(partition *entity.Partition, nodeID entity.NodeID) bool
 	return partition.ReStatusMap[nodeID] == entity.ReplicasRebuilding
 }
 
-// isPartitionNotLeaderErr reports whether a PS rpc error is the
-// PARTITION_NOT_LEADER signal — either via a typed VearchErr or via
-// a string match on the wrapped error message.
+// isPartitionNotLeaderErr reports whether err is PARTITION_NOT_LEADER.
 func isPartitionNotLeaderErr(err error) bool {
 	if err == nil {
 		return false
@@ -1399,10 +1355,7 @@ func isPartitionNotLeaderErr(err error) bool {
 	return strings.Contains(err.Error(), vearchpb.ErrMsg(vearchpb.ErrorEnum_PARTITION_NOT_LEADER))
 }
 
-// pickHealthyNonRebuildingReplica picks a replica suitable as a
-// fallback target when the originally chosen replica (typically the
-// leader) is rebuilding. Filters apply the same liveness/health checks
-// as the Random path. Returns 0 when no candidate is available.
+// pickHealthyNonRebuildingReplica picks a live fallback replica.
 func pickHealthyNonRebuildingReplica(partition *entity.Partition,
 	servers *cache.Cache, client *Client, excludeNodeID entity.NodeID) entity.NodeID {
 	candidates := make([]entity.NodeID, 0)
@@ -1428,24 +1381,13 @@ func pickHealthyNonRebuildingReplica(partition *entity.Partition,
 	return replicaRoundRobin.Next(partition.Id, candidates)
 }
 
-// GetNodeIdsByClientType picks a target node for a partition request. The
-// second return value is true when the caller asked for the leader but we
-// fell back to a follower because the leader is mid-rebuild; the caller
-// must then downgrade request.Head.ClientType so the follower will accept
-// the read (PS rejects leader-typed reads on non-PA_READWRITE partitions).
+// GetNodeIdsByClientType picks a target node; bool means leader fallback.
 func GetNodeIdsByClientType(clientType string, partition *entity.Partition, servers *cache.Cache, client *Client) (entity.NodeID, bool) {
 	nodeId := uint64(0)
 	leaderFellBack := false
 	switch clientType {
 	case request.Leader:
-		// Leader path normally bypasses health checks. But if the
-		// leader is mid-rebuild we'd serve a query against an index
-		// that is being torn down/swapped. Fall back to a healthy
-		// non-rebuilding replica; this briefly relaxes strong-leader
-		// consistency but keeps the partition queryable. Per-partition
-		// serialization in the rebuild scheduler guarantees that at
-		// most one replica is rebuilding at a time, so a fallback
-		// candidate normally exists.
+		// Avoid querying a leader while its index is rebuilding.
 		if isReplicaRebuilding(partition, partition.LeaderID) {
 			if fb := pickHealthyNonRebuildingReplica(partition, servers, client, partition.LeaderID); fb != 0 {
 				log.Warn("partition %d leader=%d rebuilding, fallback to nodeID=%d",

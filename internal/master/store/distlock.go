@@ -168,8 +168,9 @@ func (dl *DistLock) waitOnLastRev(ctx context.Context, nodePath string, revision
 	}
 }
 
-func (dl *DistLock) KeepAliveOnce() {
-	dl.client.KeepAliveOnce(dl.ctx, dl.leaseID)
+func (dl *DistLock) KeepAliveOnce() error {
+	_, err := dl.client.KeepAliveOnce(dl.ctx, dl.leaseID)
+	return err
 }
 
 func (dl *DistLock) Unlock() error {

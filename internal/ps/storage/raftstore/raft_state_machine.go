@@ -196,13 +196,18 @@ func (s *Store) ApplyMemberChange(confChange *proto.ConfChange, index uint64) (i
 		if err := replica.Unmarshal(confChange.Context); err != nil {
 			log.Error(err.Error())
 		}
-		s.EventListener.HandleRaftReplicaEvent(&RaftReplicaEvent{PartitionId: s.Partition.Id, Delete: true, Replica: replica})
 
+		exist := false
 		replicas := make([]entity.NodeID, 0, len(s.Partition.Replicas)-1)
 		for _, r := range s.Partition.Replicas {
 			if r != replica.NodeID {
 				replicas = append(replicas, r)
+			} else {
+				exist = true
 			}
+		}
+		if exist {
+			s.EventListener.HandleRaftReplicaEvent(&RaftReplicaEvent{PartitionId: s.Partition.Id, Delete: true, Replica: replica})
 		}
 
 		s.Partition.Replicas = replicas

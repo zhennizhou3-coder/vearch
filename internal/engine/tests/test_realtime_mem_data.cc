@@ -157,7 +157,7 @@ TEST_F(RealTimeMemDataTest, CompactBucket) {
   CreateData(num, keys, codes, code_byte_size);
   ASSERT_TRUE(realtime_data->AddKeys(bucket_no, num, keys, codes));
   ASSERT_EQ(num, GetRetrievePos(bucket_no));
-  vector<int> deleted_vids;
+  vector<int64_t> deleted_vids;
   for (int i = 0; i < 10; i++) {
     int pos = random_generator->Rand(num);
     if (!docids_bitmap->Test(pos)) {
@@ -271,7 +271,8 @@ TEST_F(RealTimeMemDataTest, DumpLoad) {
   // dump
   string index_file = dump_dir + "/index.data";
   realtime::RTInvertIndex *rt_invert_index =
-      new realtime::RTInvertIndex(0, 0, nullptr, nullptr);
+      new realtime::RTInvertIndex(0, 0, docids_bitmap, bucket_keys,
+                                  bucket_keys_limit);
   rt_invert_index->cur_ptr_ = realtime_data;
   faiss::IOWriter *fw = new FileIOWriter(index_file.c_str());
   ASSERT_EQ(0, WriteInvertedLists(fw, rt_invert_index));
@@ -285,7 +286,7 @@ TEST_F(RealTimeMemDataTest, DumpLoad) {
 
   rt_invert_index->cur_ptr_ = new_realtime_data;
   faiss::IOReader *fr = new FileIOReader(index_file.c_str());
-  int nload = 0;
+  int64_t nload = 0;
   ASSERT_EQ(0, ReadInvertedLists(fr, rt_invert_index, nload).code());
   delete fr;
 

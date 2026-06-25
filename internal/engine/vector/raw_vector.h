@@ -60,7 +60,7 @@ struct StoreParams : DumpConfig {
 };
 
 class RawVector : public VectorReader {
- public:
+public:
   RawVector(VectorMetaInfo *meta_info, bitmap::BitmapManager *docids_bitmap,
             const StoreParams &store_params);
 
@@ -72,36 +72,29 @@ class RawVector : public VectorReader {
    */
   int Init(std::string vec_name);
 
-  /** get the header of vectors, so it can access vecotors through the
-   * header if dimension is known
+  /** Sample up to `num` random training vectors, filtering out deleted
+   * docs.  Returns one contiguous block in `vecs`.
    *
-   * @param start start vector id(include)
-   * @param n number of vectors
-   * @param vec[out] vector header address
-   * @param m[out] the real number of vectors(0 < m <= n)
-   * @return success: 0
+   * Sampling is random and skips tombstones: picking the first `num`
+   * vectors or letting deleted entries into the training set both
+   * pollute cluster centroids on first build and on rebuild after
+   * partial deletes.
+   *
+   * @param num          desired sample size.  Bounded by the per-index
+   *                     training threshold (typical IVF families use
+   *                     ncentroids * 39..256, so up to ~10^7 entries —
+   *                     well under any practical OOM threshold).
+   * @param vecs         [out] one contiguous block of `num_got` vectors.
+   * @param num_got      [out] actual sample size; min(num, valid_count).
+   * @param valid_count  [out] total non-deleted vectors.  Caller compares
+   *                     this against its training threshold and decides
+   *                     whether to bail out — that policy stays in the
+   *                     caller, not here.
+   * @return 0 on success; -1 if num is zero or no valid vectors; -2 on
+   *         storage error.
    */
-  virtual int GetVectorHeader(int64_t start, int n, ScopeVectors &vec,
-                              std::vector<int> &lens) = 0;
-
-  /** Get random training vectors, filtering out deleted ones.
-   *
-   * This method collects all valid (non-deleted) vector IDs, randomly
-   * samples up to `num` of them, and returns the vector data in a
-   * contiguous memory block.  It replaces the old pattern of calling
-   * GetVectorHeader(0, num, ...) which both includes deleted vectors
-   * and always picks the first num vectors (no randomness).
-   *
-   * @param num          desired number of training vectors
-   * @param vecs         [out] scope vectors containing the selected data
-   *                     (a single contiguous block)
-   * @param n_get        [out] actual number of valid vectors obtained
-   * @param valid_count  [out] total number of non-deleted vectors in the
-   *                     collection (for threshold checking)
-   * @return 0 on success
-   */
-  virtual int GetRandomTrainVectors(int num, ScopeVectors &vecs,
-                                    size_t &n_get, size_t &valid_count) = 0;
+  virtual int SampleTrainingVectors(const size_t num, ScopeVectors &vecs,
+                                    size_t &num_got, size_t &valid_count) = 0;
 
   /** dump vectors and sources to disk file
    *
@@ -191,7 +184,7 @@ class RawVector : public VectorReader {
   StorageManager *storage_mgr_;
   int cf_id_;
 
- protected:
+protected:
   /** get vector by id
    *
    * @param id vector id
@@ -202,15 +195,37 @@ class RawVector : public VectorReader {
 
   virtual int InitStore(std::string &vec_name) = 0;
 
- protected:
+  /** Reservoir-sample (Algorithm R) up to `num` valid vector ids in a
+   * single O(total) pass with O(num) memory.
+   *
+   * Why reservoir, not "collect all valid ids then sample": at 1B docs
+   * the full-id list would be 1B * sizeof(int64_t) = 8 GiB, which
+   * would OOM most index nodes.  Reservoir keeps memory at O(num) ≈
+   * training threshold (tens of MB at worst).
+   * std::random_device may fall back to deterministic entropy on restricted
+   * platforms, which can affect cross-platform CI reproducibility.
+   *
+   * Each surviving vector has uniform num/valid_count probability of
+   * landing in the final reservoir.  Subclasses then fetch the actual
+   * vector bytes from their backing store.
+   *
+   * @param num           target reservoir size
+   * @param reservoir     [out] sampled valid vector ids
+   * @param valid_count   [out] total non-deleted vectors observed
+   * @return 0 on success; -1 if num is zero or no valid vectors exist
+   */
+  int SampleTrainingVectorIds(const size_t num, std::vector<int64_t> &reservoir,
+                              size_t &valid_count);
+
+protected:
   long vector_byte_size_;
   int data_size_;
 
-  long total_mem_bytes_;  // total used memory bytes
-  std::string desc_;      // description of this raw vector
+  long total_mem_bytes_; // total used memory bytes
+  std::string desc_;     // description of this raw vector
   StoreParams store_params_;
   bitmap::BitmapManager *docids_bitmap_;
   bool compact_if_need_;
 };
 
-}  // namespace vearch
+} // namespace vearch

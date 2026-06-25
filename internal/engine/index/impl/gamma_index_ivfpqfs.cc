@@ -212,68 +212,28 @@ int GammaIVFPQFastScanIndex::Indexing() {
     LOG(INFO) << "gamma ivfpq index is already trained, skip indexing";
     return 0;
   }
-  RawVector *raw_vec = dynamic_cast<RawVector *>(vector_);
-  size_t vectors_count = raw_vec->MetaInfo()->Size();
 
-  size_t num;
-  if ((size_t)training_threshold_ < nlist) {
-    num = nlist * 39;
-    LOG(WARNING) << "Because training_threshold[" << training_threshold_
-                 << "] < ncentroids[" << nlist
-                 << "], training_threshold becomes ncentroids * 39[" << num
-                 << "].";
-  } else if ((size_t)training_threshold_ <= nlist * 256) {
-    if ((size_t)training_threshold_ < nlist * 39) {
-      LOG(WARNING)
-          << "training_threshold[" << training_threshold_ << "] is too small. "
-          << "The appropriate range is [ncentroids * 39, ncentroids * 256]";
-    }
-    num = (size_t)training_threshold_;
-  } else {
-    num = nlist * 256;
-    LOG(WARNING)
-        << "training_threshold[" << training_threshold_ << "] is too big. "
-        << "The appropriate range is [ncentroids * 39, ncentroids * 256]."
-        << "training_threshold becomes ncentroids * 256[" << num << "].";
-  }
-  if (num > vectors_count) {
-    LOG(ERROR) << "vector total count [" << vectors_count
-               << "] less then training_threshold[" << num << "], failed!";
-    return -1;
-  }
+  size_t num = ComputeIVFTrainingNum(nlist);
 
-  ScopeVectors headers;
-  std::vector<int> lens;
-  raw_vec->GetVectorHeader(0, num, headers, lens);
-
-  // merge vectors
-  int raw_d = raw_vec->MetaInfo()->Dimension();
-  const uint8_t *train_raw_vec = nullptr;
-  utils::ScopeDeleter1<uint8_t> del_train_raw_vec;
-  if (lens.size() == 1) {
-    train_raw_vec = headers.Get(0);
-  } else {
-    train_raw_vec = new uint8_t[raw_d * num * sizeof(float)];
-    del_train_raw_vec.set(train_raw_vec);
-    size_t offset = 0;
-    for (size_t i = 0; i < headers.Size(); ++i) {
-      memcpy((void *)(train_raw_vec + offset), (void *)headers.Get(i),
-             sizeof(float) * raw_d * lens[i]);
-      offset += sizeof(float) * raw_d * lens[i];
-    }
-  }
+  std::unique_ptr<const uint8_t[]> train_data;
+  size_t num_got = 0;
+  int ret = GetTrainingVectors(num, train_data, num_got);
+  if (ret != 0) return ret;
+  const uint8_t *train_raw_vec = train_data.get();
 
   const float *xt = nullptr;
-  utils::ScopeDeleter1<float> del_xt;
+  utils::ScopeDeleter<float> del_xt;
   if (opq_ != nullptr) {
-    opq_->train(num, (const float *)train_raw_vec);
-    xt = opq_->apply(num, (const float *)train_raw_vec);
+    opq_->train(num_got, (const float *)train_raw_vec);
+    xt = opq_->apply(num_got, (const float *)train_raw_vec);
     del_xt.set(xt == (const float *)train_raw_vec ? nullptr : xt);
   } else {
     xt = (const float *)train_raw_vec;
   }
 
-  faiss::IndexIVFPQFastScan::train(num, xt);
+  LOG(INFO) << "train vector wanted num=" << num << ", real num=" << num_got;
+
+  faiss::IndexIVFPQFastScan::train(num_got, xt);
 
   LOG(INFO) << "train successed!";
   return 0;
