@@ -106,8 +106,6 @@ jobs:
         build-type: github
 
     - name: Run chaos rebuild tests
-      # --maxfail=3 收齐多个 failing case 的日志,而不是首发 fail 就退。
-      # -p no:cacheprovider 避免 .pytest_cache 堆在 runner 上。
       run: |
         cd test
         pytest test_module_rebuild_chaos.py \
