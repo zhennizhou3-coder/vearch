@@ -21,56 +21,56 @@ on:
 
 
 jobs:
-  # rebuild-fast:
-  #   name: 'Rebuild comprehensive tests'
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 90     # comprehensive + DiskANN 可能比纯 fast 更久
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       include:
-  #         - platform: linux/amd64
-  #           docker-arch: ''
-  #   env:
-  #     TARGET_PLATFORM: ${{ matrix.platform }}
+  rebuild-fast:
+    name: 'Rebuild comprehensive tests'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90     # comprehensive + DiskANN 可能比纯 fast 更久
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            docker-arch: ''
+    env:
+      TARGET_PLATFORM: ${{ matrix.platform }}
 
-  #   steps:
-  #   - uses: actions/checkout@v4
+    steps:
+    - uses: actions/checkout@v4
 
-  #   # 复用现有的 cluster setup composite action — 它会:
-  #   # 1) build vearch docker image
-  #   # 2) docker-compose up 一套 3-master / 3-ps / 2-router 集群
-  #   # 3) 装 Python + pytest 依赖
-  #   - uses: ./.github/actions/set_cluster_env
-  #     with:
-  #       build-type: github
+    # 复用现有的 cluster setup composite action — 它会:
+    # 1) build vearch docker image
+    # 2) docker-compose up 一套 3-master / 3-ps / 2-router 集群
+    # 3) 装 Python + pytest 依赖
+    - uses: ./.github/actions/set_cluster_env
+      with:
+        build-type: github
 
-  #   # ---- 模块测试:基础 lifecycle ----
-  #   # test_module_rebuild_index.py 覆盖:
-  #   #   trigger / progress / cancel / 多 target / DB-level / 全局 rebuild
-  #   - name: Run basic rebuild module tests
-  #     run: |
-  #       cd test
-  #       pytest test_module_rebuild_index.py \
-  #         -x --log-cli-level=INFO
+    # ---- 模块测试:基础 lifecycle ----
+    # test_module_rebuild_index.py 覆盖:
+    #   trigger / progress / cancel / 多 target / DB-level / 全局 rebuild
+    - name: Run basic rebuild module tests
+      run: |
+        cd test
+        pytest test_module_rebuild_index.py \
+          -x --log-cli-level=INFO
 
-  #   - name: Run comprehensive rebuild tests
-  #     run: |
-  #       cd test
-  #       pytest test_module_rebuild_comprehensive.py \
-  #         -x -rs --log-cli-level=INFO
+    - name: Run comprehensive rebuild tests
+      run: |
+        cd test
+        pytest test_module_rebuild_comprehensive.py \
+          -x -rs --log-cli-level=INFO
 
-  #   # ---- 失败时把 master / PS / router 日志都打上来,debug 方便 ----
-  #   # `if: failure()` 只在前面的 step 挂掉时才跑。
-  #   - name: Upload cluster logs on failure
-  #     if: failure()
-  #     uses: actions/upload-artifact@v4
-  #     with:
-  #       name: rebuild-fast-logs
-  #       path: |
-  #         cloud/logs/
-  #         test/*.log
-  #       retention-days: 7
+    # ---- 失败时把 master / PS / router 日志都打上来,debug 方便 ----
+    # `if: failure()` 只在前面的 step 挂掉时才跑。
+    - name: Upload cluster logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: rebuild-fast-logs
+        path: |
+          cloud/logs/
+          test/*.log
+        retention-days: 7
 
   # ===========================================================================
   # Job B:chaos 测试 — kill PS / master 故障注入
@@ -83,7 +83,7 @@ jobs:
   # ---------------------------------------------------------------------------
   rebuild-chaos:
     name: 'Chaos rebuild (PS kill, master failover)'
-    # needs: rebuild-fast
+    needs: rebuild-fast
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
