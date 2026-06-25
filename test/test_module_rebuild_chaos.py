@@ -1822,15 +1822,6 @@ class TestRebuildPSFailureExtras:
             final = _wait_terminal(db_name, case_space, timeout=300,
                                    allow_failed=True)
 
-            # The invariant we assert is the same regardless of whether
-            # status ended up failed or completed: NO partition's
-            # ReStatusMap should still hold a Rebuilding (=3) entry.
-            # detail 接口的 Partitions 字段没有 omitempty(entity/space.go:125),
-            # 集群降级时(ps2 死 + partition leader 正在重选)master 一个分区
-            # 信息都拿不到 → nil slice 序列化成 "partitions": null。注意
-            # dict.get(k, []) 只在 key 缺失时给默认值,值为 null 仍返回 None。
-            # 这里重试拿非空 partitions(等 leader 重选完成);始终拿不到说明
-            # ps2 死期间无法观测 ReStatusMap,skip 而非崩。
             detail_url = (
                 f"{router_url}/dbs/{db_name}/spaces/"
                 f"{case_space}?detail=true")
@@ -1901,183 +1892,185 @@ class TestRebuildPSFailureExtras:
             cl.start_ps(2, wait_ready=True, timeout=30)
         drop_space(router_url, db_name, case_space)
 
-    # def test_multi_target_fail_first_aborts_rest(self):
-    #     """6.8: 多 vector field 的 space 触发 rebuild 时,如果第一个 target
-    #     (HNSW) 因 partition retry 全部用完而失败,后续 target (IVFFLAT,
-    #     IVFPQ) 不能被 silently 推进。
+    def test_multi_target_fail_first_aborts_rest(self):
+        """6.8: 多 vector field 的 space 触发 rebuild 时,如果第一个 target
+        (HNSW) 因 partition retry 全部用完而失败,后续 target (IVFFLAT,
+        IVFPQ) 不能被 silently 推进。
 
-    #     Per design (rebuild_service.go:1599-1602):
-    #       "Any failed replica → finalize the whole record as failed.
-    #        We deliberately do NOT continue to the next target after a
-    #        failure because the user almost always wants to investigate
-    #        the failure first."
+        Per design (rebuild_service.go:1599-1602):
+          "Any failed replica → finalize the whole record as failed.
+           We deliberately do NOT continue to the next target after a
+           failure because the user almost always wants to investigate
+           the failure first."
 
-    #     故障注入时序 (race-free):
-    #       rn=1 pn=1 ⇒ partition 仅有 1 个 replica,kill 后无 alternate;
-    #       触发 rebuild 后 *立刻* kill PS,而不是等到 running ——
-    #         master tick=2s, HTTP POST 返回到 SIGKILL 完成 < 200ms,远早于
-    #         master 第一次 dispatchPending tick → master 派发的 RPC 全部撞死
-    #         PS (connection refused) → maxDispatchAttempts=3 后 task 失败 →
-    #         partition retry × max_retries=1 后 record 终态 failed。
-    #       这条路径跳过了「引擎已完成 + master 还没来得及回收 completed」的
-    #       race,即使 HNSW 引擎工作只有几十 ms 也不会误判成 completed。
+        故障注入时序 (race-free):
+          rn=1 pn=1 ⇒ partition 仅有 1 个 replica,kill 后无 alternate;
+          触发 rebuild 后 *立刻* kill PS,而不是等到 running ——
+            master tick=2s, HTTP POST 返回到 SIGKILL 完成 < 200ms,远早于
+            master 第一次 dispatchPending tick → master 派发的 RPC 全部撞死
+            PS (connection refused) → maxDispatchAttempts=3 后 task 失败 →
+            partition retry × max_retries=1 后 record 终态 failed。
+          这条路径跳过了「引擎已完成 + master 还没来得及回收 completed」的
+          race,即使 HNSW 引擎工作只有几十 ms 也不会误判成 completed。
 
-    #     断言:
-    #       (1) 终态 status == failed
-    #       (2) indexes 数组长度 == 3 (HNSW + IVFFLAT + IVFPQ 都被识别为
-    #           IndexTarget)
-    #       (3) current_index == 1 (1-based,首个 target 即停;若静默推进了,
-    #           这里会变成 2 或 3)
-    #       (4) indexes[0] 是合法 vector target(target 顺序来自 SpaceProperties
-    #           map,不保证 = 字段声明顺序,故不假设首个一定是 HNSW)
-    #     """
-    #     _ensure_clean_db()
+        断言:
+          (1) 终态 status == failed
+          (2) indexes 数组长度 == 3 (HNSW + IVFFLAT + IVFPQ 都被识别为
+              IndexTarget)
+          (3) current_index == 1 (1-based,首个 target 即停;若静默推进了,
+              这里会变成 2 或 3)
+          (4) indexes[0] 是合法 vector target(target 顺序来自 SpaceProperties
+              map,不保证 = 字段声明顺序,故不假设首个一定是 HNSW)
+        """
+        _ensure_clean_db()
 
-    #     case_space = "%s_chaos_multi_fail_first_%d" % (
-    #         space_name, int(time.time() * 1000))
-    #     dim = xb.shape[1]
-    #     _ensure_all_ps_alive()
+        case_space = "%s_chaos_multi_fail_first_%d" % (
+            space_name, int(time.time() * 1000))
+        dim = xb.shape[1]
+        _ensure_all_ps_alive()
 
-    #     # 三个 vector field 的 space, 参数对齐 comprehensive._multi3_cfg —
-    #     # 那套已经在 6.7 测试里被证实可以建出来。
-    #     # rn=1 pn=1: 单点, kill 后无 alternate 可挪 ⇒ 必然 failed。
-    #     cfg = {
-    #         "name": case_space, "partition_num": 1, "replica_num": 1,
-    #         "fields": [
-    #             {"name": "field_int", "type": "integer"},
-    #             {"name": "field_vector_a", "type": "vector",
-    #              "index": {"name": "gamma_a", "type": "HNSW",
-    #                        "params": {"metric_type": "L2", "nlinks": 32,
-    #                                   "efConstruction": 40,
-    #                                   "training_threshold": 1}},
-    #              "dimension": dim},
-    #             {"name": "field_vector_b", "type": "vector",
-    #              "index": {"name": "gamma_b", "type": "IVFFLAT",
-    #                        "params": {"metric_type": "L2",
-    #                                   "ncentroids": 128,
-    #                                   "training_threshold": 3999}},
-    #              "dimension": dim},
-    #             {"name": "field_vector_c", "type": "vector",
-    #              "index": {"name": "gamma_c", "type": "IVFPQ",
-    #                        "params": {"metric_type": "InnerProduct",
-    #                                   "ncentroids": 128, "nsubvector": 32,
-    #                                   "training_threshold": 3999}},
-    #              "dimension": dim},
-    #         ],
-    #     }
-    #     resp = create_space(router_url, db_name, cfg)
-    #     if resp.json().get("code") != 0:
-    #         pytest.skip(f"cluster cannot create multi-vector space: {resp.json()}")
+        # 三个 vector field 的 space, 参数对齐 comprehensive._multi3_cfg —
+        # 那套已经在 6.7 测试里被证实可以建出来。
+        # rn=1 pn=1: 单点, kill 后无 alternate 可挪 ⇒ 必然 failed。
+        cfg = {
+            "name": case_space, "partition_num": 1, "replica_num": 1,
+            "fields": [
+                {"name": "field_int", "type": "integer"},
+                {"name": "field_vector_a", "type": "vector",
+                 "index": {"name": "gamma_a", "type": "HNSW",
+                           "params": {"metric_type": "L2", "nlinks": 32,
+                                      "efConstruction": 40,
+                                      "training_threshold": 1}},
+                 "dimension": dim},
+                {"name": "field_vector_b", "type": "vector",
+                 "index": {"name": "gamma_b", "type": "IVFFLAT",
+                           "params": {"metric_type": "L2",
+                                      "ncentroids": 32, "nprobe": 8,
+                                      "training_threshold": 1248}},
+                 "dimension": dim},
+                {"name": "field_vector_c", "type": "vector",
+                 "index": {"name": "gamma_c", "type": "IVFPQ",
+                           "params": {"metric_type": "InnerProduct",
+                                      "ncentroids": 32, "nprobe": 8,
+                                      "nsubvector": 32,
+                                      "training_threshold": 1248}},
+                 "dimension": dim},
+            ],
+        }
+        resp = create_space(router_url, db_name, cfg)
+        if resp.json().get("code") != 0:
+            # Full response dump for diagnosis — pytest.skip truncates long msgs.
+            body = resp.json()
+            full_msg = body.get("msg") or body.get("message") or ""
+            logger.error("create_space failed full body: %s", body)
+            logger.error("create_space failed full msg: %s", full_msg)
+            pytest.skip(
+                f"cluster cannot create multi-vector space: "
+                f"code={body.get('code')} msg={full_msg!r}")
 
-    #     # 写入数据 (覆盖三个 vector field)。需要超过 IVF training_threshold
-    #     # (3999) 才能让索引构建进入正常路径。
-    #     batch_size, total = 100, min(xb.shape[0], 5000)
-    #     total_batch = total // batch_size
-    #     upsert_url = router_url + "/document/upsert?timeout=2000000"
-    #     for i in range(total_batch):
-    #         docs = []
-    #         for j in range(batch_size):
-    #             gid = i * batch_size + j
-    #             docs.append({
-    #                 "_id": str(gid),
-    #                 "field_int": gid,
-    #                 "field_vector_a": xb[gid].tolist(),
-    #                 "field_vector_b": xb[gid].tolist(),
-    #                 "field_vector_c": xb[gid].tolist(),
-    #             })
-    #         up = requests.post(upsert_url, auth=(username, password),
-    #                            json={"db_name": db_name,
-    #                                  "space_name": case_space,
-    #                                  "documents": docs})
-    #         assert up.json().get("code") == 0, up.text
-    #     waiting_index_finish(total, space_name=case_space)
+        batch_size, total = 100, min(xb.shape[0], 5000)
+        total_batch = total // batch_size
+        upsert_url = router_url + "/document/upsert?timeout=2000000"
+        for i in range(total_batch):
+            docs = []
+            for j in range(batch_size):
+                gid = i * batch_size + j
+                docs.append({
+                    "_id": str(gid),
+                    "field_int": gid,
+                    "field_vector_a": xb[gid].tolist(),
+                    "field_vector_b": xb[gid].tolist(),
+                    "field_vector_c": xb[gid].tolist(),
+                })
+            up = requests.post(upsert_url, auth=(username, password),
+                               json={"db_name": db_name,
+                                     "space_name": case_space,
+                                     "documents": docs})
+            assert up.json().get("code") == 0, up.text
+        waiting_index_finish(total, space_name=case_space)
 
-    #     # 找到唯一 partition 的唯一 replica 所在的 PS instance。
-    #     kill_ps_idx = None
-    #     try:
-    #         pl = requests.get(f"{router_url}/partitions",
-    #                           auth=(username, password), timeout=5).json()
-    #         assert pl.get("code") == 0, pl
-    #         our_node = None
-    #         detail = _get_space_detail(db_name, case_space)
-    #         our_pids = {p.get("pid") for p in detail.get("partitions") or []}
-    #         for it in pl.get("data") or []:
-    #             if it.get("id") in our_pids:
-    #                 reps = it.get("replicas") or []
-    #                 if reps:
-    #                     our_node = int(reps[0])
-    #                 break
-    #         assert our_node is not None, (
-    #             f"cannot locate partition for {case_space}: "
-    #             f"detail_pids={our_pids}")
-    #         kill_ps_idx = cl.ps_idx_for_node(our_node)
-    #     except Exception as e:
-    #         logger.warning("PS lookup failed: %s", e)
-    #     if kill_ps_idx is None:
-    #         drop_space(router_url, db_name, case_space)
-    #         pytest.skip("cannot map partition replica to a known PS instance")
+        # 找到唯一 partition 的唯一 replica 所在的 PS instance。
+        kill_ps_idx = None
+        try:
+            pl = requests.get(f"{router_url}/partitions",
+                              auth=(username, password), timeout=5).json()
+            assert pl.get("code") == 0, pl
+            our_node = None
+            detail = _get_space_detail(db_name, case_space)
+            our_pids = {p.get("pid") for p in detail.get("partitions") or []}
+            for it in pl.get("data") or []:
+                if it.get("id") in our_pids:
+                    reps = it.get("replicas") or []
+                    if reps:
+                        our_node = int(reps[0])
+                    break
+            assert our_node is not None, (
+                f"cannot locate partition for {case_space}: "
+                f"detail_pids={our_pids}")
+            kill_ps_idx = cl.ps_idx_for_node(our_node)
+        except Exception as e:
+            logger.warning("PS lookup failed: %s", e)
+        if kill_ps_idx is None:
+            drop_space(router_url, db_name, case_space)
+            pytest.skip("cannot map partition replica to a known PS instance")
 
-    #     try:
-    #         # 触发 rebuild,max_retries=1。立刻 kill,不等 running ——
-    #         # 这样 master 的 dispatch RPC 一定打到死 PS 上 (engine 永远不
-    #         # 启动 / 启动了但 master 也来不及收到 completed),从根上避免
-    #         # 「engine 太快完成」的 race。
-    #         resp = _trigger_rebuild(db_name, case_space, max_retries=1)
-    #         assert resp.json().get("code") == 0, resp.text
-    #         cl.kill_ps(kill_ps_idx, hard=True)
+        try:
+            resp = _trigger_rebuild(db_name, case_space, max_retries=1)
+            assert resp.json().get("code") == 0, resp.text
+            cl.kill_ps(kill_ps_idx, hard=True)
 
-    #         # 等终态 (允许 failed)。
-    #         final = _wait_terminal(db_name, case_space, timeout=300,
-    #                                allow_failed=True)
+            # 等终态 (允许 failed)。
+            final = _wait_terminal(db_name, case_space, timeout=300,
+                                   allow_failed=True)
 
-    #         # (1) status == failed
-    #         assert final["status"] == "failed", (
-    #             f"expected failed (单 replica + 永久 kill 没法 retry 成功),"
-    #             f"got {final}"
-    #         )
+            # (1) status == failed
+            assert final["status"] == "failed", (
+                f"expected failed (单 replica + 永久 kill 没法 retry 成功),"
+                f"got {final}"
+            )
 
-    #         # (2) indexes 数组长度 == 3
-    #         indexes = final.get("indexes") or []
-    #         assert len(indexes) == 3, (
-    #             f"expected 3 IndexTargets (HNSW+IVFFLAT+IVFPQ), got "
-    #             f"{len(indexes)}: {indexes}"
-    #         )
+            # (2) indexes 数组长度 == 3
+            indexes = final.get("indexes") or []
+            assert len(indexes) == 3, (
+                f"expected 3 IndexTargets (HNSW+IVFFLAT+IVFPQ), got "
+                f"{len(indexes)}: {indexes}"
+            )
 
-    #         # (3) current_index == 1 (1-based;首 target 即停)
-    #         #     若静默推进到 IVFFLAT/IVFPQ,这里会是 2 或 3。
-    #         cur = final.get("current_index")
-    #         assert cur == 1, (
-    #             f"current_index 应该停在 1 (HNSW 首个 target 失败立即终态),"
-    #             f"实际为 {cur} — 这意味着失败后游标被静默推进到了下一个 "
-    #             f"target,违反 rebuild_service.go:1599-1602 的设计意图"
-    #         )
+            # (3) current_index == 1 (1-based;首 target 即停)
+            #     若静默推进到 IVFFLAT/IVFPQ,这里会是 2 或 3。
+            cur = final.get("current_index")
+            assert cur == 1, (
+                f"current_index 应该停在 1 (HNSW 首个 target 失败立即终态),"
+                f"实际为 {cur} — 这意味着失败后游标被静默推进到了下一个 "
+                f"target,违反 rebuild_service.go:1599-1602 的设计意图"
+            )
 
-    #         # (4) 失败确实发生在「第一个 target」上。#3 的 current_index==1
-    #         #     已证明游标停在首个 target,indexes[0] 按定义就是那个失败的
-    #         #     target。注意:target 顺序来自 space.Indexes 的装配,而它源自
-    #         #     SpaceProperties(map),并不保证等于字段声明顺序 —— 所以不能
-    #         #     假设首个一定是 HNSW,这里只做合法 vector target 的 sanity 检查。
-    #         first_target = indexes[0]
-    #         ft_type = (first_target.get("index_type")
-    #                    or first_target.get("type") or "").upper()
-    #         assert ft_type in ("HNSW", "IVFFLAT", "IVFPQ"), (
-    #             f"first target has unexpected index_type: {first_target}"
-    #         )
+            # (4) 失败确实发生在「第一个 target」上。#3 的 current_index==1
+            #     已证明游标停在首个 target,indexes[0] 按定义就是那个失败的
+            #     target。注意:target 顺序来自 space.Indexes 的装配,而它源自
+            #     SpaceProperties(map),并不保证等于字段声明顺序 —— 所以不能
+            #     假设首个一定是 HNSW,这里只做合法 vector target 的 sanity 检查。
+            first_target = indexes[0]
+            ft_type = (first_target.get("index_type")
+                       or first_target.get("type") or "").upper()
+            assert ft_type in ("HNSW", "IVFFLAT", "IVFPQ"), (
+                f"first target has unexpected index_type: {first_target}"
+            )
 
-    #         logger.info(
-    #             "6.8 verified: status=failed, indexes=%d, current_index=%s, "
-    #             "first=%s",
-    #             len(indexes), cur, ft_type,
-    #         )
-    #     finally:
-    #         try:
-    #             cl.start_ps(kill_ps_idx, wait_ready=True, timeout=30)
-    #         except Exception as e:
-    #             logger.warning("start_ps recovery failed: %s", e)
-    #         try:
-    #             drop_space(router_url, db_name, case_space)
-    #         except Exception:
-    #             pass
+            logger.info(
+                "6.8 verified: status=failed, indexes=%d, current_index=%s, "
+                "first=%s",
+                len(indexes), cur, ft_type,
+            )
+        finally:
+            try:
+                cl.start_ps(kill_ps_idx, wait_ready=True, timeout=30)
+            except Exception as e:
+                logger.warning("start_ps recovery failed: %s", e)
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception:
+                pass
 
     def test_failed_record_can_be_overwritten_by_new_request(self):
         """8.2: 一个 rebuild 进入 failed 终态后,新发起的 rebuild 请求必须
