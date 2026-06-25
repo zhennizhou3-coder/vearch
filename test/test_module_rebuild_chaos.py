@@ -1931,6 +1931,8 @@ class TestRebuildPSFailureExtras:
           (4) indexes[0] 是合法 vector target(target 顺序来自 SpaceProperties
               map,不保证 = 字段声明顺序,故不假设首个一定是 HNSW)
         """
+        _ensure_clean_db()
+
         case_space = "%s_chaos_multi_fail_first_%d" % (
             space_name, int(time.time() * 1000))
         dim = xb.shape[1]
