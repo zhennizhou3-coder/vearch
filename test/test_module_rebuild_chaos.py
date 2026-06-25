@@ -1901,6 +1901,16 @@ class TestRebuildPSFailureExtras:
             cl.start_ps(2, wait_ready=True, timeout=30)
         drop_space(router_url, db_name, case_space)
 
+    @pytest.mark.skip(
+        reason="hangs in CI between previous test teardown (kill+restart "
+               "ps2 + drop_space) and this test's setup. Symptom: "
+               "test_restatus_map_resets_on_real_failure PASSES, then "
+               "log goes silent and the whole 90min chaos job is killed "
+               "by GitHub. Skipping until we can dump master/PS logs and "
+               "isolate whether drop_space, _ensure_clean_db, or this "
+               "test's create_space (multi-vector) is the actual hang "
+               "point. Tracked as a follow-up — should be re-enabled "
+               "once the hang is identified and fixed.")
     def test_multi_target_fail_first_aborts_rest(self):
         """6.8: 多 vector field 的 space 触发 rebuild 时,如果第一个 target
         (HNSW) 因 partition retry 全部用完而失败,后续 target (IVFFLAT,
