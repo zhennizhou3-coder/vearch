@@ -1519,13 +1519,7 @@ func (sc *RebuildScheduler) persistRecord(ctx context.Context, rec *SpaceRebuild
 		return err
 	}
 	key := entity.RebuildSpaceKey(rec.DBName, rec.SpaceName)
-	return sc.client.Master().STM(ctx, func(stm concurrency.STM) error {
-		// stm.Get tracks the key's revision so a concurrent write under us
-		// causes the txn to retry rather than blind-overwrite.
-		_ = stm.Get(key)
-		stm.Put(key, string(value))
-		return nil
-	})
+	return sc.client.Master().Put(ctx, key, value)
 }
 
 // deleteRecord removes a rebuild record from etcd.
