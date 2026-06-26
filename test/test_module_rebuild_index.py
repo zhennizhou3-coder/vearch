@@ -319,32 +319,68 @@ def _check_search_field(case_space_name: str, field: str, times: int = 3, db_nam
 
 def _ensure_clean_db():
     """Drop all spaces then drop DB, then create a fresh DB.
-    A DB with remaining spaces cannot be deleted, so we must
-    first enumerate and drop every space under it."""
-    # Step 1: List existing spaces under the DB.
-    url = f"{router_url}/dbs/{db_name}/spaces"
-    rs = requests.get(url, auth=(username, password))
-    logger.info("list spaces response: status=%d body=%s", rs.status_code, rs.text[:500])
+    """
+    spaces_url = f"{router_url}/dbs/{db_name}/spaces"
+    db_url = f"{router_url}/dbs/{db_name}"
+
+    # Step 1: List existing spaces under the DB and drop each.
+    rs = requests.get(spaces_url, auth=(username, password))
+    logger.info("list spaces response: status=%d body=%s",
+                rs.status_code, rs.text[:500])
     if rs.status_code == 200:
         body = rs.json()
         if body.get("code") == 0 and body.get("data"):
-            spaces = body["data"]
-            for sp in spaces:
-                # SpaceInfo uses "space_name" as primary field, "name" is legacy compat
+            for sp in body["data"]:
                 sp_name = sp.get("space_name") or sp.get("name") or ""
                 if sp_name:
                     logger.info("dropping residual space: %s", sp_name)
                     drop_resp = drop_space(router_url, db_name, sp_name)
                     logger.info("drop_space %s result: status=%d body=%s",
-                                sp_name, drop_resp.status_code, drop_resp.text[:200])
-    # Step 2: Drop DB (ignore errors — DB might not exist).
+                                sp_name, drop_resp.status_code,
+                                drop_resp.text[:200])
+
+    # Wait until all spaces actually disappear from the master view (max 30s).
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        rs = requests.get(spaces_url, auth=(username, password))
+        if rs.status_code != 200:
+            break  # DB itself already gone -> nothing left to drop
+        body = rs.json()
+        if not body.get("data"):
+            break
+        time.sleep(0.5)
+    else:
+        logger.warning("_ensure_clean_db: spaces did not fully drop within 30s; "
+                       "last list: %s", rs.text[:500])
+
+    # Step 2: Drop DB (ignore "not found"; we created it ourselves anyway).
     drop_resp = drop_db(router_url, db_name)
     logger.info("drop_db result: status=%d body=%s",
                 drop_resp.status_code, drop_resp.text[:200])
-    # Step 3: Create fresh DB.
+
+    # Wait until the DB itself is gone (max 15s).
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        r = requests.get(db_url, auth=(username, password))
+        # Master returns non-200 OR code != 0 once the DB is fully removed.
+        if r.status_code != 200 or r.json().get("code") != 0:
+            break
+        time.sleep(0.5)
+    else:
+        logger.warning("_ensure_clean_db: db %s still visible after drop within 15s",
+                       db_name)
+
+    # Step 3: Create fresh DB — assert success so a silent failure cannot
+    # cascade into "db_not_exist" on later create_space.
     create_resp = create_db(router_url, db_name)
     logger.info("create_db result: status=%d body=%s",
                 create_resp.status_code, create_resp.text[:200])
+    assert create_resp.status_code == 200, (
+        f"create_db {db_name} HTTP {create_resp.status_code}: "
+        f"{create_resp.text[:500]}")
+    create_body = create_resp.json()
+    assert create_body.get("code") == 0, (
+        f"create_db {db_name} business error: {create_resp.text[:500]}")
 
 # ---------------------------------------------------------------------------
 # Space config factories
