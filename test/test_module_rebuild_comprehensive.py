@@ -288,7 +288,23 @@ def _ivfrabitq_cfg(name, pn=1, rn=1):
                         "dimension": dim}]}
 
 def _multi3_cfg(name, pn=1, rn=1):
-    """3 vector fields: HNSW + IVFFLAT + IVFPQ."""
+    """3 vector fields: HNSW + IVFFLAT + IVFPQ.
+
+    Parameter notes:
+      - ncentroids=32 chosen so that vearch engine's auto-clamped
+        training_threshold (= ncentroids * 39 = 1248 after PR #748) is
+        well below the 10000 docs _add_multi3_docs writes. With the
+        original ncentroids=128 the clamped threshold becomes 4992,
+        and the multi-vector concurrent indexing path occasionally
+        stalls at valid_count ~4900 — see engine log
+        "valid vector count < training threshold" — making rebuild
+        tests time out unreliably.
+      - nprobe=8 is explicit so we don't fall into the C++ engine's
+        default nprobe=80 (harmless for ncentroids>=80 but ambiguous
+        otherwise).
+      - HNSW training_threshold=1 keeps the cheap graph-index path
+        unchanged; HNSW doesn't share the IVF clamping logic.
+    """
     dim = xb.shape[1]
     return {"name": name, "partition_num": pn, "replica_num": rn,
             "fields": [
@@ -299,11 +315,11 @@ def _multi3_cfg(name, pn=1, rn=1):
                  "dimension": dim},
                 {"name": "field_vector_b", "type": "vector",
                  "index": {"name": "gamma_b", "type": "IVFFLAT",
-                           "params": {"metric_type": "L2", "ncentroids": 128, "training_threshold": 3999}},
+                           "params": {"metric_type": "L2", "ncentroids": 32, "nprobe": 8, "training_threshold": 1248}},
                  "dimension": dim},
                 {"name": "field_vector_c", "type": "vector",
                  "index": {"name": "gamma_c", "type": "IVFPQ",
-                           "params": {"metric_type": "InnerProduct", "ncentroids": 128, "nsubvector": 32, "training_threshold": 3999}},
+                           "params": {"metric_type": "InnerProduct", "ncentroids": 32, "nprobe": 8, "nsubvector": 32, "training_threshold": 1248}},
                  "dimension": dim},
             ]}
 
