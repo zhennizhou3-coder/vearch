@@ -37,8 +37,6 @@ import (
 
 var _ engine.Engine = &gammaEngine{}
 
-var indexLocker sync.Mutex
-
 type EngineConfig struct {
 	// Path is the data directory.
 	Path string
@@ -143,6 +141,7 @@ type gammaEngine struct {
 
 	counter   *atomic.AtomicInt64
 	lock      sync.RWMutex
+	indexMu   sync.Mutex // Experiment C: per-engine index lock (was global indexLocker)
 	hasClosed bool
 }
 
@@ -359,8 +358,8 @@ func (ge *gammaEngine) BuildIndex() error {
 		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED, nil)
 	}
 
-	indexLocker.Lock()
-	defer indexLocker.Unlock()
+	ge.indexMu.Lock()
+	defer ge.indexMu.Unlock()
 
 	// UNINDEXED = 0, INDEXING, INDEXED
 	go func() {
@@ -386,8 +385,8 @@ func (ge *gammaEngine) RebuildFieldIndex(field, indexType string, drop, cpu, des
 		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED, nil)
 	}
 
-	indexLocker.Lock()
-	defer indexLocker.Unlock()
+	ge.indexMu.Lock()
+	defer ge.indexMu.Unlock()
 
 	if ge.hasClosed {
 		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED, nil)
@@ -416,8 +415,8 @@ func (ge *gammaEngine) RebuildFieldIndex(field, indexType string, drop, cpu, des
 }
 
 func (ge *gammaEngine) Load() error {
-	indexLocker.Lock()
-	defer indexLocker.Unlock()
+	ge.indexMu.Lock()
+	defer ge.indexMu.Unlock()
 	ge.counter.Incr()
 	defer ge.counter.Decr()
 	cfg := EngineConfig{

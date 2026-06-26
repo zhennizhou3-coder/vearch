@@ -1164,46 +1164,46 @@ func markReplicaFailed(t *PartitionRebuildTask, msg string) {
 }
 
 // markReplicaRebuilding toggles the router-visible Rebuilding marker.
-// Clearing only changes ReplicasRebuilding, leaving other replica states intact.
 func (sc *RebuildScheduler) markReplicaRebuilding(ctx context.Context,
 	pid entity.PartitionID, nodeID entity.NodeID, rebuilding bool) error {
 
-	mc := sc.client.Master()
-	p, err := mc.QueryPartition(ctx, pid)
-	if err != nil {
-		return fmt.Errorf("query partition %d: %w", pid, err)
-	}
-	if p == nil {
-		return fmt.Errorf("partition %d not found", pid)
-	}
-	if p.ReStatusMap == nil {
-		p.ReStatusMap = make(map[uint64]uint32)
-	}
-
-	cur := p.ReStatusMap[uint64(nodeID)]
-	if rebuilding {
-		if cur == entity.ReplicasRebuilding {
-			return nil // already set, no-op
+	key := entity.PartitionKey(pid)
+	return sc.client.Master().STM(ctx, func(stm concurrency.STM) error {
+		raw := stm.Get(key)
+		if raw == "" {
+			return fmt.Errorf("partition %d not found", pid)
 		}
-		p.ReStatusMap[uint64(nodeID)] = entity.ReplicasRebuilding
-	} else {
-		if cur != entity.ReplicasRebuilding {
-			return nil // not currently Rebuilding; don't clobber NotReady etc.
+		p := &entity.Partition{}
+		if err := vjson.Unmarshal([]byte(raw), p); err != nil {
+			return fmt.Errorf("unmarshal partition %d: %w", pid, err)
 		}
-		p.ReStatusMap[uint64(nodeID)] = entity.ReplicasOK
-	}
+		if p.ReStatusMap == nil {
+			p.ReStatusMap = make(map[uint64]uint32)
+		}
 
-	// Bump UpdateTime so router partition caches accept this write.
-	p.UpdateTime = time.Now().UnixNano()
+		cur := p.ReStatusMap[uint64(nodeID)]
+		if rebuilding {
+			if cur == entity.ReplicasRebuilding {
+				return nil // already set, no-op (no Put → STM commits empty)
+			}
+			p.ReStatusMap[uint64(nodeID)] = entity.ReplicasRebuilding
+		} else {
+			if cur != entity.ReplicasRebuilding {
+				return nil // not currently Rebuilding; don't clobber NotReady etc.
+			}
+			p.ReStatusMap[uint64(nodeID)] = entity.ReplicasOK
+		}
 
-	bytes, err := vjson.Marshal(p)
-	if err != nil {
-		return fmt.Errorf("marshal partition %d: %w", pid, err)
-	}
-	if err := mc.Put(ctx, entity.PartitionKey(pid), bytes); err != nil {
-		return fmt.Errorf("put partition %d: %w", pid, err)
-	}
-	return nil
+		// Bump UpdateTime so router partition caches accept this write.
+		p.UpdateTime = time.Now().UnixNano()
+
+		bytes, err := vjson.Marshal(p)
+		if err != nil {
+			return fmt.Errorf("marshal partition %d: %w", pid, err)
+		}
+		stm.Put(key, string(bytes))
+		return nil
+	})
 }
 
 // unmarkRebuildingForTerminalTasks clears markers for finished tasks.
@@ -1518,7 +1518,11 @@ func (sc *RebuildScheduler) persistRecord(ctx context.Context, rec *SpaceRebuild
 		return err
 	}
 	key := entity.RebuildSpaceKey(rec.DBName, rec.SpaceName)
-	return sc.client.Master().Put(ctx, key, value)
+	return sc.client.Master().STM(ctx, func(stm concurrency.STM) error {
+		_ = stm.Get(key) // include in read set for CAS retry
+		stm.Put(key, string(value))
+		return nil
+	})
 }
 
 // deleteRecord removes a rebuild record from etcd.
