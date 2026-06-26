@@ -31,6 +31,8 @@ jobs:
         include:
           - platform: linux/amd64
             docker-arch: ''
+          - platform: linux/arm64
+            docker-arch: '--platform linux/arm64'
     env:
       TARGET_PLATFORM: ${{ matrix.platform }}
 
@@ -92,6 +94,8 @@ jobs:
         include:
           - platform: linux/amd64
             docker-arch: ''
+          - platform: linux/arm64
+            docker-arch: '--platform linux/arm64'
     env:
       TARGET_PLATFORM: ${{ matrix.platform }}
       # cluster_helpers 也会自动探测,显式声明更稳。
