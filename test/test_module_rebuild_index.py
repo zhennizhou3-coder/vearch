@@ -70,21 +70,16 @@ _PROGRESS_REQUIRED_KEYS = {
 def _trigger_rebuild(
     db: str,
     space: str,
-    field_name: str = "",
-    index_type: str = "",
+    index_name: str = "",
     max_retries: int = 0,
 ):
-    """POST /rebuild/index/dbs/:db/spaces/:space[ /fields/:field/indexes/:index]
+    """POST /index/rebuild/dbs/:db/spaces/:space[/indexes/:index_name]
     """
     payload = {}
-    if field_name and index_type:
-        url = f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}/fields/{field_name}/indexes/{index_type}"
+    if index_name:
+        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/indexes/{index_name}"
     else:
-        url = f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}"
-        if field_name:
-            payload["field_name"] = field_name
-        if index_type:
-            payload["index_type"] = index_type
+        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}"
     if max_retries > 0:
         payload["max_retries"] = max_retries
     resp = requests.post(url, auth=(username, password), json=payload)
@@ -92,27 +87,27 @@ def _trigger_rebuild(
     return resp
 
 def _trigger_rebuild_db(db: str):
-    """POST /rebuild/index/dbs/:db — rebuild all spaces in a DB."""
-    url = f"{router_url}/rebuild/index/dbs/{db}"
+    """POST /index/rebuild/dbs/:db — rebuild all spaces in a DB."""
+    url = f"{router_url}/index/rebuild/dbs/{db}"
     resp = requests.post(url, auth=(username, password), json={})
     logger.info("trigger_rebuild_db url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
     return resp
 
 def _trigger_rebuild_global():
-    """POST /rebuild/index/dbs — rebuild all spaces across all DBs."""
-    url = f"{router_url}/rebuild/index/dbs"
+    """POST /index/rebuild/dbs — rebuild all spaces across all DBs."""
+    url = f"{router_url}/index/rebuild/dbs"
     resp = requests.post(url, auth=(username, password), json={})
     logger.info("trigger_rebuild_global url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
     return resp
 
 def _trigger_rebuild_drop(db, space):
-      url = f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}"
+      url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}"
       return requests.post(url, auth=(username, password),
                            json={"drop_before_rebuild": True})
 
 def _get_rebuild_progress(db: str, space: str) -> dict:
-    """GET /rebuild/index/dbs/:db/spaces/:space/progress"""
-    url = f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}/progress"
+    """GET /index/rebuild/dbs/:db/spaces/:space/progress"""
+    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/progress"
     resp = requests.get(url, auth=(username, password))
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -125,13 +120,13 @@ def _get_rebuild_progress(db: str, space: str) -> dict:
 def _list_rebuild_progress(db: str = "") -> dict:
     """GET progress summary.
 
-    db=""  -> GET /rebuild/index/dbs              (global summary)
-    db=xxx -> GET /rebuild/index/dbs/xxx/progress  (db-level summary)
+    db=""  -> GET /index/rebuild/dbs              (global summary)
+    db=xxx -> GET /index/rebuild/dbs/xxx/progress  (db-level summary)
     """
     if db:
-        url = f"{router_url}/rebuild/index/dbs/{db}/progress"
+        url = f"{router_url}/index/rebuild/dbs/{db}/progress"
     else:
-        url = f"{router_url}/rebuild/index/dbs"
+        url = f"{router_url}/index/rebuild/dbs"
     resp = requests.get(url, auth=(username, password))
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -139,20 +134,20 @@ def _list_rebuild_progress(db: str = "") -> dict:
     return body.get("data", {})
 
 def _cancel_rebuild(db: str, space: str):
-    """POST /cancel/rebuild/index/dbs/:db/spaces/:space"""
-    url = f"{router_url}/cancel/rebuild/index/dbs/{db}/spaces/{space}"
+    """POST /index/rebuild/dbs/:db/spaces/:space/cancel"""
+    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/cancel"
     resp = requests.post(url, auth=(username, password))
     return resp
 
 def _cancel_rebuild_db(db: str):
-    """POST /cancel/rebuild/index/dbs/:db — cancel all rebuilds in a DB."""
-    url = f"{router_url}/cancel/rebuild/index/dbs/{db}"
+    """POST /index/rebuild/dbs/:db/cancel — cancel all rebuilds in a DB."""
+    url = f"{router_url}/index/rebuild/dbs/{db}/cancel"
     resp = requests.post(url, auth=(username, password))
     return resp
 
 def _cancel_rebuild_global():
-    """POST /cancel/rebuild/index/dbs — cancel all rebuilds globally."""
-    url = f"{router_url}/cancel/rebuild/index/dbs"
+    """POST /index/rebuild/cancel — cancel all rebuilds globally."""
+    url = f"{router_url}/index/rebuild/cancel"
     resp = requests.post(url, auth=(username, password))
     return resp
 
@@ -319,6 +314,15 @@ def _check_search_field(case_space_name: str, field: str, times: int = 3, db_nam
 
 def _ensure_clean_db():
     """Drop all spaces then drop DB, then create a fresh DB.
+
+    Step 1/2 are async on the master side (drop_space returns once master
+    accepts the request, but partitions are torn down on PS afterwards;
+    similarly drop_db can race with residual space removal). We poll
+    after each destructive step until the master view actually clears.
+
+    The final create_db is asserted — silent failure here had been
+    masquerading as a "code=1 / db_not_exist" failure on the next
+    create_space, which is exactly the flaky CI hit we just observed.
     """
     spaces_url = f"{router_url}/dbs/{db_name}/spaces"
     db_url = f"{router_url}/dbs/{db_name}"
@@ -521,8 +525,8 @@ class TestRebuildBasicLifecycle:
         )
 
         # Diagnostic: test rebuild route via both Router and Master directly
-        rebuild_url_via_router = f"{router_url}/rebuild/index/dbs/{db_name}/spaces/{case_space}"
-        rebuild_url_via_master = f"{master_url}/rebuild/index/dbs/{db_name}/spaces/{case_space}"
+        rebuild_url_via_router = f"{router_url}/index/rebuild/dbs/{db_name}/spaces/{case_space}"
+        rebuild_url_via_master = f"{master_url}/index/rebuild/dbs/{db_name}/spaces/{case_space}"
         logger.info("rebuild URL via router: %s", rebuild_url_via_router)
         logger.info("rebuild URL via master: %s", rebuild_url_via_master)
 
@@ -623,7 +627,7 @@ class TestRebuildBasicLifecycle:
         drop_space(router_url, db_name, case_space)
 
     def test_rebuild_all_spaces_in_db(self):
-        """Trigger DB-level rebuild (POST /rebuild/index/dbs/:db) which
+        """Trigger DB-level rebuild (POST /index/rebuild/dbs/:db) which
         rebuilds every space in the DB.  Create 2 spaces, trigger DB-level
         rebuild, verify both spaces are rebuilt and search works."""
         batch_size = 100
@@ -667,7 +671,7 @@ class TestRebuildBasicLifecycle:
         drop_space(router_url, db_name, sp_b)
 
     def test_rebuild_global_multiple_dbs(self):
-        """Global rebuild (POST /rebuild/index/dbs) rebuilds all spaces
+        """Global rebuild (POST /index/rebuild/dbs) rebuilds all spaces
         across all DBs.  Create 2 DBs with 1 space each, trigger global
         rebuild, verify both spaces are rebuilt."""
         batch_size = 100
@@ -1040,7 +1044,7 @@ class TestRebuildBasicLifecycle:
                                       "ncentroids": 32,
                                       "nprobe": 16,
                                       "nsubvector": 32,
-                                      "training_threshold": 1000}},
+                                      "training_threshold": 1248}},
                  "dimension": embedding_size},
             ],
         }
@@ -1568,7 +1572,11 @@ class TestCancelRebuild:
 
         # Create spaces with HNSW and load data.
         for sp in spaces:
-            assert create_space(router_url, db_name, _hnsw_space_config(sp)).json()["code"] == 0
+            cs_resp = create_space(router_url, db_name, _hnsw_space_config(sp))
+            assert cs_resp.json().get("code") == 0, (
+                f"create_space {sp} failed: HTTP={cs_resp.status_code} "
+                f"body={cs_resp.text[:500]}"
+            )
             add(total_batch, batch_size, xb, True, False, space_name=sp)
             waiting_index_finish(total, space_name=sp)
 
@@ -2020,17 +2028,17 @@ class TestRebuildPerField:
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
 
-        resp = _trigger_rebuild(db_name, case_space, field_name="field_vector_a", index_type="HNSW")
+        resp = _trigger_rebuild(db_name, case_space, index_name="gamma_a")
         body = resp.json()
         logger.info("per-field rebuild trigger response: %s", body)
         assert body.get("code") == 0, body
 
         first = _get_rebuild_progress(db_name, case_space)
         indexes = first.get("indexes", [])
-        assert len(indexes) == 1, f"expected 1 IndexTarget, got {indexes}"
-        assert indexes[0]["field_name"] == "field_vector_a"
-        assert indexes[0]["index_type"] == "HNSW"
-        logger.info("rebuild detail: db_name %s, space_name %s, field_name %s, index_type %s",db_name, case_space, indexes[0]["field_name"], indexes[0]["index_type"])
+        assert len(indexes) == 1, f"expected 1 index target, got {indexes}"
+        assert indexes[0] == "gamma_a"
+        logger.info("rebuild detail: db_name %s, space_name %s, index_name %s",
+                    db_name, case_space, indexes[0])
 
         snapshots = _wait_rebuild_completed(db_name, case_space, timeout=600)
         assert snapshots[-1]["status"] == "completed"
@@ -2046,16 +2054,15 @@ class TestRebuildPerField:
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
 
-        resp = _trigger_rebuild(db_name, case_space, field_name="field_vector_b", index_type="FLAT")
+        resp = _trigger_rebuild(db_name, case_space, index_name="gamma_b")
         body = resp.json()
         logger.info("per-field rebuild flat trigger response: %s", body)
         assert body.get("code") == 0, body
 
         first = _get_rebuild_progress(db_name, case_space)
         indexes = first.get("indexes", [])
-        assert len(indexes) == 1, f"expected 1 IndexTarget, got {indexes}"
-        assert indexes[0]["field_name"] == "field_vector_b"
-        assert indexes[0]["index_type"] == "FLAT"
+        assert len(indexes) == 1, f"expected 1 index target, got {indexes}"
+        assert indexes[0] == "gamma_b"
 
         _wait_rebuild_completed(db_name, case_space, timeout=600)
         _wait_index_status_indexed(db_name, case_space)
@@ -2076,10 +2083,9 @@ class TestRebuildPerField:
 
         first = _get_rebuild_progress(db_name, case_space)
         indexes = first.get("indexes", [])
-        assert len(indexes) >= 2, f"expected >= 2 IndexTargets, got {indexes}"
-        for idx_target in indexes:
-            assert "field_name" in idx_target, f"IndexTarget missing field_name: {idx_target}"
-            assert "index_type" in idx_target, f"IndexTarget missing index_type: {idx_target}"
+        assert len(indexes) >= 2, f"expected >= 2 index names, got {indexes}"
+        for idx_name in indexes:
+            assert isinstance(idx_name, str) and idx_name, f"index name must be non-empty string: {idx_name!r}"
 
         _wait_rebuild_completed(db_name, case_space, timeout=600)
         _wait_index_status_indexed(db_name, case_space)
@@ -2096,16 +2102,15 @@ class TestRebuildPerField:
         add(total_batch, batch_size, xb, True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
-        resp = _trigger_rebuild(db_name, case_space, field_name="field_vector", index_type="HNSW")
+        resp = _trigger_rebuild(db_name, case_space, index_name="gamma")
         body = resp.json()
         logger.info("single-field per-target rebuild response: %s", body)
         assert body.get("code") == 0, body
 
         first = _get_rebuild_progress(db_name, case_space)
         indexes = first.get("indexes", [])
-        assert len(indexes) == 1, f"expected 1 IndexTarget, got {indexes}"
-        assert indexes[0]["field_name"] == "field_vector"
-        assert indexes[0]["index_type"] == "HNSW"
+        assert len(indexes) == 1, f"expected 1 index target, got {indexes}"
+        assert indexes[0] == "gamma"
 
         _wait_rebuild_completed(db_name, case_space, timeout=600)
         _wait_index_status_indexed(db_name, case_space)
@@ -2118,7 +2123,7 @@ class TestRebuildPerField:
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
 
-        resp = _trigger_rebuild(db_name, case_space, field_name="nonexistent_field", index_type="HNSW")
+        resp = _trigger_rebuild(db_name, case_space, index_name="nonexistent_index")
         body = resp.json()
         logger.info("rebuild nonexistent field response: %s", body)
         # The rebuild API returns code=0 at the top level for batch-style
@@ -2150,8 +2155,8 @@ class TestRebuildPerField:
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
 
-        # field_vector_a has HNSW; asking for IVFPQ should fail.
-        resp = _trigger_rebuild(db_name, case_space, field_name="field_vector_a", index_type="IVFPQ")
+        # field_vector_a has HNSW (gamma_a); asking for a non-existent index should fail.
+        resp = _trigger_rebuild(db_name, case_space, index_name="gamma_a_ivfpq_nonexistent")
         body = resp.json()
         logger.info("rebuild wrong index type response: %s", body)
         # The rebuild API returns code=0 at the top level for batch-style
@@ -2172,8 +2177,8 @@ class TestRebuildPerField:
                 f"unexpected failure message for wrong index type: {body}"
             )
 
-        # field_vector_b has FLAT; asking for HNSW should also fail.
-        resp2 = _trigger_rebuild(db_name, case_space, field_name="field_vector_b", index_type="HNSW")
+        # field_vector_b has FLAT (gamma_b); asking for a non-existent index name should also fail.
+        resp2 = _trigger_rebuild(db_name, case_space, index_name="gamma_b_hnsw_nonexistent")
         body2 = resp2.json()
         logger.info("rebuild wrong index type (b->HNSW) response: %s", body2)
         data2 = body2.get("data", {})
@@ -2187,30 +2192,27 @@ class TestRebuildPerField:
 
         drop_space(router_url, db_name, case_space)
 
-    def test_rebuild_field_without_index_type_rejected(self):
-        """Specifying only field_name without index_type (or vice versa)
-        must be rejected — both must be specified together."""
-        case_space = space_name + "_mri_partial_target"
+    def test_rebuild_empty_index_name_means_all(self):
+        """Empty index_name means rebuild all rebuildable indexes of the space.
+        (Replaces the old field/type partial-target test — under the
+        IndexName API there is only one identifier and it is either
+        specified or absent, never half-specified.)"""
+        case_space = space_name + "_mri_empty_idx_name"
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
 
-        # Only field_name, no index_type.
-        resp = _trigger_rebuild(db_name, case_space, field_name="field_vector_a", index_type="")
+        # Empty index_name -> rebuild all targets.
+        resp = _trigger_rebuild(db_name, case_space, index_name="")
         body = resp.json()
-        logger.info("rebuild field-only (no index_type) response: %s", body)
-        # The rebuild API may return code=0 at the top level for batch-style
-        # responses; individual failures are reported in data.failures.
-        data = body.get("data", {})
-        failures = data.get("failures", [])
-        rejected = body.get("code") != 0 or len(failures) > 0
-        assert rejected, (
-            f"expected error for field_name without index_type, got success: {body}"
-        )
+        logger.info("rebuild with empty index_name response: %s", body)
+        assert body.get("code") == 0, body
 
-        # Only index_type, no field_name — this triggers full-space rebuild
-        # because empty field_name means "all indexes", so it should succeed.
-        # We test the truly invalid case below via the URL path itself.
+        first = _get_rebuild_progress(db_name, case_space)
+        indexes = first.get("indexes", [])
+        # _multi_vector_space_config has two rebuildable vector indexes.
+        assert len(indexes) >= 2, f"expected >= 2 targets when no index_name set, got {indexes}"
 
+        _wait_rebuild_completed(db_name, case_space, timeout=600)
         drop_space(router_url, db_name, case_space)
 
     def test_rebuild_multi_index_space_all_indexes(self):
@@ -2226,13 +2228,13 @@ class TestRebuildPerField:
         logger.info("multi-index space rebuild trigger response: %s", body)
         assert body.get("code") == 0, body
 
-        # Verify the progress response lists all indexes.
+        # Verify the progress response lists all index names.
         first = _get_rebuild_progress(db_name, case_space)
         indexes = first.get("indexes", [])
-        assert len(indexes) == 2, f"expected 2 IndexTargets, got {indexes}"
-        field_types = {(idx["field_name"], idx["index_type"]) for idx in indexes}
-        assert ("field_vector_a", "HNSW") in field_types, f"missing field_vector_a/HNSW in {indexes}"
-        assert ("field_vector_b", "FLAT") in field_types, f"missing field_vector_b/FLAT in {indexes}"
+        assert len(indexes) == 2, f"expected 2 index targets, got {indexes}"
+        names = set(indexes)
+        assert "gamma_a" in names, f"missing gamma_a in {indexes}"
+        assert "gamma_b" in names, f"missing gamma_b in {indexes}"
 
         # Wait for rebuild to complete.
         snapshots = _wait_rebuild_completed(db_name, case_space, timeout=600)
@@ -2367,9 +2369,9 @@ class TestRebuildMultiIndexType:
 class TestRebuildDBLevel:
     """Exercise the DB-scope rebuild endpoints.
 
-    POST /rebuild/index/dbs/:db                     — trigger all spaces
-    GET  /rebuild/index/dbs/:db/progress             — query DB summary
-    POST /cancel/rebuild/index/dbs/:db               — cancel all spaces
+    POST /index/rebuild/dbs/:db                     — trigger all spaces
+    GET  /index/rebuild/dbs/:db/progress             — query DB summary
+    POST /index/rebuild/dbs/:db/cancel               — cancel all spaces
     """
 
     def setup_class(self):
@@ -2459,9 +2461,9 @@ class TestRebuildDBLevel:
 class TestRebuildGlobalScope:
     """Exercise the global rebuild endpoints.
 
-    POST /rebuild/index/dbs                           — trigger all DBs
-    GET  /rebuild/index/dbs/progress                   — global summary
-    POST /cancel/rebuild/index/dbs                     — cancel all DBs
+    POST /index/rebuild/dbs                           — trigger all DBs
+    GET  /index/rebuild/dbs/progress                   — global summary
+    POST /index/rebuild/cancel                     — cancel all DBs
     """
 
     def setup_class(self):
@@ -2535,9 +2537,9 @@ class TestRebuildGlobalScope:
 
     """Exercise the global rebuild endpoints.
 
-    POST /rebuild/index/dbs                           — trigger all DBs
-    GET  /rebuild/index/dbs/progress                   — global summary
-    POST /cancel/rebuild/index/dbs                     — cancel all DBs
+    POST /index/rebuild/dbs                           — trigger all DBs
+    GET  /index/rebuild/dbs/progress                   — global summary
+    POST /index/rebuild/cancel                     — cancel all DBs
     """
 
     def setup_class(self):

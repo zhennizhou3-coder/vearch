@@ -57,14 +57,14 @@ def _trigger_rebuild(db, space, max_retries=0, drop_before_rebuild=False):
     if drop_before_rebuild:
         payload["drop_before_rebuild"] = True
     return requests.post(
-        f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}",
+        f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}",
         auth=(username, password), json=payload, timeout=30)
 
 
 def _get_progress(db, space):
     try:
         r = requests.get(
-            f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}/progress",
+            f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/progress",
             auth=(username, password), timeout=5)
     except requests.exceptions.RequestException:
         # PS 死 / 集群降级时 router 可能 hang 到超时;视为本次 poll 无结果,
@@ -113,7 +113,7 @@ def _partition_id(partition):
 
 def _partition_restatus_map(partition):
     # detail 接口把 per-replica rebuild 状态暴露在 "replica_status",值是字符串
-    # (ReplicasOK / ReplicasRebuilding / ReplicasNotReady),见
+    # (ReplicasOK / ReplicasRebuildingIndex / ReplicasNotReady),见
     # internal/entity/partition.go:90 + space_service.go:407。不是数字 status_map。
     return partition.get("replica_status") or {}
 
@@ -1036,7 +1036,7 @@ class TestRebuildReplicaRoutingChaos:
                                 continue
                             pid = t.get("partition_id")
                             nid = int(t.get("node_id", 0))
-                            # 用 3 (entity.ReplicasRebuilding) 表示 router
+                            # 用 3 (entity.ReplicasRebuildingIndex) 表示 router
                             # 视角下的 Rebuilding, 让下方 st == 3 的判断保持原样。
                             snap.setdefault(pid, {})[nid] = 3
                         restatus_snapshots.append((time.time(), snap))
@@ -1286,7 +1286,7 @@ class TestRebuildReplicaRoutingChaos:
           2) /document/query + partition_id + document_ids 是哈希 space
              里唯一能把请求定向到指定 partition 的公开路径 (走
              handleDocumentGet → getDocsByPartition, 复用同一份
-             GetNodeIdsByClientType 路由逻辑);
+             SelectNodeByClientType 路由逻辑);
           3) 这条路径的 Head 由 setRequestHeadFromGin 构建,只读 URL
              query, 不会把 body 的 load_balance 写进 ClientType, 即随机
              路由 — 仅靠请求成败外部观察不到"是否打到 X";
@@ -1473,7 +1473,7 @@ class TestRebuildReplicaRoutingChaos:
                 logger.info("3.5 baseline OK: 无重建时 p2 已稳定路由到 X.r2")
 
             # 6. 触发 p1 单 partition rebuild --------------------------
-            rebuild_url = (f"{router_url}/rebuild/index/dbs/{db_name}"
+            rebuild_url = (f"{router_url}/index/rebuild/dbs/{db_name}"
                            f"/spaces/{case_space}")
             trig_resp = requests.post(rebuild_url,
                                       auth=(username, password),
@@ -1607,7 +1607,7 @@ class TestRebuildReplicaRoutingChaos:
             for p in post.get("partitions") or []:
                 rsm = p.get("replica_status") or {}
                 for nid, st in rsm.items():
-                    assert st != "ReplicasRebuilding", (
+                    assert st != "ReplicasRebuildingIndex", (
                         f"rebuild 完成后 pid={p.get('pid')} node={nid} "
                         f"残留 Rebuilding"
                     )
@@ -1849,7 +1849,7 @@ class TestRebuildPSFailureExtras:
                 pid = p.get("pid")
                 rsm = _partition_restatus_map(p)
                 for nid, st in rsm.items():
-                    if st == "ReplicasRebuilding":
+                    if st == "ReplicasRebuildingIndex":
                         stuck_rebuilding.append((pid, nid, st))
 
             assert not stuck_rebuilding, (
@@ -2047,20 +2047,16 @@ class TestRebuildPSFailureExtras:
 
             # (4) 失败确实发生在「第一个 target」上。#3 的 current_index==1
             #     已证明游标停在首个 target,indexes[0] 按定义就是那个失败的
-            #     target。注意:target 顺序来自 space.Indexes 的装配,而它源自
-            #     SpaceProperties(map),并不保证等于字段声明顺序 —— 所以不能
-            #     假设首个一定是 HNSW,这里只做合法 vector target 的 sanity 检查。
+            #     target。target 现在是 IndexName 字符串 (e.g. "gamma_a")。
             first_target = indexes[0]
-            ft_type = (first_target.get("index_type")
-                       or first_target.get("type") or "").upper()
-            assert ft_type in ("HNSW", "IVFFLAT", "IVFPQ"), (
-                f"first target has unexpected index_type: {first_target}"
+            assert isinstance(first_target, str) and first_target, (
+                f"first target should be a non-empty index name, got: {first_target!r}"
             )
 
             logger.info(
                 "6.8 verified: status=failed, indexes=%d, current_index=%s, "
                 "first=%s",
-                len(indexes), cur, ft_type,
+                len(indexes), cur, first_target,
             )
         finally:
             try:

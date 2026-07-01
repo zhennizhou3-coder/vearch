@@ -59,7 +59,7 @@ gt = sift10k.get_groundtruth()
 # ---------------------------------------------------------------------------
 
 
-def _trigger_rebuild(db, space, field_name="", index_type="", max_retries=0,
+def _trigger_rebuild(db, space, index_name="", max_retries=0,
                      drop_before_rebuild=False, describe=0, partition_id=-1,
                      ensure_indexed=True):
     """POST rebuild with optional parameters.
@@ -79,14 +79,10 @@ def _trigger_rebuild(db, space, field_name="", index_type="", max_retries=0,
     if ensure_indexed:
         _wait_index_status_indexed(db, space)
     payload = {}
-    if field_name and index_type:
-        url = f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}/fields/{field_name}/indexes/{index_type}"
+    if index_name:
+        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/indexes/{index_name}"
     else:
-        url = f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}"
-        if field_name:
-            payload["field_name"] = field_name
-        if index_type:
-            payload["index_type"] = index_type
+        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}"
     if max_retries > 0:
         payload["max_retries"] = max_retries
     if drop_before_rebuild:
@@ -101,12 +97,12 @@ def _trigger_rebuild(db, space, field_name="", index_type="", max_retries=0,
 
 
 def _trigger_rebuild_db(db):
-    url = f"{router_url}/rebuild/index/dbs/{db}"
+    url = f"{router_url}/index/rebuild/dbs/{db}"
     return requests.post(url, auth=(username, password), json={})
 
 
 def _get_rebuild_progress(db, space):
-    url = f"{router_url}/rebuild/index/dbs/{db}/spaces/{space}/progress"
+    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/progress"
     resp = requests.get(url, auth=(username, password))
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -115,7 +111,7 @@ def _get_rebuild_progress(db, space):
 
 
 def _cancel_rebuild(db, space):
-    url = f"{router_url}/cancel/rebuild/index/dbs/{db}/spaces/{space}"
+    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/cancel"
     return requests.post(url, auth=(username, password))
 
 
@@ -289,21 +285,6 @@ def _ivfrabitq_cfg(name, pn=1, rn=1):
 
 def _multi3_cfg(name, pn=1, rn=1):
     """3 vector fields: HNSW + IVFFLAT + IVFPQ.
-
-    Parameter notes:
-      - ncentroids=32 chosen so that vearch engine's auto-clamped
-        training_threshold (= ncentroids * 39 = 1248 after PR #748) is
-        well below the 10000 docs _add_multi3_docs writes. With the
-        original ncentroids=128 the clamped threshold becomes 4992,
-        and the multi-vector concurrent indexing path occasionally
-        stalls at valid_count ~4900 — see engine log
-        "valid vector count < training threshold" — making rebuild
-        tests time out unreliably.
-      - nprobe=8 is explicit so we don't fall into the C++ engine's
-        default nprobe=80 (harmless for ncentroids>=80 but ambiguous
-        otherwise).
-      - HNSW training_threshold=1 keeps the cheap graph-index path
-        unchanged; HNSW doesn't share the IVF clamping logic.
     """
     dim = xb.shape[1]
     return {"name": name, "partition_num": pn, "replica_num": rn,
@@ -530,7 +511,7 @@ class TestRebuildReplicaSerialization:
                     for p in d.get("partitions", []):
                         # detail API exposes per-replica rebuild state under
                         # "replica_status" with string values
-                        # (ReplicasOK / ReplicasRebuilding / ReplicasNotReady),
+                        # (ReplicasOK / ReplicasRebuildingIndex / ReplicasNotReady),
                         # NOT a numeric "status_map".
                         rsm = p.get("replica_status") or {}
                         snap[p.get("pid")] = {int(k): v for k, v in rsm.items()}
@@ -564,7 +545,7 @@ class TestRebuildReplicaSerialization:
         # === 第 3 阶段:断言 ===
         # 3a. 至少观察到一帧 Rebuilding 状态(否则集群没经过被验证的状态)
         seen_rebuilding = any(
-            any(s == "ReplicasRebuilding" for nodes in snap.values() for s in nodes.values())
+            any(s == "ReplicasRebuildingIndex" for nodes in snap.values() for s in nodes.values())
             for _, snap in restatus_snapshots)
         assert seen_rebuilding, (
             "ReStatusMap 全程没出现 Rebuilding 状态;rebuild 太快或 polling "
@@ -603,7 +584,7 @@ class TestRebuildReplicaSerialization:
 
         强化点(相比之前的 weak 版只验"无错"):
         1. 监控 router 日志,断言出现 N 条 'leader=... rebuilding,
-           fallback to nodeID=' 行(对应 client.go GetNodeIdsByClientType
+           fallback to nodeID=' 行(对应 client.go SelectNodeByClientType
            的 Leader case fallback 分支)。
         2. 监控 ReStatusMap,验证 leader 副本至少进入过 Rebuilding 状态
            (否则 fallback 路径未被实际触发,本测试无效)。
@@ -662,7 +643,7 @@ class TestRebuildReplicaSerialization:
                         rsm = p.get("replica_status") or {}
                         if leader_id is not None:
                             st = rsm.get(str(leader_id)) or rsm.get(int(leader_id))
-                            if st == "ReplicasRebuilding":
+                            if st == "ReplicasRebuildingIndex":
                                 leader_seen_rebuilding[0] = True
                 except Exception:
                     pass
@@ -1219,7 +1200,7 @@ class TestRebuildConcurrentWrites:
         # 直接判:是否存在「所有 replica 同时 Rebuilding」的瞬间
         all_rebuilding_windows = []
         for ts, rsm in restatus_snapshots:
-            if rsm and all(st == "ReplicasRebuilding" for st in rsm.values()):
+            if rsm and all(st == "ReplicasRebuildingIndex" for st in rsm.values()):
                 all_rebuilding_windows.append(ts)
         if all_rebuilding_windows:
             duration = all_rebuilding_windows[-1] - all_rebuilding_windows[0]
@@ -1933,7 +1914,7 @@ class TestRebuildLifecycle:
         # The progress endpoint must still respond (not 5xx). The record
         # may persist briefly but ideally transitions to failed/not_found.
         time.sleep(5)
-        url = f"{router_url}/rebuild/index/dbs/{db_name}/spaces/{case_space}/progress"
+        url = f"{router_url}/index/rebuild/dbs/{db_name}/spaces/{case_space}/progress"
         rs = requests.get(url, auth=(username, password))
         assert rs.status_code == 200, f"progress endpoint 5xx after drop: {rs.text}"
 
@@ -1946,12 +1927,28 @@ class TestRebuildLifecycle:
         local_db = db_name + "_drop_during"
         case_a = "sp_a"
         case_b = "sp_b"
-        # Best-effort cleanup of leftovers.
+        # Best-effort cleanup of leftovers. drop_db alone is not enough:
+        # vearch rejects it when spaces still live under the db (a stuck
+        # prior run may have left sp_a/sp_b behind), so enumerate and drop
+        # each space first, then the db. Finally assert create_db succeeds
+        # so a silent no-op cannot cascade into SPACE_EXIST below.
+        try:
+            rs = requests.get(f"{router_url}/dbs/{local_db}/spaces",
+                              auth=(username, password))
+            if rs.status_code == 200 and rs.json().get("code") == 0:
+                for sp in rs.json().get("data") or []:
+                    sp_name = sp.get("space_name") or sp.get("name") or ""
+                    if sp_name:
+                        drop_space(router_url, local_db, sp_name)
+        except Exception:
+            pass
         try:
             drop_db(router_url, local_db)
         except Exception:
             pass
-        create_db(router_url, local_db)
+        cr = create_db(router_url, local_db)
+        assert cr.json().get("code") == 0, (
+            f"create_db({local_db}) failed: {cr.text[:500]}")
 
         batch_size, total = 100, 5000
         for sp in (case_a, case_b):
@@ -1978,7 +1975,7 @@ class TestRebuildLifecycle:
             _wait_index_status_indexed(local_db, sp)
 
         # Trigger DB-level rebuild.
-        rs = requests.post(f"{router_url}/rebuild/index/dbs/{local_db}",
+        rs = requests.post(f"{router_url}/index/rebuild/dbs/{local_db}",
                            auth=(username, password), json={})
         assert rs.json().get("code") == 0
 
@@ -2024,19 +2021,3 @@ class TestRebuildLifecycle:
             drop_db(router_url, db_name)
         except Exception:
             pass
-
-
-# ===========================================================================
-# 1, 2, 10. Skipped categories: PS failure / master failover / scale.
-# ===========================================================================
-#
-# These categories require infrastructure capabilities not present in the
-# default pytest environment:
-#
-#   - Category 1 (PS failure): kill -9 / iptables / process restart
-#   - Category 2 (Master failover): multi-master cluster + leader kill
-#   - Category 10 (Scale): 1M+ vector datasets, dedicated host, 30+ min
-#                          timeouts, memory profiling
-#
-# Implement under a separate test_module_rebuild_chaos.py with the
-# fault-injection harness wired into your CI / staging environment.

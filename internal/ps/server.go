@@ -44,7 +44,7 @@ const maxTryTime = 5
 var (
 	defaultConcurrentNum = 256
 	defaultRpcTimeOut    = 10 // 10 seconds
-	defaultMinotorPort   = 8818
+	defaultMinotorPort   = 28818
 )
 
 // Server partition server

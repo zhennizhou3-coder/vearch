@@ -57,8 +57,7 @@ const (
 	paramNodeID         = "node_id"
 	paramRequestID      = "X-Request-Id"
 	versionID           = "version_id"
-	paramFieldName      = "field_name"
-	paramIndexType      = "index_type"
+	paramIndexName      = "index_name"
 	defaultResourceName = "default"
 )
 
@@ -293,21 +292,23 @@ func ExportToClusterHandler(router *gin.Engine, masterService *masterService, se
 	groupAuth.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s", paramDbName, paramSpaceName, versionID), c.deleteBackupVersion)
 	groupAuth.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s/direct", paramDbName, paramSpaceName, versionID), c.deleteBackupVersionDirect)
 
-	// rebuild index handler
-	groupAuth.POST("/rebuild/index/dbs", c.rebuildIndex)
-	groupAuth.POST(fmt.Sprintf("/rebuild/index/dbs/:%s", paramDbName), c.rebuildIndex)
-	groupAuth.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s", paramDbName, paramSpaceName), c.rebuildIndex)
-	groupAuth.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s", paramDbName, paramSpaceName, paramFieldName, paramIndexType), c.rebuildIndex)
+	// rebuild index handlers — all rebuild endpoints live under
+	// /index/rebuild/ with cancel as a sub-path (per-scope) or a
+	// top-level "cancel" for the global scope (gin does not allow
+	// static/param siblings at the same tree level).
+	groupAuth.POST("/index/rebuild/dbs", c.rebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/index/rebuild/dbs/:%s", paramDbName), c.rebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s", paramDbName, paramSpaceName), c.rebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/indexes/:%s", paramDbName, paramSpaceName, paramIndexName), c.rebuildIndex)
 
-	groupAuth.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/progress", paramDbName, paramSpaceName), c.getRebuildProgress)
-	groupAuth.GET("/rebuild/index/dbs", c.listAllRebuildProgress)
-	groupAuth.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/progress", paramDbName), c.listDBRebuildProgress)
+	groupAuth.GET("/index/rebuild/dbs", c.listAllRebuildProgress)
+	groupAuth.GET(fmt.Sprintf("/index/rebuild/dbs/:%s/progress", paramDbName), c.listDBRebuildProgress)
+	groupAuth.GET(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/progress", paramDbName, paramSpaceName), c.getRebuildProgress)
 
-	// cancel rebuild handler
-	groupAuth.POST("/cancel/rebuild/index/dbs", c.cancelRebuildIndex)
-	groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s", paramDbName), c.cancelRebuildIndex)
-	groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s", paramDbName, paramSpaceName), c.cancelRebuildIndex)
-	// groupAuth.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s", paramDbName, paramSpaceName, paramFieldName, paramIndexType), c.cancelRebuildIndex)
+	// cancel rebuild handlers
+	groupAuth.POST("/index/rebuild/cancel", c.cancelRebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/cancel", paramDbName), c.cancelRebuildIndex)
+	groupAuth.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/cancel", paramDbName, paramSpaceName), c.cancelRebuildIndex)
 
 	// modify engine config handler
 	groupAuth.POST("/config/:"+paramDbName+"/:"+paramSpaceName, c.modifySpaceConfig)
@@ -1143,11 +1144,10 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 
 	dbName = c.Param(paramDbName)
 	spaceName = c.Param(paramSpaceName)
-	urlFieldName := c.Param(paramFieldName)
-	urlIndexType := c.Param(paramIndexType)
+	urlIndexName := c.Param(paramIndexName)
 
-	log.Info("rebuildIndex handler called: dbName=%s, spaceName=%s, field=%s, indexType=%s, path=%s",
-		dbName, spaceName, urlFieldName, urlIndexType, c.Request.URL.Path)
+	log.Info("rebuildIndex handler called: dbName=%s, spaceName=%s, indexName=%s, path=%s",
+		dbName, spaceName, urlIndexName, c.Request.URL.Path)
 
 	// spaceName provided without dbName is invalid
 	if dbName == "" && spaceName != "" {
@@ -1176,21 +1176,13 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 			fmt.Errorf("partition_id requires both dbName and spaceName to be specified")))
 		return
 	}
-	if urlFieldName != "" {
-		rebuildReqTpl.FieldName = urlFieldName
+	if urlIndexName != "" {
+		rebuildReqTpl.IndexName = urlIndexName
 	}
-	if urlIndexType != "" {
-		rebuildReqTpl.IndexType = urlIndexType
-	}
-	if _, _, err := entity.NormalizeRebuildTarget(rebuildReqTpl.FieldName, rebuildReqTpl.IndexType); err != nil {
-		log.Warn("rebuildIndex: %v", err)
-		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(err))
-		return
-	}
-	if (rebuildReqTpl.FieldName != "" || rebuildReqTpl.IndexType != "") && (dbName == "" || spaceName == "") {
-		log.Warn("rebuildIndex: field_name/index_type requires both dbName and spaceName")
+	if rebuildReqTpl.IndexName != "" && (dbName == "" || spaceName == "") {
+		log.Warn("rebuildIndex: index_name requires both dbName and spaceName")
 		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(
-			fmt.Errorf("field_name/index_type require both dbName and spaceName to be specified")))
+			fmt.Errorf("index_name requires both dbName and spaceName to be specified")))
 		return
 	}
 	type target struct {
@@ -1260,8 +1252,8 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 	succeeded := 0
 	for _, t := range targets {
 		req := *rebuildReqTpl // shallow copy of body params
-		req.Database = t.db
-		req.Space = t.space
+		req.DBName = t.db
+		req.SpaceName = t.space
 
 		progress, err := ca.masterService.Rebuild().StartRebuild(c, &req)
 		if err != nil {

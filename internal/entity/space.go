@@ -56,6 +56,7 @@ var (
 	MinTrainingThreshold        = 256
 	DefaultMaxPointsPerCentroid = 256
 	DefaultMinPointsPerCentroid = 39
+	DefaultNprobe               = 80
 	DefaultRefreshInterval      = 1000 // 1s
 	DefaultEnableIdCache        = false
 	DefalutEnableRealtime       = false
@@ -196,54 +197,27 @@ func (s *Space) GetFieldIndexType(fieldName string) string {
 	return ""
 }
 
-// HasField reports whether fieldName exists in indexes or space properties
+// HasField reports whether fieldName is declared in this space.
+// SpaceProperties is the source of truth — validateIndexes already
+// guarantees every Index.FieldName / Index.FieldNames entry refers to
+// a field present in SpaceProperties, so we only need to check there.
 func (s *Space) HasField(fieldName string) bool {
 	if fieldName == "" {
 		return false
 	}
-	for _, idx := range s.Indexes {
-		if idx.FieldName == fieldName {
-			return true
-		}
-		for _, fn := range idx.FieldNames {
-			if fn == fieldName {
-				return true
-			}
-		}
-	}
-	if _, ok := s.SpaceProperties[fieldName]; ok {
-		return true
-	}
-	return false
+	_, ok := s.SpaceProperties[fieldName]
+	return ok
 }
 
-// GetIndexByFieldAndType returns the matching index for a field and type.
-func (s *Space) GetIndexByFieldAndType(fieldName, indexType string) *Index {
-	if fieldName == "" || indexType == "" {
+// GetIndexByName returns the index with the given name, or nil if absent.
+// IndexName is unique within a space (enforced by validateIndexes).
+func (s *Space) GetIndexByName(name string) *Index {
+	if name == "" {
 		return nil
 	}
 	for _, idx := range s.Indexes {
-		if !strings.EqualFold(idx.Type, indexType) {
-			continue
-		}
-		if idx.FieldName == fieldName {
+		if idx != nil && idx.Name == name {
 			return idx
-		}
-		for _, fn := range idx.FieldNames {
-			if fn == fieldName {
-				return idx
-			}
-		}
-	}
-	// Fallback for legacy per-field index definitions
-	if pro, ok := s.SpaceProperties[fieldName]; ok && pro != nil && pro.Index != nil {
-		if strings.EqualFold(pro.Index.Type, indexType) {
-			return &Index{
-				Name:      pro.Index.Name,
-				Type:      pro.Index.Type,
-				FieldName: fieldName,
-				Params:    pro.Index.Params,
-			}
 		}
 	}
 	return nil
@@ -257,42 +231,18 @@ func (s *Space) IsVectorField(fieldName string) bool {
 	return false
 }
 
-// AllIndexTargets returns vector index targets for rebuild.
-func (s *Space) AllIndexTargets() []IndexTarget {
-	out := make([]IndexTarget, 0, len(s.Indexes))
-	seen := make(map[string]struct{})
-	add := func(field, typ string) {
-		if field == "" || typ == "" {
-			return
-		}
-		// Skip non-vector fields: rebuild only applies to vector indexes.
-		if !s.IsVectorField(field) {
-			return
-		}
-		k := field + "\x00" + strings.ToLower(typ)
-		if _, dup := seen[k]; dup {
-			return
-		}
-		seen[k] = struct{}{}
-		out = append(out, IndexTarget{FieldName: field, IndexType: typ})
-	}
+// AllIndexTargets returns the rebuildable index names for this space.
+// Only single-field vector indexes are rebuildable in the current
+// engine. Composite (scalar) indexes are out of rebuild scope; future
+// multi-field vector indexes would need explicit support here.
+func (s *Space) AllIndexTargets() []string {
+	out := make([]string, 0, len(s.Indexes))
 	for _, idx := range s.Indexes {
-		if idx == nil {
+		if idx == nil || idx.Name == "" {
 			continue
 		}
-		if idx.FieldName != "" {
-			add(idx.FieldName, idx.Type)
-		}
-		for _, fn := range idx.FieldNames {
-			add(fn, idx.Type)
-		}
-	}
-	if len(out) == 0 {
-		// Legacy fallback: derive from SpaceProperties.
-		for fieldName, pro := range s.SpaceProperties {
-			if pro != nil && pro.Index != nil {
-				add(fieldName, pro.Index.Type)
-			}
+		if idx.FieldName != "" && s.IsVectorField(idx.FieldName) {
+			out = append(out, idx.Name)
 		}
 	}
 	return out
@@ -622,6 +572,10 @@ func IsScalarIndexType(indexType string) bool {
 //   - name cannot be empty
 func validateIndexes(indexes []*Index, props map[string]*SpaceProperties) error {
 	indexNames := make(map[string]bool)
+	// (field, type) must be unique across all single-field indexes — a
+	// field may host multiple indexes of *different* types (e.g. HNSW
+	// and IVFFLAT on the same vector) but never two of the same type.
+	fieldTypeSet := make(map[string]struct{})
 	for i, idx := range indexes {
 		if idx.Name == "" {
 			return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
@@ -687,27 +641,32 @@ func validateIndexes(indexes []*Index, props map[string]*SpaceProperties) error 
 							i, idx.Name, idx.Type, idx.FieldName))
 				}
 			}
+			// (FieldName, Type) uniqueness for single-field indexes — a
+			// field may carry multiple types (HNSW + IVFFLAT on the same
+			// vector) but not two of the same type.
+			ftKey := idx.FieldName + "\x00" + strings.ToLower(idx.Type)
+			if _, dup := fieldTypeSet[ftKey]; dup {
+				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
+					fmt.Errorf("indexes[%d] name[%s]: duplicate index for (field=%s, type=%s); each (field, type) pair must be unique",
+						i, idx.Name, idx.FieldName, idx.Type))
+			}
+			fieldTypeSet[ftKey] = struct{}{}
 		}
 	}
 	return nil
 }
 
-// This means a field can participate in both a single-field index and a composite index simultaneously.
+// MergeFieldIndexes folds inline SpaceProperties.Index entries into the
+// Indexes slice. (FieldName, Type) uniqueness across inline + explicit
+// indexes is enforced by validateIndexes (called at the end of this
+// function), which permits a field to carry multiple indexes of
+// *different* types.
 func MergeFieldIndexes(props map[string]*SpaceProperties, indexes *[]*Index) error {
 	for fieldName, field := range props {
 		if field.Index != nil {
 			if field.Index.Type == CompositeIndexType {
 				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
 					fmt.Errorf("field[%s] index type[COMPOSITE] can not set in fields", fieldName))
-			}
-			for _, idx := range *indexes {
-				if idx == nil {
-					continue
-				}
-				if fieldName == idx.FieldName && idx.Type != CompositeIndexType {
-					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
-						fmt.Errorf("field[%s] index duplicated", fieldName))
-				}
 			}
 			index := &Index{
 				Name:      field.Index.Name,

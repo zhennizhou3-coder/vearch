@@ -1285,15 +1285,15 @@ type RebuildIndexHandler struct {
 func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.PartitionData, reply *vearchpb.PartitionData) (err error) {
 	reply.Err = &vearchpb.Error{Code: vearchpb.ErrorEnum_SUCCESS}
 
-	param := new(entity.RebuildIndexParam)
+	param := new(entity.PSRebuildParam)
 	if err := json.Unmarshal(req.Data, param); err != nil {
 		log.Error("Failed to unmarshal rebuild index param: %v", err)
 		return vearchpb.NewError(vearchpb.ErrorEnum_RPC_PARAM_ERROR, err)
 	}
 
 	pid := req.PartitionID
-	log.Info("PS received rebuild index request: spaceKey=%s, field=%s, indexType=%s, partitionID=%d, dropBefore=%d, limitCPU=%d, describe=%d, myNodeID=%d",
-		param.SpaceKey, param.FieldName, param.IndexType, pid,
+	log.Info("PS received rebuild index request: spaceKey=%s, indexName=%s, partitionID=%d, dropBefore=%d, limitCPU=%d, describe=%d, myNodeID=%d",
+		param.SpaceKey, param.IndexName, pid,
 		param.DropBefore, param.LimitCPU, param.Describe, rih.server.nodeID)
 
 	// Ensure the target partition lives on this PS.
@@ -1317,38 +1317,33 @@ func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.Parti
 		log.Warn("rebuild index request missing spaceKey, derived %s for pid=%d", spaceKey, pid)
 	}
 
-	// Validate the requested rebuild target against the local space schema.
-	if _, _, nerr := entity.NormalizeRebuildTarget(param.FieldName, param.IndexType); nerr != nil {
-		log.Warn("rebuild index request rejected (pid=%d): %v", pid, nerr)
-		return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, nerr)
+	// Resolve the index by name on the local space schema, and translate
+	// to (field, type) for the engine CGo call.
+	if param.IndexName == "" {
+		err := fmt.Errorf("partition %d rebuild request missing index_name", pid)
+		log.Warn("rebuild index request rejected: %v", err)
+		return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, err)
 	}
-	if param.FieldName != "" {
-		space := store.GetSpace()
-		if !space.HasField(param.FieldName) {
-			err := fmt.Errorf("partition %d space has no field %q", pid, param.FieldName)
-			log.Warn("rebuild index request rejected: %v", err)
-			return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, err)
-		}
-		if space.GetIndexByFieldAndType(param.FieldName, param.IndexType) == nil {
-			err := fmt.Errorf("partition %d field %q has no index of type %q",
-				pid, param.FieldName, param.IndexType)
-			log.Warn("rebuild index request rejected: %v", err)
-			return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, err)
-		}
+	space := store.GetSpace()
+	idx := space.GetIndexByName(param.IndexName)
+	if idx == nil {
+		err := fmt.Errorf("partition %d space has no index named %q", pid, param.IndexName)
+		log.Warn("rebuild index request rejected: %v", err)
+		return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, err)
 	}
 
 	// GetRebuildManager is lazily initialized and safe for concurrent handlers.
 	rebuildMgr := rih.server.GetRebuildManager()
 
-	if err := rebuildMgr.StartRebuildTask(spaceKey, param.FieldName, param.IndexType,
+	if err := rebuildMgr.StartRebuildTask(spaceKey, param.IndexName, idx.FieldName, idx.Type,
 		uint32(pid), param.DropBefore, param.LimitCPU, param.Describe); err != nil {
-		log.Error("Failed to start rebuild task: spaceKey=%s, field=%s, indexType=%s, pid=%d: %v",
-			spaceKey, param.FieldName, param.IndexType, pid, err)
+		log.Error("Failed to start rebuild task: spaceKey=%s, indexName=%s, pid=%d: %v",
+			spaceKey, param.IndexName, pid, err)
 		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, err)
 	}
 
-	log.Info("Rebuild index task accepted: spaceKey=%s, field=%s, indexType=%s, partitionID=%d (async)",
-		spaceKey, param.FieldName, param.IndexType, pid)
+	log.Info("Rebuild index task accepted: spaceKey=%s, indexName=%s, partitionID=%d (async)",
+		spaceKey, param.IndexName, pid)
 	return nil
 }
 
@@ -1360,24 +1355,24 @@ type RebuildStatusHandler struct {
 func (rsh *RebuildStatusHandler) Execute(ctx context.Context, req *vearchpb.PartitionData, reply *vearchpb.PartitionData) (err error) {
 	reply.Err = &vearchpb.Error{Code: vearchpb.ErrorEnum_SUCCESS}
 
-	query := new(entity.RebuildStatusQuery)
+	query := new(entity.PSRebuildStatusQuery)
 	if err := json.Unmarshal(req.Data, query); err != nil {
 		log.Error("Failed to unmarshal rebuild status query: %v", err)
 		return vearchpb.NewError(vearchpb.ErrorEnum_RPC_PARAM_ERROR, err)
 	}
 
 	pid := req.PartitionID
-	log.Info("PS received rebuild status query: spaceKey=%s, field=%s, indexType=%s, partitionID=%d, myNodeID=%d",
-		query.SpaceKey, query.FieldName, query.IndexType, pid, rsh.server.nodeID)
+	log.Info("PS received rebuild status query: spaceKey=%s, indexName=%s, partitionID=%d, myNodeID=%d",
+		query.SpaceKey, query.IndexName, pid, rsh.server.nodeID)
 
 	rebuildMgr := rsh.server.GetRebuildManager()
 
 	status, errorMsg, exists, progress := rebuildMgr.GetRebuildTaskStatus(
-		query.SpaceKey, query.FieldName, query.IndexType, pid)
-	log.Info("RebuildTaskStatus result: spaceKey=%s, field=%s, indexType=%s, partitionID=%d, status=%d, exists=%v, errorMsg=%s, progress=%d%%",
-		query.SpaceKey, query.FieldName, query.IndexType, pid, status, exists, errorMsg, progress)
+		query.SpaceKey, query.IndexName, pid)
+	log.Info("RebuildTaskStatus result: spaceKey=%s, indexName=%s, partitionID=%d, status=%d, exists=%v, errorMsg=%s, progress=%d%%",
+		query.SpaceKey, query.IndexName, pid, status, exists, errorMsg, progress)
 
-	response := &entity.RebuildStatusResponse{
+	response := &entity.PSRebuildStatusResponse{
 		Exists:       exists,
 		Status:       status,
 		ErrorMessage: errorMsg,

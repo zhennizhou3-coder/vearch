@@ -344,6 +344,11 @@ Status VectorManager::ResolveRebuildTarget(const std::string &field_name,
                                            const std::string &index_type,
                                            RawVector *&vec,
                                            std::string &index_param) {
+  // NOTE: index_types_ / index_params_ / raw_vectors_ are populated at
+  // table creation and are not mutated at runtime, so this lookup does
+  // not need to hold vector_index_rwmutex_. If that invariant ever
+  // changes, add a shared lock here.
+
   // Look up the RawVector for this field.
   auto vec_it = raw_vectors_.find(field_name);
   if (vec_it == raw_vectors_.end() || vec_it->second == nullptr) {
@@ -354,6 +359,10 @@ Status VectorManager::ResolveRebuildTarget(const std::string &field_name,
   vec = vec_it->second;
 
   // Find the index_params_ entry matching the requested index_type.
+  // A miss returns an error rather than silently falling back to the
+  // first entry — with multi-index fields (e.g. IVFFLAT + HNSW on the
+  // same vector) fallback would install the index under the requested
+  // name but with the wrong parameters.
   index_param.clear();
   for (size_t i = 0; i < index_types_.size(); ++i) {
     if (index_types_[i] == index_type) {
@@ -361,9 +370,11 @@ Status VectorManager::ResolveRebuildTarget(const std::string &field_name,
       break;
     }
   }
-  if (index_param.empty() && !index_params_.empty()) {
-    // Fallback: use the first index_params_ entry if no exact match.
-    index_param = index_params_[0];
+  if (index_param.empty()) {
+    std::string msg = "index_type '" + index_type +
+                      "' not found for field '" + field_name + "'";
+    LOG(ERROR) << desc_ << msg;
+    return Status::ParamError(msg);
   }
   return Status::OK();
 }

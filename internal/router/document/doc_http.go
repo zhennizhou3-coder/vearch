@@ -54,8 +54,7 @@ const (
 	URLParamRoleName    = "role_name"
 	URLParamMemberId    = "member_id"
 	URLParamVersionID   = "version_id"
-	URLParamFieldName   = "field_name"
-	URLParamIndexType   = "index_type"
+	URLParamIndexName   = "index_name"
 	NodeID              = "node_id"
 	URLParamRequestID   = "X-Request-Id"
 	defaultTimeout      = 10 * time.Second
@@ -222,21 +221,24 @@ func (handler *DocumentHandler) proxyMaster(group *gin.RouterGroup) error {
 	group.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s", URLParamDbName, URLParamSpaceName, URLParamVersionID), handler.handleMasterRequest)
 	group.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s/direct", URLParamDbName, URLParamSpaceName, URLParamVersionID), handler.handleMasterRequest)
 
-	// rebuild handler (proxied to master scheduler)
-	group.POST("/rebuild/index/dbs", handler.handleMasterRequest)
-	group.POST(fmt.Sprintf("/rebuild/index/dbs/:%s", URLParamDbName), handler.handleMasterRequest)
-	group.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
-	group.POST(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/fields/:%s/indexes/:%s",
-		URLParamDbName, URLParamSpaceName, URLParamFieldName, URLParamIndexType), handler.handleMasterRequest)
+	// rebuild handler (proxied to master scheduler) — all rebuild
+	// endpoints share the /index/rebuild/ prefix; cancel is a sub-path
+	// per scope (except the global cancel, which is a top-level sibling
+	// to avoid a gin static/param collision under /dbs).
+	group.POST("/index/rebuild/dbs", handler.handleMasterRequest)
+	group.POST(fmt.Sprintf("/index/rebuild/dbs/:%s", URLParamDbName), handler.handleMasterRequest)
+	group.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
+	group.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/indexes/:%s",
+		URLParamDbName, URLParamSpaceName, URLParamIndexName), handler.handleMasterRequest)
 
-	group.GET("/rebuild/index/dbs", handler.handleMasterRequest)
-	group.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/progress", URLParamDbName), handler.handleMasterRequest)
-	group.GET(fmt.Sprintf("/rebuild/index/dbs/:%s/spaces/:%s/progress", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
+	group.GET("/index/rebuild/dbs", handler.handleMasterRequest)
+	group.GET(fmt.Sprintf("/index/rebuild/dbs/:%s/progress", URLParamDbName), handler.handleMasterRequest)
+	group.GET(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/progress", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
 
 	// cancel rebuild handler (proxied to master scheduler)
-	group.POST("/cancel/rebuild/index/dbs", handler.handleMasterRequest)
-	group.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s", URLParamDbName), handler.handleMasterRequest)
-	group.POST(fmt.Sprintf("/cancel/rebuild/index/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
+	group.POST("/index/rebuild/cancel", handler.handleMasterRequest)
+	group.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/cancel", URLParamDbName), handler.handleMasterRequest)
+	group.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/cancel", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
 
 	// space handler
 	group.POST(fmt.Sprintf("/dbs/:%s/spaces", URLParamDbName), handler.handleMasterRequest)

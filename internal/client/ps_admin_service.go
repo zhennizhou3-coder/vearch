@@ -344,12 +344,11 @@ func UpdateMemoryLimitCfg(addr string, cfg *entity.MemoryLimitCfg) error {
 }
 
 // ExecuteRebuildIndex starts a rebuild task on PS.
-func ExecuteRebuildIndex(addr string, spaceKey, fieldName, indexType string,
+func ExecuteRebuildIndex(addr string, spaceKey, indexName string,
 	pid entity.PartitionID, dropBefore int, limitCPU int, describe int) error {
-	param := &entity.RebuildIndexParam{
+	param := &entity.PSRebuildParam{
 		SpaceKey:   spaceKey,
-		FieldName:  fieldName,
-		IndexType:  indexType,
+		IndexName:  indexName,
 		DropBefore: dropBefore,
 		LimitCPU:   limitCPU,
 		Describe:   describe,
@@ -371,18 +370,17 @@ func ExecuteRebuildIndex(addr string, spaceKey, fieldName, indexType string,
 		return vearchpb.NewError(reply.Err.Code, nil)
 	}
 
-	log.Info("ExecuteRebuildIndex RPC success: addr=%s, spaceKey=%s, field=%s, indexType=%s, pid=%d",
-		addr, spaceKey, fieldName, indexType, pid)
+	log.Info("ExecuteRebuildIndex RPC success: addr=%s, spaceKey=%s, indexName=%s, pid=%d",
+		addr, spaceKey, indexName, pid)
 	return nil
 }
 
 // GetRebuildStatus queries one PS rebuild task.
-func GetRebuildStatus(addr string, spaceKey, fieldName, indexType string,
-	pid entity.PartitionID) (*entity.RebuildStatusResponse, error) {
-	query := &entity.RebuildStatusQuery{
+func GetRebuildStatus(addr string, spaceKey, indexName string,
+	pid entity.PartitionID) (*entity.PSRebuildStatusResponse, error) {
+	query := &entity.PSRebuildStatusQuery{
 		SpaceKey:  spaceKey,
-		FieldName: fieldName,
-		IndexType: indexType,
+		IndexName: indexName,
 	}
 
 	value, err := vjson.Marshal(query)
@@ -403,13 +401,13 @@ func GetRebuildStatus(addr string, spaceKey, fieldName, indexType string,
 		return nil, vearchpb.NewError(reply.Err.Code, nil)
 	}
 
-	response := &entity.RebuildStatusResponse{}
+	response := &entity.PSRebuildStatusResponse{}
 	if err := vjson.Unmarshal(reply.Data, response); err != nil {
 		log.Error("GetRebuildStatus unmarshal error: %v", err)
 		return nil, err
 	}
 
-	log.Info("GetRebuildStatus RPC success: addr=%s, spaceKey=%s, field=%s, indexType=%s, pid=%d, status=%d, progress=%d%%",
-		addr, spaceKey, fieldName, indexType, pid, response.Status, response.Progress)
+	log.Info("GetRebuildStatus RPC success: addr=%s, spaceKey=%s, indexName=%s, pid=%d, status=%d, progress=%d%%",
+		addr, spaceKey, indexName, pid, response.Status, response.Progress)
 	return response, nil
 }

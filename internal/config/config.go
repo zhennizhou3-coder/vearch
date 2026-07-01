@@ -313,7 +313,7 @@ func (config *Config) GetEmbed() (*embed.Config, error) {
 		if buf.Len() > 0 {
 			buf.WriteString(",")
 		}
-		buf.WriteString(fmt.Sprintf("%s=http://%s:%d", m.Name, m.Address, masterCfg.EtcdPeerPort))
+		buf.WriteString(fmt.Sprintf("%s=http://%s:%d", m.Name, m.Address, m.EtcdPeerPort))
 	}
 	cfg.InitialCluster = buf.String()
 

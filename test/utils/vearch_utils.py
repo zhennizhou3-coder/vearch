@@ -25,8 +25,6 @@ from multiprocessing import Pool as ThreadPool
 import numpy as np
 import datetime
 
-# router_url = os.getenv("ROUTER_URL", "http://127.0.0.1:19001")
-# master_url = os.getenv("MASTER_URL", "http://127.0.0.1:28817")
 router_url = os.getenv("ROUTER_URL", "http://127.0.0.1:9001")
 master_url = os.getenv("MASTER_URL", "http://127.0.0.1:8817")
 db_name = "ts_db"
@@ -1384,7 +1382,6 @@ def prepare_cluster_for_document_test(total, xb, partition_num=1):
 
     query_interface(total_batch, batch_size, xb, full_field, seed, "by_ids")
 
-
 def waiting_index_finish(total, timewait=5, space_name=space_name, db_name=db_name):
     url = router_url + "/dbs/" + db_name + "/spaces/" + space_name
     num = 0
@@ -1728,10 +1725,8 @@ def index_rebuild(
     drop_before_rebuild: bool = True,
     partition_id: int = 0,
 ):
-    url = f"{router_url}/index/rebuild"
+    url = f"{router_url}/index/rebuild/dbs/{db_name}/spaces/{space_name}"
     data = {
-        "db_name": db_name,
-        "space_name": space_name,
         "drop_before_rebuild": drop_before_rebuild,
         "partition_id": partition_id,
     }

@@ -123,13 +123,13 @@ _BARE_MASTERS = {
     "m3": {"api": 28837, "etcd_client": 22372, "monitor": 28841},
 }
 _BARE_PSES = {
-    1: {"rpc": 18081},
-    2: {"rpc": 18082},
-    3: {"rpc": 18083},
+    1: {"rpc": 28081},
+    2: {"rpc": 28082},
+    3: {"rpc": 28083},
 }
 _BARE_ROUTERS = {
-    1: {"http": 19001},
-    2: {"http": 19002},
+    1: {"http": 29001},
+    2: {"http": 29002},
 }
 
 # docker mode: 只有 master1 / router1 把端口暴露到 host。其它节点的端口
