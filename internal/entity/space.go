@@ -564,6 +564,108 @@ func IsScalarIndexType(indexType string) bool {
 	}
 }
 
+// IVF index parameter auto-adjust ---------------------------------------------
+
+// Gamma engine's per-centroid training-sample window; keep in sync with
+// DefaultMinPointsPerCentroid / DefaultMaxPointsPerCentroid in
+// internal/engine/index/impl/*.cc.
+const (
+	ivfMinPointsPerCentroid = 39
+	ivfMaxPointsPerCentroid = 256
+)
+
+// isIVFIndex reports whether the index type has ncentroids-based
+// training-threshold constraints (all IVF variants).
+func isIVFIndex(indexType string) bool {
+	switch strings.ToUpper(indexType) {
+	case "IVFFLAT", "IVFPQ", "IVFPQFASTSCAN", "IVFRABITQ", "BINARYIVF":
+		return true
+	}
+	return false
+}
+
+// autoAdjustIVFParams clamps training_threshold to
+// [ncentroids*39, ncentroids*256] and writes the clamped value back into
+// idx.Params. Doing this here (rather than leaving it to the engine's
+// silent clamp at Indexing() time) makes the effective value visible to
+// callers via GET space, and produces one log line explaining the
+// adjustment. The engine's runtime clamp is kept as a defence-in-depth
+// backstop for schemas that predate this hook.
+func autoAdjustIVFParams(idx *Index) error {
+	if len(idx.Params) == 0 {
+		return nil
+	}
+	var params map[string]interface{}
+	if err := json.Unmarshal(idx.Params, &params); err != nil {
+		return fmt.Errorf("index %q: params malformed: %v", idx.Name, err)
+	}
+
+	ncentroids, ok := toInt(params["ncentroids"])
+	if !ok || ncentroids <= 0 {
+		// ncentroids not set — the engine picks a default and clamp does
+		// not apply symmetrically. Skip.
+		return nil
+	}
+
+	threshold, ok := toInt(params["training_threshold"])
+	if !ok || threshold <= 0 {
+		// user did not pin a threshold — engine default kicks in.
+		return nil
+	}
+
+	minT := ncentroids * ivfMinPointsPerCentroid
+	maxT := ncentroids * ivfMaxPointsPerCentroid
+
+	adjusted := false
+	switch {
+	case threshold < minT:
+		log.Info("index %q (%s): training_threshold=%d < ncentroids*%d=%d, auto-adjusted to %d",
+			idx.Name, idx.Type, threshold, ivfMinPointsPerCentroid, minT, minT)
+		params["training_threshold"] = minT
+		adjusted = true
+	case threshold > maxT:
+		log.Info("index %q (%s): training_threshold=%d > ncentroids*%d=%d, auto-adjusted to %d",
+			idx.Name, idx.Type, threshold, ivfMaxPointsPerCentroid, maxT, maxT)
+		params["training_threshold"] = maxT
+		adjusted = true
+	}
+
+	if !adjusted {
+		return nil
+	}
+	b, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("index %q: marshal adjusted params: %v", idx.Name, err)
+	}
+	idx.Params = b
+	return nil
+}
+
+// toInt normalizes JSON number types to int. JSON's Unmarshal into
+// interface{} yields float64 for numeric literals; ints and
+// json.Number covers the corner cases when the caller has already
+// decoded them.
+func toInt(v interface{}) (int, bool) {
+	if v == nil {
+		return 0, false
+	}
+	switch t := v.(type) {
+	case float64:
+		return int(t), true
+	case int:
+		return t, true
+	case int64:
+		return int(t), true
+	case json.Number:
+		n, err := t.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(n), true
+	}
+	return 0, false
+}
+
 // validateIndexes checks structural constraints for each index definition.
 // Rules:
 //   - COMPOSITE: must have field_names with at least 2 fields, field_name must be empty
@@ -639,6 +741,18 @@ func validateIndexes(indexes []*Index, props map[string]*SpaceProperties) error 
 					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
 						fmt.Errorf("indexes[%d] name[%s] type[%s]: field[%s] is a scalar field, use scalar index types instead",
 							i, idx.Name, idx.Type, idx.FieldName))
+				}
+			}
+			// Auto-adjust IVF training_threshold to the engine's runtime
+			// [ncentroids*39, ncentroids*256] window. Making the
+			// adjustment here (rather than letting the C++ engine
+			// silently clamp at Indexing() time) keeps the persisted
+			// schema honest: users see the effective value via
+			// GET space and get one log line explaining the change,
+			// instead of a mismatch between requested and actual value.
+			if isIVFIndex(idx.Type) {
+				if err := autoAdjustIVFParams(idx); err != nil {
+					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, err)
 				}
 			}
 			// (FieldName, Type) uniqueness for single-field indexes — a
