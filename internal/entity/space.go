@@ -584,13 +584,7 @@ func isIVFIndex(indexType string) bool {
 	return false
 }
 
-// autoAdjustIVFParams clamps training_threshold to
-// [ncentroids*39, ncentroids*256] and writes the clamped value back into
-// idx.Params. Doing this here (rather than leaving it to the engine's
-// silent clamp at Indexing() time) makes the effective value visible to
-// callers via GET space, and produces one log line explaining the
-// adjustment. The engine's runtime clamp is kept as a defence-in-depth
-// backstop for schemas that predate this hook.
+// autoAdjustIVFParams clamps training_threshold to [ncentroids*39, ncentroids*256]
 func autoAdjustIVFParams(idx *Index) error {
 	if len(idx.Params) == 0 {
 		return nil
@@ -613,24 +607,13 @@ func autoAdjustIVFParams(idx *Index) error {
 		return nil
 	}
 
+	// Only clamp the LOWER bound
 	minT := ncentroids * ivfMinPointsPerCentroid
-	maxT := ncentroids * ivfMaxPointsPerCentroid
-
-	adjusted := false
-	switch {
-	case threshold < minT:
+	if threshold < minT {
 		log.Info("index %q (%s): training_threshold=%d < ncentroids*%d=%d, auto-adjusted to %d",
 			idx.Name, idx.Type, threshold, ivfMinPointsPerCentroid, minT, minT)
 		params["training_threshold"] = minT
-		adjusted = true
-	case threshold > maxT:
-		log.Info("index %q (%s): training_threshold=%d > ncentroids*%d=%d, auto-adjusted to %d",
-			idx.Name, idx.Type, threshold, ivfMaxPointsPerCentroid, maxT, maxT)
-		params["training_threshold"] = maxT
-		adjusted = true
-	}
-
-	if !adjusted {
+	} else {
 		return nil
 	}
 	b, err := json.Marshal(params)
