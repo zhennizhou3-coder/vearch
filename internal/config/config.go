@@ -479,10 +479,7 @@ func (config *Config) CurrentByMasterNameDomainIp(masterName string) error {
 			log.Info("master's name:[%s] master's domain:[%s] and local master's ip:[%s]",
 				m.Name, m.Address, domainIP)
 		}
-		if m.Name == masterName {
-			m.Self = true
-			found = true
-		} else if addrMap[m.Address] || (domainIP != nil && addrMap[domainIP.String()]) {
+		if addrMap[m.Address] || (domainIP != nil && addrMap[domainIP.String()]) {
 			log.Info("found local master successfully :master's name:[%s] master's ip:[%s] and local master's name:[%s]", m.Name, m.Address, masterName)
 			m.Self = true
 			found = true
