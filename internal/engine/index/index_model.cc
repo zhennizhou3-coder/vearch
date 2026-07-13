@@ -14,11 +14,11 @@
 size_t IndexModel::ComputeIVFTrainingNum(size_t nlist) const {
   size_t num;
   if ((size_t)training_threshold_ < nlist * vearch::min_points_per_centroid) {
-    num = nlist * vearch::min_points_per_centroid;
+    num = (size_t)training_threshold_;
     LOG(WARNING) << "training_threshold[" << training_threshold_
-                 << "] < ncentroids[" << nlist << "] * "
-                 << vearch::min_points_per_centroid
-                 << ", clamped up to " << num << ".";
+                 << "] is below the recommended minimum for ncentroids["
+                 << nlist << "] (" << nlist * vearch::min_points_per_centroid
+                 << "), using configured value " << num << ".";
   } else if ((size_t)training_threshold_ <=
              nlist * vearch::max_points_per_centroid) {
     num = (size_t)training_threshold_;
