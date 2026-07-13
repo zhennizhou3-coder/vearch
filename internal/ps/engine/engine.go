@@ -61,14 +61,10 @@ type Engine interface {
 	NewSnapshot() (proto.Snapshot, error)
 	ApplySnapshot(peers []proto.Peer, iter proto.SnapIterator) error
 	Optimize() error
-
-	// RebuildFieldIndex rebuilds all indexes or one (field, indexType) target.
-	RebuildFieldIndex(field, indexType string, dropBefore, limitCPU, describe int) error
+	RebuildIndex(int, int, int) error
+	Rebuild(int, int, int) error
 	Load() error
 	IndexInfo() (int, int, int)
-
-	// IndexInfoWithErr returns index status, indexed count, max docid, and error.
-	IndexInfoWithErr() (int, int, int, error)
 	GetEngineStatus(status *entity.EngineStatus) error
 	Close()
 	HasClosed() bool

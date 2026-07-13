@@ -14,6 +14,10 @@
 #include "index/impl/gpu/gamma_index_ivfflat_gpu.h"
 #include "index/impl/gpu/gamma_index_ivfpq_gpu.h"
 #endif
+#ifdef BUILD_WITH_NPU
+#include "index/impl/npu/gamma_index_ivfflat_npu.h"
+#include "index/impl/npu/gamma_index_ivfrabitq_npu.h"
+#endif
 
 #include "raw_vector_factory.h"
 #include "util/utils.h"
@@ -160,7 +164,7 @@ void VectorManager::DestroyRawVectors() {
 }
 
 Status VectorManager::CreateVectorIndex(
-    const std::string &index_type, const std::string &index_params, RawVector *vec,
+    std::string &index_type, std::string &index_params, RawVector *vec,
     int training_threshold, bool destroy_vec,
     std::map<std::string, IndexModel *> &vector_indexes) {
   std::string vec_name = vec->MetaInfo()->Name();
@@ -338,159 +342,6 @@ Status VectorManager::ReCreateVectorIndexes(int training_threshold) {
   }
   pthread_rwlock_unlock(&index_rwmutex_);
   return status;
-}
-
-Status VectorManager::ResolveRebuildTarget(const std::string &field_name,
-                                           const std::string &index_type,
-                                           RawVector *&vec,
-                                           std::string &index_param) {
-  // NOTE: index_types_ / index_params_ / raw_vectors_ are populated at
-  // table creation and are not mutated at runtime, so this lookup does
-  // not need to hold vector_index_rwmutex_. If that invariant ever
-  // changes, add a shared lock here.
-
-  // Look up the RawVector for this field.
-  auto vec_it = raw_vectors_.find(field_name);
-  if (vec_it == raw_vectors_.end() || vec_it->second == nullptr) {
-    std::string msg = "raw vector not found for field: " + field_name;
-    LOG(ERROR) << desc_ << msg;
-    return Status::ParamError(msg);
-  }
-  vec = vec_it->second;
-
-  // Find the index_params_ entry matching the requested index_type.
-  // A miss returns an error rather than silently falling back to the
-  // first entry — with multi-index fields (e.g. IVFFLAT + HNSW on the
-  // same vector) fallback would install the index under the requested
-  // name but with the wrong parameters.
-  index_param.clear();
-  for (size_t i = 0; i < index_types_.size(); ++i) {
-    if (index_types_[i] == index_type) {
-      index_param = index_params_[i];
-      break;
-    }
-  }
-  if (index_param.empty()) {
-    std::string msg = "index_type '" + index_type +
-                      "' not found for field '" + field_name + "'";
-    LOG(ERROR) << desc_ << msg;
-    return Status::ParamError(msg);
-  }
-  return Status::OK();
-}
-
-Status VectorManager::ReCreateVectorIndex(const std::string &field_name,
-                                          const std::string &index_type,
-                                          int training_threshold) {
-  std::string target_index_name = IndexName(field_name, index_type);
-
-  pthread_rwlock_wrlock(&index_rwmutex_);
-
-  // Find and destroy the existing index for (field_name, index_type).
-  auto it = vector_indexes_.find(target_index_name);
-  if (it != vector_indexes_.end()) {
-    if (it->second != nullptr) {
-      delete it->second;
-    }
-    vector_indexes_.erase(it);
-    LOG(INFO) << desc_ << "removed vector index: " << target_index_name;
-  } else {
-    LOG(INFO) << desc_ << "no existing vector index found for "
-              << target_index_name << ", will create new one";
-  }
-
-  RawVector *vec = nullptr;
-  std::string index_param;
-  Status status = ResolveRebuildTarget(field_name, index_type, vec, index_param);
-  if (!status.ok()) {
-    pthread_rwlock_unlock(&index_rwmutex_);
-    return status;
-  }
-
-  // Create the new index for this specific (field, type).
-  std::map<std::string, IndexModel *> new_indexes;
-  status = CreateVectorIndex(index_type, index_param, vec, training_threshold,
-                             false, new_indexes);
-  if (!status.ok()) {
-    LOG(ERROR) << desc_ << "CreateVectorIndex for " << target_index_name
-               << " failed: " << status.ToString();
-    // Clean up any partial index.
-    for (auto &[name, idx] : new_indexes) {
-      if (idx != nullptr) delete idx;
-    }
-    pthread_rwlock_unlock(&index_rwmutex_);
-    return status;
-  }
-
-  // Install the newly created index into vector_indexes_.
-  for (auto &[name, idx] : new_indexes) {
-    vector_indexes_[name] = idx;
-    LOG(INFO) << desc_ << "set " << name << " index";
-  }
-
-  pthread_rwlock_unlock(&index_rwmutex_);
-  LOG(INFO) << desc_ << "ReCreateVectorIndex for " << target_index_name
-            << " success";
-  return Status::OK();
-}
-
-Status VectorManager::RebuildVectorIndex(const std::string &field_name,
-                                         const std::string &index_type,
-                                         int training_threshold,
-                                         bool do_train) {
-  std::string target_index_name = IndexName(field_name, index_type);
-
-  RawVector *vec = nullptr;
-  std::string index_param;
-  Status status = ResolveRebuildTarget(field_name, index_type, vec, index_param);
-  if (!status.ok()) {
-    return status;
-  }
-
-  // Step 1: Create a new index model (without destroying the old one).
-  std::map<std::string, IndexModel *> new_indexes;
-  status = CreateVectorIndex(index_type, index_param, vec, training_threshold,
-                             false, new_indexes);
-  if (!status.ok()) {
-    LOG(ERROR) << desc_ << "RebuildVectorIndex CreateVectorIndex for "
-               << target_index_name << " failed: " << status.ToString();
-    for (auto &[name, idx] : new_indexes) {
-      if (idx != nullptr) delete idx;
-    }
-    return status;
-  }
-
-  // Step 2: Train the new index if requested.
-  if (do_train) {
-    int ret = TrainIndex(new_indexes);
-    if (ret != 0) {
-      LOG(ERROR) << desc_ << "RebuildVectorIndex TrainIndex for "
-                 << target_index_name << " failed, ret=" << ret;
-      for (auto &[name, idx] : new_indexes) {
-        if (idx != nullptr) delete idx;
-      }
-      return Status::IOError("TrainIndex failed");
-    }
-  }
-
-  // Step 3: Swap the new index in, replacing the old one for this field.
-  pthread_rwlock_wrlock(&index_rwmutex_);
-  auto it = vector_indexes_.find(target_index_name);
-  if (it != vector_indexes_.end()) {
-    if (it->second != nullptr) {
-      delete it->second;
-    }
-    vector_indexes_.erase(it);
-  }
-  for (auto &[name, idx] : new_indexes) {
-    vector_indexes_[name] = idx;
-    LOG(INFO) << desc_ << "set " << name << " index";
-  }
-  pthread_rwlock_unlock(&index_rwmutex_);
-
-  LOG(INFO) << desc_ << "RebuildVectorIndex for " << target_index_name
-            << " success";
-  return Status::OK();
 }
 
 Status VectorManager::CreateVectorTable(TableInfo &table,
@@ -751,21 +602,29 @@ int VectorManager::AddRTVecsToIndex(bool &index_is_dirty) {
       LOG(INFO) << "no extra vectors existed for indexing";
 #endif
     } else {
-      int64_t MAX_NUM_PER_INDEX = 1000;
+      int64_t max_batch_size = 1000;
 #ifdef BUILD_WITH_GPU
       if (dynamic_cast<gpu::GammaIVFPQGPUIndex *>(index_model) || dynamic_cast<gpu::GammaIVFFlatGPUIndex *>(index_model)) {
-        MAX_NUM_PER_INDEX = 100000;
+        max_batch_size = 100000;
       }
 #endif
+
+#ifdef BUILD_WITH_NPU
+      if (dynamic_cast<npu::GammaIVFRABITQNPUIndex *>(index_model) ||
+          dynamic_cast<npu::GammaIVFFlatNPUIndex *>(index_model)) {
+        max_batch_size = 1000000;
+      }
+#endif
+
       int index_count =
-          (total_stored_vecs - indexed_vec_count) / MAX_NUM_PER_INDEX + 1;
+          (total_stored_vecs - indexed_vec_count) / max_batch_size + 1;
 
       for (int i = 0; i < index_count; i++) {
         int64_t start_docid = index_model->indexed_count_;
         size_t count_per_index =
             (i == (index_count - 1) ? total_stored_vecs - start_docid
-                                    : MAX_NUM_PER_INDEX);
-        if (count_per_index == 0 || (int64_t)count_per_index > MAX_NUM_PER_INDEX || start_docid < indexed_vec_count) break;
+                                    : max_batch_size);
+        if (count_per_index == 0 || (int64_t)count_per_index > max_batch_size || start_docid < indexed_vec_count) break;
 
         std::vector<int64_t> vids(count_per_index);
         std::iota(vids.begin(), vids.end(), start_docid);

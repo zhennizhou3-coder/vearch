@@ -71,11 +71,6 @@ func LockRoleKey(rolename string) string {
 	return fmt.Sprintf("%s%s", PrefixLock, rolename)
 }
 
-// LockRebuildScheduler returns the lock key for rebuild scheduler election
-func LockRebuildScheduler() string {
-	return fmt.Sprintf("%srebuild_scheduler", PrefixLock)
-}
-
 // FailServerKey generate fail server key
 func FailServerKey(nodeID uint64) string {
 	return fmt.Sprintf("%s%d", PrefixFailServer, nodeID)
@@ -98,13 +93,15 @@ func MasterMemberKey(ID uint64) string {
 	return fmt.Sprintf("%s%d", PrefixMasterMember, ID)
 }
 
-// RebuildSpaceKey returns the etcd key for a space rebuild record
-func RebuildSpaceKey(dbName, spaceName string) string {
-	return fmt.Sprintf("%s%s/%s", PrefixRebuild, dbName, spaceName)
-}
-
 func LockAliasKey(aliasName string) string {
 	return fmt.Sprintf("%s%s", PrefixLock, aliasName)
+}
+
+func PSStatKey(nodeID NodeID) string {
+	return fmt.Sprintf("%s%d", PrefixPSStat, nodeID)
+}
+func MigrateTaskKey(taskID string) string {
+	return PrefixMigrateTask + taskID
 }
 
 func SetPrefixAndSequence(cluster_id string) {
@@ -132,7 +129,8 @@ func SetPrefixAndSequence(cluster_id string) {
 	PrefixAlias = PrefixEtcdClusterID + PrefixAlias
 	PrefixRole = PrefixEtcdClusterID + PrefixRole
 	PrefixMasterMember = PrefixEtcdClusterID + PrefixMasterMember
-	PrefixRebuild = PrefixEtcdClusterID + PrefixRebuild
+	PrefixPSStat = PrefixEtcdClusterID + PrefixPSStat
+	PrefixMigrateTask = PrefixEtcdClusterID + PrefixMigrateTask
 }
 
 // sids sequence key for etcd
@@ -163,7 +161,13 @@ var (
 	PrefixAlias        = "/alias/"
 	PrefixRole         = "/role/"
 	PrefixMasterMember = "/member/"
-	PrefixRebuild      = "/rebuild/index/space/"
+	PrefixPSStat       = "/ps_stat/"
+	PrefixMigrateTask  = "/migrate_task/"
+)
+
+const (
+	KeyBalancerConfig = "/balancer/config"
+	KeyBalancerLock   = "/balancer/lock"
 )
 
 var PrefixEtcdClusterID = "/vearch/default/"

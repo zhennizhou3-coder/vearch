@@ -44,7 +44,7 @@ const maxTryTime = 5
 var (
 	defaultConcurrentNum = 256
 	defaultRpcTimeOut    = 10 // 10 seconds
-	defaultMinotorPort   = 28818
+	defaultMinotorPort   = 48818
 )
 
 // Server partition server
@@ -70,8 +70,6 @@ type Server struct {
 	rpcTimeOut               int
 	backupStatus             map[uint32]int
 	backupManager            BackupManager
-	rebuildManager           RebuildManager
-	rebuildOnce              sync.Once
 }
 
 // NewServer creates a server instance

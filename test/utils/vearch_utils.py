@@ -36,7 +36,32 @@ SCALAR_INDEX_TYPE_STRING = "SCALAR"
 INVERTED_INDEX_TYPE_STRING = "INVERTED"
 BITMAP_INDEX_TYPE_STRING = "BITMAP"
 
+SCORE_EPS = 1e-5
+
 __description__ = """ test utils for vearch """
+
+
+def build_retrieval_params(disable_filter_first=None, fetch_batch_size=None, **extra):
+    params = {}
+    if disable_filter_first is not None:
+        params["disable_filter_first"] = int(disable_filter_first)
+    if fetch_batch_size is not None:
+        params["fetch_batch_size"] = int(fetch_batch_size)
+    params.update(extra)
+    return params
+
+
+def assert_bit_wise_equal(res_a, res_b):
+    assert len(res_a) == len(res_b), \
+        f"length mismatch: {len(res_a)} != {len(res_b)}"
+    sa = sorted(res_a, key=lambda x: x["_id"])
+    sb = sorted(res_b, key=lambda x: x["_id"])
+    for a, b in zip(sa, sb):
+        assert a["_id"] == b["_id"], \
+            f"id mismatch: {a['_id']} != {b['_id']}"
+        diff = abs(a["_score"] - b["_score"])
+        assert diff < SCORE_EPS, \
+            f"score diff {diff} >= eps {SCORE_EPS} on id={a['_id']}"
 
 
 def process_add_data(items):
@@ -1382,7 +1407,8 @@ def prepare_cluster_for_document_test(total, xb, partition_num=1):
 
     query_interface(total_batch, batch_size, xb, full_field, seed, "by_ids")
 
-def waiting_index_finish(total, timewait=5, space_name=space_name, db_name=db_name):
+
+def waiting_index_finish(total, timewait=5, space_name=space_name):
     url = router_url + "/dbs/" + db_name + "/spaces/" + space_name
     num = 0
     while num < total:
@@ -1725,8 +1751,10 @@ def index_rebuild(
     drop_before_rebuild: bool = True,
     partition_id: int = 0,
 ):
-    url = f"{router_url}/index/rebuild/dbs/{db_name}/spaces/{space_name}"
+    url = f"{router_url}/index/rebuild"
     data = {
+        "db_name": db_name,
+        "space_name": space_name,
         "drop_before_rebuild": drop_before_rebuild,
         "partition_id": partition_id,
     }

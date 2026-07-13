@@ -37,7 +37,7 @@ class VectorManager {
 
   void DestroyRawVectors();
 
-  Status CreateVectorIndex(const std::string &index_type, const std::string &index_params,
+  Status CreateVectorIndex(std::string &index_type, std::string &index_params,
                            RawVector *vec, int training_threshold,
                            bool destroy_vec,
                            std::map<std::string, IndexModel *> &vector_indexes);
@@ -62,38 +62,6 @@ class VectorManager {
       std::map<std::string, IndexModel *> &rebuild_vector_indexes);
 
   Status ReCreateVectorIndexes(int training_threshold);
-
-  /**
-   * @brief Re-create vector index for a specific (field_name, index_type)
-   * pair. This is the per-field counterpart of ReCreateVectorIndexes.
-   *
-   * @param field_name  field name whose vector index should be rebuilt
-   * @param index_type  index type (e.g. "HNSW", "IVFFLAT", "IVFPQ", "FLAT")
-   * @param training_threshold  training threshold for the new index
-   * @return Status
-   */
-  Status ReCreateVectorIndex(const std::string &field_name,
-                             const std::string &index_type,
-                             int training_threshold);
-
-  /**
-   * @brief Rebuild (in-place) vector index for a specific (field_name,
-   * index_type) pair without dropping the old index first.
-   *
-   * This is the per-field counterpart of the CreateVectorIndexes +
-   * TrainIndex + ResetVectorIndexes sequence used by
-   * Engine::RebuildIndex(drop_before_rebuild=0). The new index is created,
-   * optionally trained, and then swapped in to replace the old one.
-   *
-   * @param field_name  field name whose vector index should be rebuilt
-   * @param index_type  index type (e.g. "HNSW", "IVFFLAT", "IVFPQ", "FLAT")
-   * @param training_threshold  training threshold for the new index
-   * @param do_train   whether to train the new index before swapping in
-   * @return Status
-   */
-  Status RebuildVectorIndex(const std::string &field_name,
-                            const std::string &index_type,
-                            int training_threshold, bool do_train);
 
   Status CreateVectorTable(TableInfo &table, std::vector<int> &vector_cf_ids,
                            StorageManager *storage_mgr);
@@ -184,25 +152,6 @@ class VectorManager {
     vec_name = index_name.substr(0, pos);
     index_type = index_name.substr(pos + 1);
   }
-
-  /**
-   * @brief Resolve (RawVector*, index_param) for a (field_name, index_type)
-   * rebuild target. Shared by ReCreateVectorIndex / RebuildVectorIndex.
-   *
-   * Looks up `raw_vectors_[field_name]`, then scans `index_types_` /
-   * `index_params_` for a matching index_type; falls back to the first
-   * index_param entry when no exact match exists (legacy behaviour).
-   *
-   * @param field_name   target field
-   * @param index_type   target index type
-   * @param vec          [out] RawVector pointer; set on success only
-   * @param index_param  [out] resolved index param string
-   * @return Status::OK() on success; ParamError when the field has no
-   *         RawVector entry.
-   */
-  Status ResolveRebuildTarget(const std::string &field_name,
-                              const std::string &index_type,
-                              RawVector *&vec, std::string &index_param);
 
  private:
   VectorStorageType default_store_type_;

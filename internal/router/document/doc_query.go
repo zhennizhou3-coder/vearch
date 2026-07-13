@@ -222,7 +222,7 @@ func parseSlowSearch(indexParams *entity.IndexParams, indexType string, req *vea
 	}
 
 	if indexParams != nil {
-		if (indexType == "IVFFLAT" || indexType == "IVFPQ") && indexParams.Nprobe >= indexParams.Ncentroids/10 {
+		if (indexType == "IVFFLAT" || indexType == "IVFPQ" || indexType == "NPU_IVFFLAT") && indexParams.Nprobe >= indexParams.Ncentroids/10 {
 			req.IsSlowSearch = true
 			return
 		}

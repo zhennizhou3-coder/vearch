@@ -70,28 +70,6 @@ class Engine {
 
   int RebuildIndex(int drop_before_rebuild, int limit_cpu, int describe);
 
-  /**
-   * @brief Rebuild index for a specific (field_name, index_type) pair.
-   *
-   * This is the per-field counterpart of RebuildIndex. When field_name is
-   * empty, it falls back to the whole-partition RebuildIndex (backward
-   * compatible with the legacy path).
-   *
-   * For vector indexes: destroys and re-creates only the index for the
-   * specified (field, indexType), then triggers BuildIndex.
-   * For scalar/bitmap indexes: reinitializes the bitmap index for the field.
-   *
-   * @param field_name  field name whose index should be rebuilt
-   * @param index_type  index type (e.g. "HNSW", "IVFFLAT", "IVFPQ", "SCALAR")
-   * @param drop_before_rebuild  1 to drop before rebuild, 0 to rebuild in-place
-   * @param limit_cpu  CPU limit for rebuild
-   * @param describe  describe level
-   * @return 0 on success, non-zero on failure
-   */
-  int RebuildFieldIndex(const std::string &field_name,
-                        const std::string &index_type,
-                        int drop_before_rebuild, int limit_cpu, int describe);
-
   std::string EngineStatus();
   std::string GetMemoryInfo();
 
@@ -168,34 +146,6 @@ class Engine {
                            const std::string &indexParam);
 
   void RemoveFieldIndexThread(const std::string &field_name);
-
- private:
-  /**
-   * @brief Stop any background indexing thread and gate-keep the rebuild
-   * preconditions shared by RebuildIndex and RebuildFieldIndex.
-   *
-   * Performs the steps that are identical to both rebuild flavours:
-   *   1. UNINDEXED check (returns false on UNINDEXED — nothing to rebuild).
-   *   2. CAS RUNNING -> STOPPING (handles STARTING -> RUNNING -> STOPPING
-   *      transition with a 100ms back-off).
-   *   3. WaitForIndexingComplete (logged on timeout, proceeds anyway).
-   *   4. join indexing_thread_ when joinable.
-   *
-   * @param tag  short label like "RebuildIndex" / "RebuildFieldIndex" used
-   *             only in log lines so the source of the rebuild is clear.
-   * @return true if the caller may proceed with the actual mutation,
-   *         false if the rebuild must be aborted (only on UNINDEXED).
-   */
-  bool PrepareRebuild(const char *tag);
-
-  /**
-   * @brief Trigger BuildIndex + CompactVector after the index has been
-   * mutated. Shared finalisation step of both rebuild flavours.
-   *
-   * @param tag  same label semantics as PrepareRebuild.
-   * @return 0 on success, non-zero on BuildIndex / CompactVector failure.
-   */
-  int FinishRebuild(const char *tag);
 
  private:
   std::string index_root_path_;

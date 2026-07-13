@@ -274,6 +274,8 @@ func (handler *UnaryHandler) execute(ctx context.Context, req *vearchpb.Partitio
 		query(ctx, store, req.QueryRequest, req.SearchResponse)
 	case client.ForceMergeHandler:
 		req.Err = forceMerge(store)
+	case client.RebuildIndexHandler:
+		req.Err = rebuildIndex(store, req.IndexRequest)
 	case client.DeleteByQueryHandler:
 		if req.DelByQueryResponse == nil {
 			req.DelByQueryResponse = &vearchpb.DelByQueryeResponse{DelNum: 0}
@@ -469,6 +471,16 @@ func forceMerge(store PartitionStore) *vearchpb.Error {
 		partitionID := store.GetPartition().Id
 		pIdStr := strconv.Itoa(int(partitionID))
 		return &vearchpb.Error{Code: vearchpb.ErrorEnum_FORCE_MERGE_BUILD_INDEX_ERR, Msg: "build index err, PartitionID :" + pIdStr}
+	}
+	return nil
+}
+
+func rebuildIndex(store PartitionStore, indexRequest *vearchpb.IndexRequest) *vearchpb.Error {
+	err := store.GetEngine().Rebuild(int(indexRequest.DropBeforeRebuild), int(indexRequest.LimitCpu), int(indexRequest.Describe))
+	if err != nil {
+		partitionID := store.GetPartition().Id
+		pIdStr := strconv.Itoa(int(partitionID))
+		return &vearchpb.Error{Code: vearchpb.ErrorEnum_FORCE_MERGE_BUILD_INDEX_ERR, Msg: "rebuild index err, PartitionID :" + pIdStr}
 	}
 	return nil
 }

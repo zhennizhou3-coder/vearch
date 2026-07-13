@@ -311,12 +311,6 @@ func (s *SpaceService) DeleteSpace(ctx context.Context, as *AliasService, dbName
 		return err
 	}
 
-	// Remove the space rebuild record to avoid stale PS busy state.
-	if err := masterClient.Delete(ctx, entity.RebuildSpaceKey(dbName, spaceName)); err != nil {
-		log.Error("delete rebuild record for space:[%s/%s] err:[%s]",
-			dbName, spaceName, err.Error())
-	}
-
 	return nil
 }
 
@@ -400,12 +394,9 @@ func (s *SpaceService) DescribeSpace(ctx context.Context, space *entity.Space, s
 
 		replicasStatus := make(map[entity.NodeID]string)
 		for nodeID, status := range partition.ReStatusMap {
-			switch status {
-			case entity.ReplicasOK:
+			if status == entity.ReplicasOK {
 				replicasStatus[nodeID] = "ReplicasOK"
-			case entity.ReplicasRebuildingIndex:
-				replicasStatus[nodeID] = "ReplicasRebuildingIndex"
-			default:
+			} else {
 				replicasStatus[nodeID] = "ReplicasNotReady"
 			}
 		}

@@ -39,9 +39,6 @@ const (
 const (
 	ReplicasOK       = 1
 	ReplicasNotReady = 2
-	// ReplicasRebuildingIndex means the replica's index is being rebuilt;
-	// it is kept off reads until the rebuild finishes.
-	ReplicasRebuildingIndex = 3
 )
 
 type PartitionForSearch struct {

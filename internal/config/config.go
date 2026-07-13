@@ -313,7 +313,7 @@ func (config *Config) GetEmbed() (*embed.Config, error) {
 		if buf.Len() > 0 {
 			buf.WriteString(",")
 		}
-		buf.WriteString(fmt.Sprintf("%s=http://%s:%d", m.Name, m.Address, m.EtcdPeerPort))
+		buf.WriteString(fmt.Sprintf("%s=http://%s:%d", m.Name, m.Address, masterCfg.EtcdPeerPort))
 	}
 	cfg.InitialCluster = buf.String()
 
@@ -442,17 +442,6 @@ func DumpConfig(conf *Config) error {
 // CurrentByMasterNameDomainIp find this machine domain.The main purpose of this function is to find the master from from multiple masters and set it‘s Field:self to true.
 // The only criterion for judging is: Is the IP address the same with one of the masters?
 func (config *Config) CurrentByMasterNameDomainIp(masterName string) error {
-	if masterName != "" {
-		for _, m := range config.Masters {
-			if m.Name == masterName {
-				m.Self = true
-				log.Info("found local master by name: master's name:[%s]", masterName)
-				return nil
-			}
-		}
-		return fmt.Errorf("master name [%s] not found in config", masterName)
-	}
-
 	//find local all ip
 	addrMap := config.addrMap()
 
@@ -479,7 +468,10 @@ func (config *Config) CurrentByMasterNameDomainIp(masterName string) error {
 			log.Info("master's name:[%s] master's domain:[%s] and local master's ip:[%s]",
 				m.Name, m.Address, domainIP)
 		}
-		if addrMap[m.Address] || (domainIP != nil && addrMap[domainIP.String()]) {
+		if m.Name == masterName {
+			m.Self = true
+			found = true
+		} else if addrMap[m.Address] || (domainIP != nil && addrMap[domainIP.String()]) {
 			log.Info("found local master successfully :master's name:[%s] master's ip:[%s] and local master's name:[%s]", m.Name, m.Address, masterName)
 			m.Self = true
 			found = true

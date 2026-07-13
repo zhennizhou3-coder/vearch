@@ -26,6 +26,12 @@ namespace accelerator {
  */
 class AcceleratorSearchItem {
  public:
+  enum Status {
+    OK = 0,
+    NPU_ERROR = -1,
+    INDEX_UNAVAILABLE = -2,
+  };
+
   AcceleratorSearchItem(int n, const float *x, int k, float *dis, long *label,
                         int nprobe)
       : n_(n),
@@ -34,6 +40,7 @@ class AcceleratorSearchItem {
         dis_(dis),
         label_(label),
         nprobe_(nprobe),
+        status_(OK),
         done_(false) {}
 
   virtual ~AcceleratorSearchItem() = default;
@@ -44,12 +51,19 @@ class AcceleratorSearchItem {
     cv_.notify_one();
   }
 
+  void NotifyFailure(int status) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    status_ = status;
+    done_ = true;
+    cv_.notify_one();
+  }
+
   int WaitForDone() {
     std::unique_lock<std::mutex> lck(mtx_);
     while (!done_) {
       cv_.wait(lck);
     }
-    return 0;
+    return status_;
   }
 
   // Search parameters
@@ -61,6 +75,7 @@ class AcceleratorSearchItem {
   int nprobe_;
 
  private:
+  int status_;
   std::condition_variable cv_;
   std::mutex mtx_;
   bool done_;

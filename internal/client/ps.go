@@ -66,7 +66,6 @@ const (
 	IncrementBackupHandler        = "IncrementBackupHandler"
 	BackupStatusHandler           = "BackupStatusHandler"
 	DeleteBackupHandler           = "DeleteBackupHandler"
-	RebuildStatusHandler         = "RebuildStatusHandler"
 	ResourceLimitHandler          = "ResourceLimitHandler"
 
 	CreatePartitionHandler = "CreatePartitionHandler"
