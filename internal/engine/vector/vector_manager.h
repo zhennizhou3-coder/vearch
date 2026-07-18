@@ -37,9 +37,10 @@ class VectorManager {
 
   void DestroyRawVectors();
 
-  Status CreateVectorIndex(const std::string &index_type, const std::string &index_params,
-                           RawVector *vec, int training_threshold,
-                           bool destroy_vec,
+  Status CreateVectorIndex(const std::string &index_name,
+                           const std::string &index_type,
+                           const std::string &index_params, RawVector *vec,
+                           int training_threshold, bool destroy_vec,
                            std::map<std::string, IndexModel *> &vector_indexes);
 
   void DestroyVectorIndexes();
@@ -64,34 +65,34 @@ class VectorManager {
   Status ReCreateVectorIndexes(int training_threshold);
 
   /**
-   * @brief Re-create vector index for a specific (field_name, index_type)
-   * pair. This is the per-field counterpart of ReCreateVectorIndexes.
+   * @brief Re-create vector index for a specific (index_name, field_name,
+   * index_type) target. Per-index counterpart of ReCreateVectorIndexes.
    *
-   * @param field_name  field name whose vector index should be rebuilt
+   * @param index_name  unique index name (map key in vector_indexes_)
+   * @param field_name  field the index is over
    * @param index_type  index type (e.g. "HNSW", "IVFFLAT", "IVFPQ", "FLAT")
    * @param training_threshold  training threshold for the new index
    * @return Status
    */
-  Status ReCreateVectorIndex(const std::string &field_name,
+  Status ReCreateVectorIndex(const std::string &index_name,
+                             const std::string &field_name,
                              const std::string &index_type,
                              int training_threshold);
 
   /**
-   * @brief Rebuild (in-place) vector index for a specific (field_name,
-   * index_type) pair without dropping the old index first.
+   * @brief Rebuild (in-place) vector index without dropping the old one.
+   * Creates a new IndexModel, optionally trains it, then swaps it in.
+   * Mirrors CreateVectorIndexes + TrainIndex + ResetVectorIndexes used by
+   * Engine::RebuildIndex(drop_before_rebuild=0), scoped to one index.
    *
-   * This is the per-field counterpart of the CreateVectorIndexes +
-   * TrainIndex + ResetVectorIndexes sequence used by
-   * Engine::RebuildIndex(drop_before_rebuild=0). The new index is created,
-   * optionally trained, and then swapped in to replace the old one.
-   *
-   * @param field_name  field name whose vector index should be rebuilt
-   * @param index_type  index type (e.g. "HNSW", "IVFFLAT", "IVFPQ", "FLAT")
+   * @param index_name  unique index name (map key in vector_indexes_)
+   * @param field_name  field the index is over
+   * @param index_type  index type
    * @param training_threshold  training threshold for the new index
    * @param do_train   whether to train the new index before swapping in
-   * @return Status
    */
-  Status RebuildVectorIndex(const std::string &field_name,
+  Status RebuildVectorIndex(const std::string &index_name,
+                            const std::string &field_name,
                             const std::string &index_type,
                             int training_threshold, bool do_train);
 
@@ -156,12 +157,20 @@ class VectorManager {
   void ResetIndexTypesAndParams();
 
   /**
-   * @brief Add index type and index parameter
+   * @brief Add one index entry to the parallel config vectors.
+   * All four (index_names_ / index_types_ / index_params_ / and the
+   * field_to_index_name_ map) are kept in sync.
    *
-   * @param index_type  index type to add
-   * @param index_param index parameter to add
+   * @param index_name  unique map key in vector_indexes_ (falls back to
+   *                    IndexName(field_name, index_type) when the caller
+   *                    has no user-supplied name)
+   * @param field_name  vector field this index is over
+   * @param index_type  index type
+   * @param index_param index parameter JSON string
    */
-  void AddIndexTypeAndParam(const std::string &index_type,
+  void AddIndexTypeAndParam(const std::string &index_name,
+                            const std::string &field_name,
+                            const std::string &index_type,
                             const std::string &index_param);
 
   bool GetEnableRealtime() { return enable_realtime_; }
@@ -212,13 +221,24 @@ class VectorManager {
   std::string desc_;
 
   std::map<std::string, RawVector *> raw_vectors_;
+  // key = index_name (IndexInfo.name; falls back to IndexName(field, type)
+  // when the caller has no user-supplied name).
   std::map<std::string, IndexModel *> vector_indexes_;
-  // vector memory buffer for realtime
+  // vector memory buffer for realtime, key = field_name (1:1 with the field)
   std::map<std::string, RawVector *> vector_memory_buffers_;
-  // FLAT index
+  // Realtime FLAT index shadowing the main index. Key is the SAME index_name
+  // used in vector_indexes_ so search/update can locate both maps by one
+  // lookup through field_to_index_name_.
   std::map<std::string, IndexModel *> vector_memory_buffer_indexes_;
+  // Route search/update from user-facing field_name to index_name.
+  // Populated on CreateVectorTable / AddIndexTypeAndParam; kept in sync with
+  // the parallel index_* vectors below.
+  std::map<std::string, std::string> field_to_index_name_;
   bool enable_realtime_;
 
+  // Parallel configuration vectors, aligned by position (entry i describes
+  // one index). Populated by CreateVectorTable / AddIndexTypeAndParam.
+  std::vector<std::string> index_names_;
   std::vector<std::string> index_types_;
   std::vector<std::string> index_params_;
   pthread_rwlock_t index_rwmutex_;

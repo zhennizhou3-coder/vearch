@@ -99,12 +99,7 @@ Status StorageManager::Init(size_t cache_size) {
     return Status::IOError(msg);
   }
 
-  rocksdb::Options options;
-  if (cache_size) {
-    std::shared_ptr<rocksdb::Cache> cache = rocksdb::NewLRUCache(cache_size);
-    table_options_.block_cache = cache;
-    options.table_factory.reset(NewBlockBasedTableFactory(table_options_));
-  }
+  rocksdb::DBOptions options;
   options.IncreaseParallelism();
   // options.OptimizeLevelStyleCompaction();
   // create the DB if it's not already present
@@ -209,6 +204,17 @@ Status StorageManager::Init(size_t cache_size) {
     }
 
     db_.reset();
+  }
+
+
+  if (cache_size) {
+    std::shared_ptr<rocksdb::Cache> cache = rocksdb::NewLRUCache(cache_size);
+    table_options_.block_cache = cache;
+    std::shared_ptr<rocksdb::TableFactory> table_factory(
+        NewBlockBasedTableFactory(table_options_));
+    for (auto &cf_desc : column_families_) {
+      cf_desc.options.table_factory = table_factory;
+    }
   }
 
   // open DB

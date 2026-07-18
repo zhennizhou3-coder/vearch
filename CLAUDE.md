@@ -152,7 +152,41 @@ items := request.Execute()
 
 ---
 
-## 6. Common Commands
+## 6. Working Principles
+
+Engineering discipline that complements the architectural invariants in §5. Adapted from the Karpathy LLM-coding guidelines and biased toward caution over speed.
+
+### Think before coding
+
+- Surface assumptions — do not silently pick an interpretation. If a request is ambiguous (e.g. "fix the partition timeout" without a reproduction), state the interpretation you're acting on, or stop and ask.
+- When multiple valid approaches exist (e.g. add a config flag vs. branch on space type vs. extend the proto), present the tradeoff before implementing.
+- Push back when a simpler approach exists rather than following a clearly-suboptimal request literally.
+
+### Simplicity first
+
+- Build only what the task demands. No speculative features, no premature abstractions, no configurability for hypothetical future callers.
+- No error handling, fallbacks, or validation for scenarios that cannot occur. Trust the invariants in §5; validate only at system boundaries — HTTP/RPC entrypoints (`internal/router/document/`, `internal/master/cluster_api.go`, `internal/ps/handler_*.go`), user input, and external libraries (cgo Gamma calls, etcd, raft).
+- A bug fix does not need surrounding cleanup. A one-shot change does not need a helper. Three similar lines beats a premature abstraction.
+- Self-check: would a senior engineer say this is overcomplicated? If yes, rewrite.
+
+### Surgical changes
+
+- Modify only what the request demands. Do not reformat unrelated lines, rename variables in passing, or delete pre-existing dead code on the side.
+- Every changed line should trace directly to the user's request. If you cannot justify a hunk against the request, drop it.
+- Drive-by typo fixes in a comment of a file you are already editing are fine; drive-by *behavior* changes are not.
+- This rule extends to the PR boundary: see `.claude/skills/pr-review-single-purpose/SKILL.md` (§10) — one PR = one purpose; bundling unrelated changes is a CRITICAL review finding.
+
+### Goal-driven execution
+
+- Convert vague tasks into verifiable criteria before implementing:
+  - "Fix the bug" → write a reproducing test (`internal/**/_test.go` for Go, `test/test_*.py` for integration) first, then make it pass.
+  - "Add validation" → write tests for invalid inputs first, then implement.
+  - "Refactor X" → ensure existing tests pass before and after; add characterization tests first if the area is uncovered.
+- For multi-step work, lay out a numbered plan where each step has its own verification check. Use `TaskCreate` for tracking.
+
+---
+
+## 7. Common Commands
 
 ```bash
 # Full build, including Gamma C++ engine
@@ -189,7 +223,7 @@ For full command options, Docker commands, debug endpoints, and CI details, see 
 
 ---
 
-## 7. Common Task Entrypoints
+## 8. Common Task Entrypoints
 
 | Task | Start here |
 |---|---|
@@ -208,14 +242,14 @@ For detailed task recipes and large-file reading order, see `docs/DeveloperGuide
 
 ---
 
-## 8. Deeper References
+## 9. Deeper References
 
 - `docs/Architecture.md` — architecture, data/control paths, write/search/scheduling flows, call chains, external dependencies.
 - `docs/Development.md` — build flags, run modes, Docker, tests, debug endpoints, CI; engine CMake options and third-party deps.
 - `docs/DeveloperGuide.md` — code map, modification entrypoints, task recipes, large-file reading order.
 - `docs/IndexLayer.md` — Gamma index-layer reference: registered vector indexes, scalar/filter indexes, storage backends.
 
-## 9. Skills (load on demand)
+## 10. Skills (load on demand)
 
 Project-local Claude skills under `.claude/skills/`. **Not** auto-loaded — invoke when the task matches the trigger.
 

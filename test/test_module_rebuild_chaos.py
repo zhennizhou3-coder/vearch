@@ -536,6 +536,76 @@ class TestRebuildPSFailure:
                 logger.warning("1.4 cleanup start_ps(3) failed: %s", e)
         drop_space(router_url, db_name, case_space)
 
+    def test_partition_replica_failure_skips_remaining_replicas(self):
+        """1.4b: R1 invariant — once one replica of a partition exhausts its
+        retry budget, every remaining not-yet-dispatched replica task on
+        the SAME partition must be cancelled (not failed, not run), so at
+        least one physical replica of that partition is left untouched and
+        the partition stays queryable.
+
+        Setup: rn>=2, pn=1, max_retries=1. Kill the PS hosting one specific
+        replica so its retries all fail; the other replica's task must end
+        up Cancelled (not Completed, not Failed).
+        """
+        _ensure_all_ps_alive()
+
+        case_space = space_name + "_chaos_skip_replicas"
+        rn, pn = 2, 1
+        resp = create_space(router_url, db_name,
+                            _hnsw_cfg(case_space, pn=pn, rn=rn))
+        body = resp.json()
+        if body.get("code") != 0:
+            pytest.skip(f"cluster cannot host rn={rn}: {body}")
+        _populate(case_space, total=5000)
+
+        # Locate the PS hosting each replica of the single partition.
+        pl = requests.get(f"{router_url}/partitions",
+                          auth=(username, password), timeout=5).json()
+        assert pl.get("code") == 0, pl
+        detail = _get_space_detail(db_name, case_space)
+        our_pids = {p.get("pid") for p in detail.get("partitions") or []}
+        replica_nodes = []
+        for it in pl.get("data") or []:
+            if it.get("id") in our_pids:
+                replica_nodes = [int(n) for n in (it.get("replicas") or [])]
+                break
+        assert len(replica_nodes) == rn, replica_nodes
+        # Kill the PS carrying the first replica.
+        victim_ps_idx = cl.ps_idx_for_node(replica_nodes[0])
+        assert victim_ps_idx is not None, replica_nodes
+
+        try:
+            assert _trigger_rebuild(db_name, case_space, max_retries=1).json().get("code") == 0
+            _wait_until_running(db_name, case_space, timeout=60)
+            cl.kill_ps(victim_ps_idx, hard=True)
+
+            final = _wait_terminal(db_name, case_space, timeout=300, allow_failed=True)
+            # Whole record should be Failed (the killed replica exhausted
+            # retries) — not Completed, not Cancelled.
+            assert final["status"] == "failed", final
+
+            tasks = final.get("tasks") or []
+            assert len(tasks) == rn, tasks
+            # Exactly one replica task is Failed (the victim); every other
+            # replica task on the same partition is Cancelled (skipped).
+            failed = [t for t in tasks if t.get("status") == "failed"]
+            cancelled = [t for t in tasks if t.get("status") == "cancelled"]
+            completed = [t for t in tasks if t.get("status") == "completed"]
+            assert len(failed) >= 1, tasks
+            assert len(cancelled) >= 1, (
+                "R1 invariant broken: no sibling replica task was cancelled "
+                "after the failing replica exhausted retries. Tasks: "
+                + json.dumps(tasks, indent=2, default=str)
+            )
+            # Sanity: cancelled + failed + completed accounts for every task.
+            assert len(failed) + len(cancelled) + len(completed) == len(tasks), tasks
+        finally:
+            try:
+                cl.start_ps(victim_ps_idx, wait_ready=True, timeout=30)
+            except Exception as e:
+                logger.warning("skip-replicas cleanup start_ps failed: %s", e)
+        drop_space(router_url, db_name, case_space)
+
     def test_dispatched_task_idempotent_after_ps_restart(self):
         """1.2-style: graceful PS restart mid-rebuild; PS reports task gone
         (Exists=false) on next master poll → partition retry → eventually
@@ -818,11 +888,15 @@ class TestRebuildMasterFailover:
 class TestRebuildReplicaRoutingChaos:
 
     def test_only_one_replica_per_partition_running_at_any_time(self):
-        """3.1: 同 partition 串行、不同 partition 可并行。
+        """3.1: 全局 rebuild 串行 — 任一时刻至多 1 个 task 在 Running。
+
+        新调度语义: 一个 record 内所有 task 严格串行执行 (dispatchPending 里
+        `如果有任何 Dispatched && !terminal 的 task, 就一个都不派发`)。因此:
+          - 每个 progress frame 的 running 集合大小 <= 1
+          - final tasks 的 [start_time, complete_time] 区间两两不重叠
 
         用 rn=2(而非 rn=3):3-PS 的 docker 集群 + resource_limit_rate=0.98
-        放不下 rn=3 会直接 skip。rn=2 同样能验"同 partition 的 2 个副本串行
-        重建、不同 partition 并行"这个不变量,且能真正在 CI 跑起来。
+        放不下 rn=3 会直接 skip。rn=2 + pn=2 共 4 个 task, 足以观察串行序。
         """
         _ensure_clean_db()
         case_space = space_name + "_chaos_serial_r2p2"
@@ -848,9 +922,9 @@ class TestRebuildReplicaRoutingChaos:
                         if p:
                             running = []
                             for t in p.get("tasks") or []:
-                                # status=1 + dispatched=true means the task
+                                # status="running" + dispatched=true means the task
                                 # was actually sent to PS and is Running.
-                                if int(t.get("status", -1)) == 1 and \
+                                if t.get("status") == "running" and \
                                    t.get("dispatched", False):
                                     running.append({
                                         "partition_id": t.get("partition_id"),
@@ -877,75 +951,66 @@ class TestRebuildReplicaRoutingChaos:
             stop_evt.set()
             poller.join(timeout=5)
 
-            violations = []
-            cross_partition_parallel_seen = False
+            # (a) Frame-level check: at most one running task cluster-wide.
+            frame_violations = []
             for idx, (_, _, running) in enumerate(frames):
-                by_pid = {}
-                for t in running:
-                    by_pid.setdefault(t["partition_id"], []).append(t)
-                for pid, tasks in by_pid.items():
-                    if len(tasks) > 1:
-                        violations.append(
-                            "frame %d partition %s has %d running tasks: %s" %
-                            (idx, pid, len(tasks), tasks))
-                if len([pid for pid, tasks in by_pid.items() if tasks]) >= 2:
-                    cross_partition_parallel_seen = True
+                if len(running) > 1:
+                    frame_violations.append(
+                        "frame %d has %d running tasks (expected <= 1): %s" %
+                        (idx, len(running), running))
 
             assert frames, "no rebuild progress frames collected"
-            assert not violations, (
-                "Per-partition serial violated:\n" + "\n".join(violations))
+            assert not frame_violations, (
+                "Global serial invariant violated:\n"
+                + "\n".join(frame_violations))
 
-            # Fallback: 当 rebuild 过快 / polling 漏采时, 用 final tasks 的
-            # [start_time, complete_time] 区间重叠来证明跨 partition 并行。
-            # master 在 dispatch 时写 start_time, finalize 时写 complete_time,
-            # 区间重叠 ⇔ 这两个 partition 的副本曾同时处于 Running。
-            intervals = {}  # pid -> [(start, end), ...]
-            if not cross_partition_parallel_seen:
-                def _parse_ts(s):
-                    if not s or s.startswith("0001"):
-                        return None
-                    # Go RFC3339: 2026-06-15T14:18:17.115451808+08:00.
-                    # Truncate sub-microsecond digits, strip colon in tz so
-                    # strptime accepts it on Python < 3.7.
-                    s2 = re.sub(r"(\.\d{6})\d+", r"\1", s)
-                    s2 = re.sub(r"([+-]\d{2}):(\d{2})$", r"\1\2", s2)
-                    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z",
-                                "%Y-%m-%dT%H:%M:%S%z"):
-                        try:
-                            return _dt.strptime(s2, fmt)
-                        except ValueError:
-                            continue
+            # (b) Interval-level check on final tasks: [start_time,
+            # complete_time] intervals must be pairwise non-overlapping.
+            # master writes start_time on dispatch, complete_time on
+            # finalize; overlap ⇔ two tasks were Running at once.
+            def _parse_ts(s):
+                if not s or s.startswith("0001"):
                     return None
-
-                for t in final.get("tasks") or []:
-                    st = _parse_ts(t.get("start_time"))
-                    ct = _parse_ts(t.get("complete_time"))
-                    if not st or not ct or ct <= st:
+                # Go RFC3339: 2026-06-15T14:18:17.115451808+08:00.
+                # Truncate sub-microsecond digits, strip colon in tz so
+                # strptime accepts it on Python < 3.7.
+                s2 = re.sub(r"(\.\d{6})\d+", r"\1", s)
+                s2 = re.sub(r"([+-]\d{2}):(\d{2})$", r"\1\2", s2)
+                for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z",
+                            "%Y-%m-%dT%H:%M:%S%z"):
+                    try:
+                        return _dt.strptime(s2, fmt)
+                    except ValueError:
                         continue
-                    intervals.setdefault(t.get("partition_id"), []).append(
-                        (st, ct))
+                return None
 
-                pids = list(intervals.keys())
-                for i in range(len(pids)):
-                    for j in range(i + 1, len(pids)):
-                        for s1, e1 in intervals[pids[i]]:
-                            for s2, e2 in intervals[pids[j]]:
-                                if s1 < e2 and s2 < e1:
-                                    cross_partition_parallel_seen = True
-                                    break
-                            if cross_partition_parallel_seen:
-                                break
-                        if cross_partition_parallel_seen:
-                            break
-                    if cross_partition_parallel_seen:
-                        break
+            intervals = []  # list of (start, end, partition_id, replica_index)
+            for t in final.get("tasks") or []:
+                st = _parse_ts(t.get("start_time"))
+                ct = _parse_ts(t.get("complete_time"))
+                if not st or not ct or ct <= st:
+                    continue
+                intervals.append(
+                    (st, ct, t.get("partition_id"), t.get("replica_index")))
 
-            assert cross_partition_parallel_seen, (
-                "rebuild 期间未观察到不同 partition 同时 Running; "
-                "无法证明跨 partition 并行 (frames=%d, intervals=%s)" %
-                (len(frames),
-                 {pid: [(s.isoformat(), e.isoformat()) for s, e in ivs]
-                  for pid, ivs in intervals.items()}))
+            assert len(intervals) >= 2, (
+                "expected >= 2 completed intervals to test serialism, "
+                "got %d: tasks=%s" % (len(intervals), final.get("tasks")))
+
+            overlaps = []
+            for i in range(len(intervals)):
+                s1, e1, p1, r1 = intervals[i]
+                for j in range(i + 1, len(intervals)):
+                    s2, e2, p2, r2 = intervals[j]
+                    if s1 < e2 and s2 < e1:
+                        overlaps.append(
+                            "(pid=%s repl=%s [%s..%s]) overlaps "
+                            "(pid=%s repl=%s [%s..%s])" % (
+                                p1, r1, s1.isoformat(), e1.isoformat(),
+                                p2, r2, s2.isoformat(), e2.isoformat()))
+            assert not overlaps, (
+                "Task intervals must be pairwise disjoint under global "
+                "serial scheduling; overlaps:\n" + "\n".join(overlaps))
         finally:
             drop_space(router_url, db_name, case_space)
 
@@ -1031,8 +1096,7 @@ class TestRebuildReplicaRoutingChaos:
                         for t in (p.get("tasks") if p else None) or []:
                             if not t.get("dispatched", False):
                                 continue
-                            st = int(t.get("status", -1))
-                            if st != 1:
+                            if t.get("status") != "running":
                                 continue
                             pid = t.get("partition_id")
                             nid = int(t.get("node_id", 0))
@@ -1074,7 +1138,7 @@ class TestRebuildReplicaRoutingChaos:
             # markReplicaRebuilding 与 t.Dispatched=true 一起发生)。
             if not seen_rebuilding:
                 for t in final.get("tasks") or []:
-                    if int(t.get("status", -1)) == 2:
+                    if t.get("status") == "completed":
                         seen_rebuilding = True
                         break
             assert seen_rebuilding, (
@@ -1189,7 +1253,7 @@ class TestRebuildReplicaRoutingChaos:
                         for t in (p.get("tasks") if p else None) or []:
                             if int(t.get("node_id", -1)) != lid_int:
                                 continue
-                            if int(t.get("status", -1)) == 1 and \
+                            if t.get("status") == "running" and \
                                t.get("dispatched", False):
                                 leader_seen_rebuilding[0] = True
                                 break
@@ -1226,7 +1290,7 @@ class TestRebuildReplicaRoutingChaos:
                 lid_int = int(leader_id)
                 for t in final.get("tasks") or []:
                     if int(t.get("node_id", -1)) == lid_int and \
-                       int(t.get("status", -1)) == 2:
+                       t.get("status") == "completed":
                         leader_seen_rebuilding[0] = True
                         break
             assert leader_seen_rebuilding[0], (
@@ -1497,7 +1561,7 @@ class TestRebuildReplicaRoutingChaos:
                             for t in p.get("tasks") or []:
                                 if (int(t.get("partition_id", -1)) == p1_pid
                                         and int(t.get("node_id", -1)) == lid
-                                        and int(t.get("status", -1)) == 1
+                                        and t.get("status") == "running"
                                         and t.get("dispatched", False)):
                                     in_window = True
                                     x_running_seen[0] = True

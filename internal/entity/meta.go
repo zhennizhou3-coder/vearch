@@ -107,6 +107,13 @@ func LockAliasKey(aliasName string) string {
 	return fmt.Sprintf("%s%s", PrefixLock, aliasName)
 }
 
+func PSStatKey(nodeID NodeID) string {
+	return fmt.Sprintf("%s%d", PrefixPSStat, nodeID)
+}
+func MigrateTaskKey(taskID string) string {
+	return PrefixMigrateTask + taskID
+}
+
 func SetPrefixAndSequence(cluster_id string) {
 	if strings.HasPrefix(cluster_id, Prefix) {
 		PrefixEtcdClusterID = cluster_id
@@ -132,6 +139,8 @@ func SetPrefixAndSequence(cluster_id string) {
 	PrefixAlias = PrefixEtcdClusterID + PrefixAlias
 	PrefixRole = PrefixEtcdClusterID + PrefixRole
 	PrefixMasterMember = PrefixEtcdClusterID + PrefixMasterMember
+	PrefixPSStat = PrefixEtcdClusterID + PrefixPSStat
+	PrefixMigrateTask = PrefixEtcdClusterID + PrefixMigrateTask
 	PrefixRebuild = PrefixEtcdClusterID + PrefixRebuild
 }
 
@@ -163,7 +172,14 @@ var (
 	PrefixAlias        = "/alias/"
 	PrefixRole         = "/role/"
 	PrefixMasterMember = "/member/"
+	PrefixPSStat       = "/ps_stat/"
+	PrefixMigrateTask  = "/migrate_task/"
 	PrefixRebuild      = "/rebuild/index/space/"
+)
+
+const (
+	KeyBalancerConfig = "/balancer/config"
+	KeyBalancerLock   = "/balancer/lock"
 )
 
 var PrefixEtcdClusterID = "/vearch/default/"

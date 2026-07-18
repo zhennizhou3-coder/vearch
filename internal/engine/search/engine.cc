@@ -466,7 +466,7 @@ Status Engine::Query(QueryRequest &request, Response &response_results) {
       filters[idx].upper_value = filter.upper_value;
       filters[idx].include_lower = filter.include_lower;
       filters[idx].include_upper = filter.include_upper;
-      filters[idx].is_union = static_cast<FilterOperator>(filter.is_union);
+      filters[idx].filter_operator = static_cast<FilterOperator>(filter.is_union);
 
       ++idx;
     }
@@ -476,7 +476,7 @@ Status Engine::Query(QueryRequest &request, Response &response_results) {
 
       filters[idx].field = table_->GetAttrIdx(filter.field);
       filters[idx].lower_value = filter.value;
-      filters[idx].is_union = static_cast<FilterOperator>(filter.is_union);
+      filters[idx].filter_operator = static_cast<FilterOperator>(filter.is_union);
 
       ++idx;
     }
@@ -543,7 +543,7 @@ int64_t Engine::ScalarIndexQuery(Request &request, SearchCondition *condition,
     filters[idx].upper_value = filter.upper_value;
     filters[idx].include_lower = filter.include_lower;
     filters[idx].include_upper = filter.include_upper;
-    filters[idx].is_union = static_cast<FilterOperator>(filter.is_union);
+    filters[idx].filter_operator = static_cast<FilterOperator>(filter.is_union);
 
     ++idx;
   }
@@ -553,7 +553,7 @@ int64_t Engine::ScalarIndexQuery(Request &request, SearchCondition *condition,
 
     filters[idx].field = table_->GetAttrIdx(filter.field);
     filters[idx].lower_value = filter.value;
-    filters[idx].is_union = static_cast<FilterOperator>(filter.is_union);
+    filters[idx].filter_operator = static_cast<FilterOperator>(filter.is_union);
 
     ++idx;
   }
@@ -1123,7 +1123,8 @@ int Engine::RebuildIndex(int drop_before_rebuild, int limit_cpu, int describe) {
   return 0;
 }
 
-int Engine::RebuildFieldIndex(const std::string &field_name,
+int Engine::RebuildFieldIndex(const std::string &index_name,
+                              const std::string &field_name,
                               const std::string &index_type,
                               int drop_before_rebuild, int limit_cpu,
                               int describe) {
@@ -1135,8 +1136,8 @@ int Engine::RebuildFieldIndex(const std::string &field_name,
     return RebuildIndex(drop_before_rebuild, limit_cpu, describe);
   }
 
-  LOG(INFO) << space_name_ << " RebuildFieldIndex field=" << field_name
-            << " index_type=" << index_type
+  LOG(INFO) << space_name_ << " RebuildFieldIndex name=" << index_name
+            << " field=" << field_name << " index_type=" << index_type
             << " drop_before_rebuild=" << drop_before_rebuild
             << " limit_cpu=" << limit_cpu << " describe=" << describe;
 
@@ -1156,47 +1157,35 @@ int Engine::RebuildFieldIndex(const std::string &field_name,
   }
 
   if (drop_before_rebuild) {
-    // Drop and re-create index for the specific (field, index_type).
+    // Drop and re-create index by index_name.
     Status status = vec_manager_->ReCreateVectorIndex(
-        field_name, index_type, training_threshold_);
+        index_name, field_name, index_type, training_threshold_);
     if (!status.ok()) {
       LOG(ERROR) << space_name_
                  << " RebuildFieldIndex ReCreateVectorIndex failed for "
-                 << field_name << ":" << index_type << " : "
-                 << status.ToString();
-      // ReCreateVectorIndex already cleaned up internally (it
-      // deleted the old index first, then cleared any partial new
-      // index on failure). Calling DestroyVectorIndexes() would
-      // destroy OTHER fields' indexes that are still valid.
+                 << index_name << " (" << field_name << ":" << index_type
+                 << ") : " << status.ToString();
       return -1;
     }
     index_status_ = IndexStatus::UNINDEXED;
   } else {
-    // Rebuild in-place: create a new index for the specific
-    // (field_name, index_type) without dropping the old one first,
-    // train it, then swap it in. This mirrors the CreateVectorIndexes
-    // + TrainIndex + ResetVectorIndexes sequence used by
-    // RebuildIndex(drop_before_rebuild=0), but scoped to one field.
+    // In-place rebuild: create a new index model, train it, then swap in.
     bool do_train = (indexing_state_.load() == IndexingState::IDLE &&
                      max_docid_ - delete_num_ > training_threshold_);
     Status status = vec_manager_->RebuildVectorIndex(
-        field_name, index_type, training_threshold_, do_train);
+        index_name, field_name, index_type, training_threshold_, do_train);
     if (!status.ok()) {
       LOG(ERROR) << space_name_
                  << " RebuildFieldIndex RebuildVectorIndex failed for "
-                 << field_name << ":" << index_type << " : "
-                 << status.ToString();
-      // RebuildVectorIndex already cleaned up internally (it deletes
-      // the partial new_indexes on failure and never touched the
-      // member vector_indexes_). Calling DestroyVectorIndexes() here
-      // would destroy OTHER fields' valid indexes.
+                 << index_name << " (" << field_name << ":" << index_type
+                 << ") : " << status.ToString();
       return -1;
     }
   }
 
   if (int ret = FinishRebuild("RebuildFieldIndex")) return ret;
-  LOG(INFO) << space_name_ << " RebuildFieldIndex for " << field_name << ":"
-            << index_type << " success!";
+  LOG(INFO) << space_name_ << " RebuildFieldIndex for " << index_name
+            << " (" << field_name << ":" << index_type << ") success!";
   return 0;
 }
 
@@ -1673,8 +1662,12 @@ void Engine::AddFieldIndexThread(const std::string &field_name,
       indexing_thread_.join();
     }
 
-    // Add the new index type and parameter
-    vec_manager_->AddIndexTypeAndParam(indexType, indexParam);
+    // Add the new index entry. AddFieldIndex is a runtime path without a
+    // user-supplied index_name; synthesize one to keep vector_indexes_'s
+    // key space consistent with CreateVectorTable's fallback.
+    std::string synth_index_name = field_name + "::" + indexType;
+    vec_manager_->AddIndexTypeAndParam(synth_index_name, field_name, indexType,
+                                       indexParam);
 
     // Create vector indexes with the new configuration
     std::map<std::string, IndexModel *> vector_indexes;

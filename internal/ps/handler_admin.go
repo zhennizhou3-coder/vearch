@@ -1369,7 +1369,7 @@ func (rsh *RebuildStatusHandler) Execute(ctx context.Context, req *vearchpb.Part
 
 	status, errorMsg, exists, progress := rebuildMgr.GetRebuildTaskStatus(
 		query.SpaceKey, query.IndexName, pid)
-	log.Info("RebuildTaskStatus result: spaceKey=%s, indexName=%s, partitionID=%d, status=%d, exists=%v, errorMsg=%s, progress=%d%%",
+	log.Info("RebuildTaskStatus result: spaceKey=%s, indexName=%s, partitionID=%d, status=%s, exists=%v, errorMsg=%s, progress=%d%%",
 		query.SpaceKey, query.IndexName, pid, status, exists, errorMsg, progress)
 
 	response := &entity.PSRebuildStatusResponse{

@@ -18,30 +18,29 @@ import (
 	"time"
 )
 
-// PSRebuildTaskStatus is the per-replica rebuild status on PS.
-// Pending dispatch is a master-side state; PS sees tasks as Running once
-// registered. Values are wire-stable and must not be reordered.
-type PSRebuildTaskStatus int
+// RebuildStatus is the shared lifecycle status for both per-replica tasks
+// (Master↔PS RPC) and the space-level scheduling record (etcd).
+//
+// The wire representation is the string value; the JSON encoder emits e.g.
+// "running" for either use. Values are stable and must not be renamed.
+//
+// Tasks only ever take Running / Completed / Failed. Pending / Cancelled are
+// space-level record states; NotFound is a synthetic value produced by GET
+// when no record exists and is never persisted.
+type RebuildStatus string
 
 const (
-	PSRebuildTaskStatusRunning   PSRebuildTaskStatus = 1
-	PSRebuildTaskStatusCompleted PSRebuildTaskStatus = 2
-	PSRebuildTaskStatusFailed    PSRebuildTaskStatus = 3
+	RebuildStatusPending   RebuildStatus = "pending"
+	RebuildStatusRunning   RebuildStatus = "running"
+	RebuildStatusCompleted RebuildStatus = "completed"
+	RebuildStatusFailed    RebuildStatus = "failed"
+	RebuildStatusCancelled RebuildStatus = "cancelled"
+	RebuildStatusNotFound  RebuildStatus = "not_found"
 )
 
-// Master record lifecycle statuses, persisted in etcd.
-const (
-	RebuildStatusPending   = "pending"
-	RebuildStatusRunning   = "running"
-	RebuildStatusCompleted = "completed"
-	RebuildStatusFailed    = "failed"
-	RebuildStatusCancelled = "cancelled"
-	RebuildStatusNotFound  = "not_found"
-)
-
-// IsRebuildTerminalStatus reports whether the scheduler is done with a status.
-func IsRebuildTerminalStatus(status string) bool {
-	switch status {
+// IsTerminal reports whether the scheduler is done with a record in this state.
+func (s RebuildStatus) IsTerminal() bool {
+	switch s {
 	case RebuildStatusCompleted,
 		RebuildStatusFailed,
 		RebuildStatusCancelled:
@@ -62,40 +61,65 @@ type CancelRebuildRequest struct {
 type CancelRebuildResponse struct {
 	DBName    string `json:"db_name"`
 	SpaceName string `json:"space_name"`
-	// Cancelled is true only when a pending record became cancelled.
-	Cancelled bool   `json:"cancelled"`
-	Reason    string `json:"reason,omitempty"`
-	Status    string `json:"status"` // the record's status at the time of cancellation
+	// Cancelled reports whether this call transitioned the record itself
+	// to Cancelled (only possible while the record is Pending).
+	Cancelled bool `json:"cancelled"`
+	// CancelledTasks counts per-task cancellations applied by this call:
+	//   - When the record is Pending, this is 0 (the record itself is
+	//     cancelled; task list may be empty at that point).
+	//   - When the record is Running, this is the number of tasks that
+	//     were still in the plan-but-not-dispatched state and were
+	//     transitioned to Cancelled by this call. Already-dispatched
+	//     tasks are left running and will finish naturally.
+	CancelledTasks int           `json:"cancelled_tasks,omitempty"`
+	Reason         string        `json:"reason,omitempty"`
+	Status         RebuildStatus `json:"status"` // the record's status at the time of cancellation
 }
 
-// PartitionRebuildTask is one replica rebuild task persisted in a space record.
-type PartitionRebuildTask struct {
-	PartitionID  PartitionID         `json:"partition_id"`
-	NodeID       NodeID              `json:"node_id"`
-	ReplicaIndex int                 `json:"replica_index"` // Replica index (0, 1, 2, ...)
-	PSNodeAddr   string              `json:"ps_node_addr"`
-	SpaceKey     string              `json:"space_key"` // dbName-spaceName
-	TaskType     string              `json:"task_type"` // task type: rebuild
-	IndexName    string              `json:"index_name"`
-	Status       PSRebuildTaskStatus `json:"status"`
-	// Dispatched is true after the master sends ExecuteRebuildIndex.
-	Dispatched bool      `json:"dispatched,omitempty"`
-	DispatchAt time.Time `json:"dispatch_at,omitempty"`
-	// DispatchAttempts caps retries before PS registers the task.
-	DispatchAttempts int `json:"dispatch_attempts,omitempty"`
-	// PollFailureStreak tracks consecutive failed status polls.
+// RebuildTask is a single (partition, replica) index rebuild task.
+//
+// The same struct is used on both master and PS: each side populates the
+// fields it owns and treats the rest as informational. `omitempty` on all
+// side-exclusive fields keeps the wire payload compact:
+//
+//   - Identity, runtime state, and rebuild parameters are the shared
+//     contract between master (etcd record + status polls) and PS
+//     (in-memory task + status responses).
+//   - Master-only scheduling metadata (NodeID, ReplicaIndex, PSNodeAddr,
+//     Dispatched, DispatchAt, DispatchAttempts, PollFailureStreak,
+//     RetryCount) is zero on PS.
+//   - PS-only CGo parameters (FieldName, IndexType) are zero on master.
+type RebuildTask struct {
+	// Identity — both sides.
+	PartitionID PartitionID   `json:"partition_id"`
+	SpaceKey    string        `json:"space_key"` // dbName-spaceName
+	IndexName   string        `json:"index_name"`
+	Status      RebuildStatus `json:"status"`
+
+	// Runtime state — PS is authoritative, master caches the latest poll.
+	Progress     int       `json:"progress,omitempty"`
+	ErrorMessage string    `json:"error_message,omitempty"`
+	StartTime    time.Time `json:"start_time,omitempty"`
+	CompleteTime time.Time `json:"complete_time,omitempty"`
+
+	// Rebuild parameters — master fills, PS consumes.
+	DropBefore int `json:"drop_before,omitempty"` // 1: drop before rebuild
+	LimitCPU   int `json:"limit_cpu,omitempty"`
+	Describe   int `json:"describe,omitempty"`
+
+	// Master-only scheduling metadata (zero on PS).
+	NodeID            NodeID    `json:"node_id,omitempty"`
+	ReplicaIndex      int       `json:"replica_index,omitempty"`
+	PSNodeAddr        string    `json:"ps_node_addr,omitempty"`
+	Dispatched        bool      `json:"dispatched,omitempty"`
+	DispatchAt        time.Time `json:"dispatch_at,omitempty"`
+	DispatchAttempts  int       `json:"dispatch_attempts,omitempty"`
 	PollFailureStreak int       `json:"poll_failure_streak,omitempty"`
-	RetryCount        int       `json:"retry_count"`
-	MaxRetries        int       `json:"max_retries"`
-	LastError         error     `json:"-"`
-	LastErrorMsg      string    `json:"last_error,omitempty"`
-	StartTime         time.Time `json:"start_time"`
-	CompleteTime      time.Time `json:"complete_time"`
-	DropBefore        int       `json:"drop_before"` // 1: drop before rebuild, 0: not drop
-	LimitCPU          int       `json:"limit_cpu"`   // CPU limit
-	Describe          int       `json:"describe"`    // Describe level
-	// Progress is the latest 0..100 percentage reported by PS.
-	Progress int `json:"progress,omitempty"`
+	RetryCount        int       `json:"retry_count,omitempty"`
+
+	// PS-only CGo call parameters (zero on master).
+	FieldName string `json:"field_name,omitempty"`
+	IndexType string `json:"index_type,omitempty"`
 }
 
 // RebuildRequest is the API payload for starting a rebuild.
@@ -119,22 +143,22 @@ type RebuildProgressResponse struct {
 	CurrentIndex  int      `json:"current_index,omitempty"`
 	CurrentTarget string   `json:"current_target,omitempty"`
 
-	TotalTasks     int                     `json:"total_tasks"`
-	CompletedTasks int                     `json:"completed_tasks"`
-	FailedTasks    int                     `json:"failed_tasks"`
-	RunningTasks   int                     `json:"running_tasks"`
-	PendingTasks   int                     `json:"pending_tasks"`   // planned but not yet dispatched
-	SuccessRatio   float64                 `json:"success_ratio"`   // Success ratio (0.0-1.0)
-	OverallPercent int                     `json:"overall_percent"` // 0..100, weighted across all tasks
-	Status         string                  `json:"status"`          // overall status: running, completed, failed
-	ErrorMsg       string                  `json:"error_msg,omitempty"`
-	EnqueuedAt     time.Time               `json:"enqueued_at,omitempty"`
-	StartedAt      time.Time               `json:"started_at,omitempty"`
-	FinishedAt     time.Time               `json:"finished_at,omitempty"`
-	RetryCount     int                     `json:"retry_count,omitempty"`
-	MaxRetries     int                     `json:"max_retries,omitempty"`
-	Tasks          []*PartitionRebuildTask `json:"tasks,omitempty"` // detailed task list
-	VersionID      string                  `json:"version_id,omitempty"`
+	TotalTasks     int            `json:"total_tasks"`
+	CompletedTasks int            `json:"completed_tasks"`
+	FailedTasks    int            `json:"failed_tasks"`
+	RunningTasks   int            `json:"running_tasks"`
+	PendingTasks   int            `json:"pending_tasks"`   // planned but not yet dispatched
+	SuccessRatio   float64        `json:"success_ratio"`   // Success ratio (0.0-1.0)
+	OverallPercent int            `json:"overall_percent"` // 0..100, weighted across all tasks
+	Status         RebuildStatus  `json:"status"`          // overall status: running, completed, failed
+	ErrorMsg       string         `json:"error_msg,omitempty"`
+	EnqueuedAt     time.Time      `json:"enqueued_at,omitempty"`
+	StartedAt      time.Time      `json:"started_at,omitempty"`
+	FinishedAt     time.Time      `json:"finished_at,omitempty"`
+	RetryCount     int            `json:"retry_count,omitempty"`
+	MaxRetries     int            `json:"max_retries,omitempty"`
+	Tasks          []*RebuildTask `json:"tasks,omitempty"` // detailed task list
+	VersionID      string         `json:"version_id,omitempty"`
 }
 
 // RebuildSummaryResponse summarizes rebuild progress across spaces.
@@ -157,12 +181,16 @@ type PSRebuildStatusQuery struct {
 	IndexName string `json:"index_name"`
 }
 
-// PSRebuildStatusResponse rebuild status response
+// PSRebuildStatusResponse rebuild status response.
+//
+// When Exists=false the task has no in-memory record on PS (never registered,
+// or already evicted after terminalRetentionPeriod); Status/ErrorMessage/
+// Progress are then their zero values ("", "", 0).
 type PSRebuildStatusResponse struct {
-	Exists       bool   `json:"exists"`
-	Status       int    `json:"status"` // 0=init, 1=running, 2=completed, 3=failed (PSRebuildTaskStatus)
-	ErrorMessage string `json:"error_message"`
-	Progress     int    `json:"progress"` // 0-100
+	Exists       bool          `json:"exists"`
+	Status       RebuildStatus `json:"status"` // running|completed|failed; empty when Exists=false
+	ErrorMessage string        `json:"error_message"`
+	Progress     int           `json:"progress"` // 0-100
 }
 
 // PSRebuildParam is the master-to-PS rebuild start payload.
@@ -176,9 +204,9 @@ type PSRebuildParam struct {
 
 // SpaceRebuildRecord is the etcd-persisted scheduling unit for one space.
 type SpaceRebuildRecord struct {
-	DBName    string `json:"db_name"`
-	SpaceName string `json:"space_name"`
-	Status    string `json:"status"` // pending|running|completed|failed|cancelled
+	DBName    string        `json:"db_name"`
+	SpaceName string        `json:"space_name"`
+	Status    RebuildStatus `json:"status"` // pending|running|completed|failed|cancelled
 
 	// Rebuild parameters propagated to PS.
 	DropBefore  int    `json:"drop_before,omitempty"`
@@ -195,9 +223,9 @@ type SpaceRebuildRecord struct {
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 	ErrorMsg   string    `json:"error_msg,omitempty"`
 
-	TotalReplicas     int `json:"total_replicas"`
-	CompletedReplicas int `json:"completed_replicas"`
-	FailedReplicas    int `json:"failed_replicas"`
+	TotalTasks     int `json:"total_replicas"`
+	CompletedTasks int `json:"completed_replicas"`
+	FailedTasks    int `json:"failed_replicas"`
 
 	// Retry control is partition-scoped.
 	RetryCount       int                 `json:"retry_count,omitempty"`
@@ -205,7 +233,7 @@ type SpaceRebuildRecord struct {
 	PartitionRetries map[PartitionID]int `json:"partition_retries,omitempty"`
 
 	// Tasks is the per-replica plan for the current target.
-	Tasks []*PartitionRebuildTask `json:"tasks,omitempty"`
+	Tasks []*RebuildTask `json:"tasks,omitempty"`
 }
 
 // SpaceKey returns the dbName-spaceName composite identifier.

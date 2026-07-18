@@ -292,16 +292,13 @@ func ExportToClusterHandler(router *gin.Engine, masterService *masterService, se
 	groupAuth.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s", paramDbName, paramSpaceName, versionID), c.deleteBackupVersion)
 	groupAuth.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s/direct", paramDbName, paramSpaceName, versionID), c.deleteBackupVersionDirect)
 
-	// rebuild index handlers — all rebuild endpoints live under
-	// /index/rebuild/ with cancel as a sub-path (per-scope) or a
-	// top-level "cancel" for the global scope (gin does not allow
-	// static/param siblings at the same tree level).
-	groupAuth.POST("/index/rebuild/dbs", c.rebuildIndex)
+	// rebuild index handlers
+	groupAuth.POST("/index/rebuild", c.rebuildIndex)
 	groupAuth.POST(fmt.Sprintf("/index/rebuild/dbs/:%s", paramDbName), c.rebuildIndex)
 	groupAuth.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s", paramDbName, paramSpaceName), c.rebuildIndex)
 	groupAuth.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/indexes/:%s", paramDbName, paramSpaceName, paramIndexName), c.rebuildIndex)
 
-	groupAuth.GET("/index/rebuild/dbs", c.listAllRebuildProgress)
+	groupAuth.GET("/index/rebuild/progress", c.listAllRebuildProgress)
 	groupAuth.GET(fmt.Sprintf("/index/rebuild/dbs/:%s/progress", paramDbName), c.listDBRebuildProgress)
 	groupAuth.GET(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/progress", paramDbName, paramSpaceName), c.getRebuildProgress)
 
@@ -1144,10 +1141,10 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 
 	dbName = c.Param(paramDbName)
 	spaceName = c.Param(paramSpaceName)
-	urlIndexName := c.Param(paramIndexName)
+	indexName := c.Param(paramIndexName)
 
 	log.Info("rebuildIndex handler called: dbName=%s, spaceName=%s, indexName=%s, path=%s",
-		dbName, spaceName, urlIndexName, c.Request.URL.Path)
+		dbName, spaceName, indexName, c.Request.URL.Path)
 
 	// spaceName provided without dbName is invalid
 	if dbName == "" && spaceName != "" {
@@ -1155,7 +1152,7 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(fmt.Errorf("dbName is required when spaceName is specified")))
 		return
 	}
-	rebuildReqTpl := &entity.RebuildRequest{}
+	rebuildReq := &entity.RebuildRequest{}
 	if c.Request.Body != nil {
 		data, err := io.ReadAll(c.Request.Body)
 		if err != nil {
@@ -1163,23 +1160,23 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 			return
 		}
 		if len(data) > 0 {
-			if err := json.Unmarshal(data, rebuildReqTpl); err != nil {
+			if err := json.Unmarshal(data, rebuildReq); err != nil {
 				httpCode = response.New(c).JsonError(errors.NewErrBadRequest(err))
 				return
 			}
 		}
 	}
-	if rebuildReqTpl.PartitionId != 0 && (dbName == "" || spaceName == "") {
+	if rebuildReq.PartitionId != 0 && (dbName == "" || spaceName == "") {
 		log.Warn("rebuildIndex: PartitionId=%d requires both dbName and spaceName",
-			rebuildReqTpl.PartitionId)
+			rebuildReq.PartitionId)
 		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(
 			fmt.Errorf("partition_id requires both dbName and spaceName to be specified")))
 		return
 	}
-	if urlIndexName != "" {
-		rebuildReqTpl.IndexName = urlIndexName
+	if indexName != "" {
+		rebuildReq.IndexName = indexName
 	}
-	if rebuildReqTpl.IndexName != "" && (dbName == "" || spaceName == "") {
+	if rebuildReq.IndexName != "" && (dbName == "" || spaceName == "") {
 		log.Warn("rebuildIndex: index_name requires both dbName and spaceName")
 		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(
 			fmt.Errorf("index_name requires both dbName and spaceName to be specified")))
@@ -1196,6 +1193,25 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 
 	switch {
 	case dbName != "" && spaceName != "":
+		// Verify db and space existence + enabled up-front so
+		// RebuildService.StartRebuild can trust its inputs.
+		dbID, err := mc.QueryDBName2ID(ctx, dbName)
+		if err != nil {
+			log.Error("rebuildIndex: query db %s failed: %v", dbName, err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(fmt.Errorf("query db %s failed: %v", dbName, err)))
+			return
+		}
+		space, err := mc.QuerySpaceByName(ctx, dbID, spaceName)
+		if err != nil || space == nil {
+			log.Error("rebuildIndex: query space %s/%s failed: %v", dbName, spaceName, err)
+			httpCode = response.New(c).JsonError(errors.NewErrBadRequest(fmt.Errorf("space %s/%s not found", dbName, spaceName)))
+			return
+		}
+		if space.Enabled != nil && !*space.Enabled {
+			log.Warn("rebuildIndex: space %s/%s is disabled", dbName, spaceName)
+			httpCode = response.New(c).JsonError(errors.NewErrBadRequest(fmt.Errorf("space %s/%s is disabled", dbName, spaceName)))
+			return
+		}
 		targets = append(targets, target{db: dbName, space: spaceName})
 	case dbName != "":
 		dbID, err := mc.QueryDBName2ID(ctx, dbName)
@@ -1211,6 +1227,12 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 			return
 		}
 		for _, sp := range spaces {
+			// QuerySpaces returns only existing spaces; still filter out
+			// disabled ones so the batch never dispatches to them.
+			if sp.Enabled != nil && !*sp.Enabled {
+				log.Info("rebuildIndex: skip disabled space %s/%s", dbName, sp.Name)
+				continue
+			}
 			targets = append(targets, target{db: dbName, space: sp.Name})
 		}
 	default:
@@ -1228,6 +1250,10 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 				continue
 			}
 			for _, sp := range spaces {
+				if sp.Enabled != nil && !*sp.Enabled {
+					log.Info("rebuildIndex: skip disabled space %s/%s", db.Name, sp.Name)
+					continue
+				}
 				targets = append(targets, target{db: db.Name, space: sp.Name})
 			}
 		}
@@ -1251,7 +1277,7 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 	failures := make([]map[string]string, 0)
 	succeeded := 0
 	for _, t := range targets {
-		req := *rebuildReqTpl // shallow copy of body params
+		req := *rebuildReq // shallow copy of body params
 		req.DBName = t.db
 		req.SpaceName = t.space
 

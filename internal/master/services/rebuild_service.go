@@ -34,27 +34,7 @@ type (
 	RebuildProgressResponse = entity.RebuildProgressResponse
 	RebuildRequest          = entity.RebuildRequest
 	SpaceRebuildRecord      = entity.SpaceRebuildRecord
-	PartitionRebuildTask    = entity.PartitionRebuildTask
-)
-
-// PS task status int aliases for switch-on-int contexts (e.g. matching
-// against RebuildStatusResponse.Status, which is wire-stable int). For
-// task-object comparisons (task.Status is entity.PSRebuildTaskStatus)
-// reference entity.PSRebuildTaskStatus{Running,Completed,Failed} directly.
-const (
-	PSRebuildTaskStatusRunning   = int(entity.PSRebuildTaskStatusRunning)
-	PSRebuildTaskStatusCompleted = int(entity.PSRebuildTaskStatusCompleted)
-	PSRebuildTaskStatusFailed    = int(entity.PSRebuildTaskStatusFailed)
-)
-
-// Rebuild record-status string constants (re-exported from entity).
-const (
-	RebuildStatusPending   = entity.RebuildStatusPending
-	RebuildStatusRunning   = entity.RebuildStatusRunning
-	RebuildStatusCompleted = entity.RebuildStatusCompleted
-	RebuildStatusCancelled = entity.RebuildStatusCancelled
-	RebuildStatusFailed    = entity.RebuildStatusFailed
-	RebuildStatusNotFound  = entity.RebuildStatusNotFound
+	RebuildTask             = entity.RebuildTask
 )
 
 // scheduling cadence
@@ -90,90 +70,6 @@ func (s *RebuildService) SetLeaderChecker(isLeader func() bool) {
 	s.scheduler.setLeaderChecker(isLeader)
 }
 
-// StartEtcdLeaderCampaign elects one scheduler leader through an etcd lock.
-func (s *RebuildService) StartEtcdLeaderCampaign(ctx context.Context, ttl time.Duration) func() bool {
-	if ttl <= 0 {
-		ttl = 30 * time.Second
-	}
-	state := &leaderCampaign{}
-	go state.run(ctx, s.client, ttl)
-	return state.isLeader
-}
-
-// leaderCampaign tracks local ownership of the scheduler lock.
-type leaderCampaign struct {
-	mu     sync.RWMutex
-	leader bool
-}
-
-func (lc *leaderCampaign) isLeader() bool {
-	lc.mu.RLock()
-	defer lc.mu.RUnlock()
-	return lc.leader
-}
-
-func (lc *leaderCampaign) setLeader(v bool) {
-	lc.mu.Lock()
-	lc.leader = v
-	lc.mu.Unlock()
-}
-
-// run repeatedly tries to acquire and keep the scheduler lock.
-func (lc *leaderCampaign) run(ctx context.Context, c *client.Client, ttl time.Duration) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Error("rebuild leader campaign panic: %v\n%s", r, debug.Stack())
-		}
-	}()
-	retryDelay := 5 * time.Second
-	refresh := ttl / 3
-	if refresh < time.Second {
-		refresh = time.Second
-	}
-	for {
-		if ctx.Err() != nil {
-			lc.setLeader(false)
-			return
-		}
-		lock := c.Master().NewLock(ctx, entity.LockRebuildScheduler(), ttl)
-		acquired, err := lock.TryLock()
-		if err != nil || !acquired {
-			lc.setLeader(false)
-			if err != nil {
-				log.Debug("rebuild leader campaign: TryLock failed (will retry): %v", err)
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(retryDelay):
-				continue
-			}
-		}
-		lc.setLeader(true)
-		log.Info("rebuild leader campaign: this master is now scheduler leader")
-		// Keep the lease alive until ctx cancellation or lease expiry.
-		holdTicker := time.NewTicker(refresh)
-		held := true
-		for held {
-			select {
-			case <-ctx.Done():
-				holdTicker.Stop()
-				_ = lock.Unlock()
-				lc.setLeader(false)
-				return
-			case <-holdTicker.C:
-				if err := lock.KeepAliveOnce(); err != nil {
-					log.Warn("rebuild leader campaign: lease keep-alive failed, stepping down: %v", err)
-					lc.setLeader(false)
-					held = false
-				}
-			}
-		}
-		holdTicker.Stop()
-		_ = lock.Unlock()
-	}
-}
-
 // Start launches the scheduler tick goroutine.
 func (s *RebuildService) Start() {
 	s.scheduler.start()
@@ -193,25 +89,17 @@ func (s *RebuildService) StartRebuild(ctx context.Context, req *RebuildRequest) 
 
 	mc := s.client.Master()
 
-	// (1) DB existence.
 	dbID, err := mc.QueryDBName2ID(ctx, req.DBName)
 	if err != nil {
-		return nil, fmt.Errorf("db %s not found: %v", req.DBName, err)
+		return nil, fmt.Errorf("resolve db %s: %v", req.DBName, err)
 	}
 
-	// (2) Space existence + enabled.
 	space, err := mc.QuerySpaceByName(ctx, dbID, req.SpaceName)
 	if err != nil {
-		return nil, fmt.Errorf("query space %s/%s: %v", req.DBName, req.SpaceName, err)
-	}
-	if space == nil {
-		return nil, fmt.Errorf("space %s/%s not found", req.DBName, req.SpaceName)
-	}
-	if space.Enabled != nil && !*space.Enabled {
-		return nil, fmt.Errorf("space %s/%s is disabled", req.DBName, req.SpaceName)
+		return nil, fmt.Errorf("resolve space %s/%s: %v", req.DBName, req.SpaceName, err)
 	}
 
-	// (3) Resolve the target index name list.
+	// Resolve the target index name list.
 	var indexNames []string
 	if req.IndexName != "" {
 		idx := space.GetIndexByName(req.IndexName)
@@ -234,7 +122,7 @@ func (s *RebuildService) StartRebuild(ctx context.Context, req *RebuildRequest) 
 
 	// (4) Partition health check runs before the STM so we do not hold
 	// the etcd session across per-partition RPCs.
-	partitions, err := resolveRebuildPartitions(space, req.PartitionId)
+	partitions, err := selectPartitions(space, req.PartitionId)
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +143,7 @@ func (s *RebuildService) StartRebuild(ctx context.Context, req *RebuildRequest) 
 	rec := &SpaceRebuildRecord{
 		DBName:      req.DBName,
 		SpaceName:   req.SpaceName,
-		Status:      RebuildStatusPending,
+		Status:      entity.RebuildStatusPending,
 		DropBefore:  dropBefore,
 		LimitCPU:    req.LimitCPU,
 		Describe:    req.Describe,
@@ -277,13 +165,13 @@ func (s *RebuildService) StartRebuild(ctx context.Context, req *RebuildRequest) 
 	if err != nil {
 		return nil, fmt.Errorf("marshal rebuild record: %v", err)
 	}
-	var conflictStatus string
+	var conflictStatus entity.RebuildStatus
 	err = s.client.Master().STM(ctx, func(stm concurrency.STM) error {
 		raw := stm.Get(key)
 		if raw != "" {
 			var cur SpaceRebuildRecord
 			if uerr := vjson.Unmarshal([]byte(raw), &cur); uerr == nil {
-				if !entity.IsRebuildTerminalStatus(cur.Status) {
+				if !cur.Status.IsTerminal() {
 					conflictStatus = cur.Status
 					return nil
 				}
@@ -303,7 +191,7 @@ func (s *RebuildService) StartRebuild(ctx context.Context, req *RebuildRequest) 
 	}
 
 	log.Info("rebuild record enqueued: %s/%s (partitionID=%d)", req.DBName, req.SpaceName, req.PartitionId)
-	return buildProgressFromRecord(rec), nil
+	return rebuildProgressFromRecord(rec), nil
 }
 
 // GetRebuildProgress returns the current progress for one space.
@@ -316,10 +204,10 @@ func (s *RebuildService) GetRebuildProgress(ctx context.Context, dbName, spaceNa
 	if rec == nil {
 		return &RebuildProgressResponse{
 			SpaceKey: dbName + "-" + spaceName,
-			Status:   RebuildStatusNotFound,
+			Status:   entity.RebuildStatusNotFound,
 		}, nil
 	}
-	return buildProgressFromRecord(rec), nil
+	return rebuildProgressFromRecord(rec), nil
 }
 
 // ListAllRebuildProgress summarizes all rebuild records.
@@ -350,22 +238,22 @@ func (s *RebuildService) listRebuildProgressByPrefix(ctx context.Context, prefix
 		if rec.DBName == "" || rec.SpaceName == "" {
 			continue
 		}
-		progress := buildProgressFromRecord(rec)
+		progress := rebuildProgressFromRecord(rec)
 		summary.Results = append(summary.Results, progress)
 		summary.Total++
 
 		switch progress.Status {
-		case RebuildStatusCompleted:
+		case entity.RebuildStatusCompleted:
 			summary.CompletedCount++
-		case RebuildStatusFailed:
+		case entity.RebuildStatusFailed:
 			summary.FailedCount++
-		case RebuildStatusCancelled:
+		case entity.RebuildStatusCancelled:
 			summary.CancelledCount++
-		case RebuildStatusRunning:
+		case entity.RebuildStatusRunning:
 			summary.RunningCount++
-		case RebuildStatusPending:
+		case entity.RebuildStatusPending:
 			summary.PendingCount++
-		case RebuildStatusNotFound:
+		case entity.RebuildStatusNotFound:
 			summary.NotFoundCount++
 		}
 	}
@@ -379,7 +267,20 @@ func (s *RebuildService) listRebuildProgressByPrefix(ctx context.Context, prefix
 	return summary, nil
 }
 
-// CancelRebuild cancels a rebuild only while it is still pending.
+// CancelRebuild cancels rebuild work for one space.
+//
+// Cancellation is task-scoped (best-effort):
+//   - Pending record: whole record is transitioned to Cancelled (unchanged
+//     behavior; casCancelPending performs the CAS).
+//   - Running record: every task that is still !Dispatched && !IsTerminal
+//     is transitioned to Cancelled. Already-dispatched tasks are left
+//     running and will finish naturally; the record itself stays Running
+//     until finalize converges. Returns the count of cancelled tasks so the
+//     caller can distinguish "everything was already in flight" (0) from
+//     "some pending tasks were skipped" (>0).
+//   - Terminal / unknown states: read-only response, no mutation.
+//
+// Only "record not found" and STM / IO failures return an error.
 func (s *RebuildService) CancelRebuild(ctx context.Context, dbName, spaceName string) (*entity.CancelRebuildResponse, error) {
 	key := entity.RebuildSpaceKey(dbName, spaceName)
 	rec, err := s.loadRecord(ctx, key)
@@ -390,28 +291,36 @@ func (s *RebuildService) CancelRebuild(ctx context.Context, dbName, spaceName st
 		return nil, fmt.Errorf("no rebuild record found for %s/%s", dbName, spaceName)
 	}
 
+	// classify maps a record's current terminal / read-only status to a
+	// CancelRebuildResponse. The Pending and Running paths mutate below.
+	classify := func(cur *SpaceRebuildRecord, reasonOverride string) (*entity.CancelRebuildResponse, error) {
+		resp := &entity.CancelRebuildResponse{
+			DBName:    dbName,
+			SpaceName: spaceName,
+			Status:    cur.Status,
+		}
+		switch cur.Status {
+		case entity.RebuildStatusCompleted, entity.RebuildStatusFailed:
+			resp.Reason = fmt.Sprintf("rebuild already %s, cannot cancel", cur.Status)
+		case entity.RebuildStatusCancelled:
+			resp.Cancelled = true
+			resp.Reason = "already cancelled"
+		case entity.RebuildStatusPending:
+			// Only reachable when caller has decided not to mutate (e.g. the
+			// CAS failed and reload found the record still Pending — unlikely).
+			resp.Reason = "rebuild is pending; retry cancel"
+		default:
+			return nil, fmt.Errorf("unknown rebuild status %q for %s/%s", cur.Status, dbName, spaceName)
+		}
+		if reasonOverride != "" {
+			resp.Reason = reasonOverride
+		}
+		return resp, nil
+	}
+
 	switch rec.Status {
-	case RebuildStatusCompleted, RebuildStatusFailed:
-		// Already terminal.
-		return &entity.CancelRebuildResponse{
-			DBName:    dbName,
-			SpaceName: spaceName,
-			Cancelled: false,
-			Reason:    fmt.Sprintf("rebuild already %s, cannot cancel", rec.Status),
-			Status:    rec.Status,
-		}, nil
-	case RebuildStatusCancelled:
-		// Already cancelled.
-		return &entity.CancelRebuildResponse{
-			DBName:    dbName,
-			SpaceName: spaceName,
-			Cancelled: true,
-			Reason:    "already cancelled",
-			Status:    rec.Status,
-		}, nil
-	case RebuildStatusPending:
-		// Cancel with STM to avoid racing pending -> running admission.
-		key := entity.RebuildSpaceKey(dbName, spaceName)
+	case entity.RebuildStatusPending:
+		// Cancel the whole record with STM to avoid racing pending -> running admission.
 		cancelled, err := s.casCancelPending(ctx, key)
 		if err != nil {
 			return nil, err
@@ -423,10 +332,10 @@ func (s *RebuildService) CancelRebuild(ctx context.Context, dbName, spaceName st
 				SpaceName: spaceName,
 				Cancelled: true,
 				Reason:    "pending record cancelled",
-				Status:    RebuildStatusCancelled,
+				Status:    entity.RebuildStatusCancelled,
 			}, nil
 		}
-		// Status changed; reload and report the new outcome.
+		// Status changed under us; reload and re-dispatch.
 		rec2, err2 := s.loadRecord(ctx, key)
 		if err2 != nil {
 			return nil, fmt.Errorf("reload after CAS conflict: %v", err2)
@@ -434,35 +343,41 @@ func (s *RebuildService) CancelRebuild(ctx context.Context, dbName, spaceName st
 		if rec2 == nil {
 			return nil, fmt.Errorf("no rebuild record found for %s/%s (disappeared after CAS conflict)", dbName, spaceName)
 		}
-		switch rec2.Status {
-		case RebuildStatusRunning:
-			return &entity.CancelRebuildResponse{
-				DBName:    dbName,
-				SpaceName: spaceName,
-				Cancelled: false,
-				Reason:    "rebuild was already admitted to running; cannot cancel once tasks have been dispatched to PS",
-				Status:    rec2.Status,
-			}, nil
-		default:
-			return &entity.CancelRebuildResponse{
-				DBName:    dbName,
-				SpaceName: spaceName,
-				Cancelled: false,
-				Reason:    fmt.Sprintf("rebuild status changed to %q before cancel could apply", rec2.Status),
-				Status:    rec2.Status,
-			}, nil
+		if rec2.Status == entity.RebuildStatusRunning {
+			// Fall through into the Running best-effort path.
+			rec = rec2
+		} else {
+			return classify(rec2,
+				fmt.Sprintf("rebuild status changed to %q before cancel could apply", rec2.Status))
 		}
-	case RebuildStatusRunning:
-		// Running tasks cannot be interrupted safely.
+		fallthrough
+
+	case entity.RebuildStatusRunning:
+		n, err := s.casCancelRunningTasks(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		reason := ""
+		switch {
+		case n == 0:
+			reason = "rebuild is running and every task is already dispatched or terminal; nothing to cancel"
+		case n == 1:
+			reason = "cancelled 1 not-yet-dispatched task; already-dispatched tasks will run to completion"
+		default:
+			reason = fmt.Sprintf("cancelled %d not-yet-dispatched tasks; already-dispatched tasks will run to completion", n)
+		}
+		log.Info("cancel running rebuild for %s/%s: cancelled %d pending task(s)", dbName, spaceName, n)
 		return &entity.CancelRebuildResponse{
-			DBName:    dbName,
-			SpaceName: spaceName,
-			Cancelled: false,
-			Reason:    "rebuild is running; cannot cancel once tasks have been dispatched to PS",
-			Status:    rec.Status,
+			DBName:         dbName,
+			SpaceName:      spaceName,
+			Cancelled:      false, // record itself stays Running
+			CancelledTasks: n,
+			Reason:         reason,
+			Status:         entity.RebuildStatusRunning,
 		}, nil
+
 	default:
-		return nil, fmt.Errorf("unknown rebuild status %q for %s/%s", rec.Status, dbName, spaceName)
+		return classify(rec, "")
 	}
 }
 
@@ -479,11 +394,11 @@ func (s *RebuildService) casCancelPending(ctx context.Context, key string) (bool
 		if err := vjson.Unmarshal([]byte(raw), rec); err != nil {
 			return fmt.Errorf("unmarshal in CAS cancel: %v", err)
 		}
-		if rec.Status != RebuildStatusPending {
+		if rec.Status != entity.RebuildStatusPending {
 			conflict = true
 			return nil
 		}
-		rec.Status = RebuildStatusCancelled
+		rec.Status = entity.RebuildStatusCancelled
 		rec.ErrorMsg = "cancelled by user while pending"
 		rec.FinishedAt = time.Now()
 		value, err := vjson.Marshal(rec)
@@ -497,6 +412,55 @@ func (s *RebuildService) casCancelPending(ctx context.Context, key string) (bool
 		return false, fmt.Errorf("STM cancel pending: %v", err)
 	}
 	return !conflict, nil
+}
+
+// casCancelRunningTasks marks every not-yet-dispatched, non-terminal task
+// of a Running record as Cancelled. The record itself stays Running; the
+// scheduler will observe the Cancelled tasks on the next tick, skip them
+// during dispatchPending, and finalize will converge the record once every
+// remaining (already-dispatched) task reaches a terminal state.
+//
+// Returns the number of tasks transitioned. Non-Running records and empty
+// task lists yield (0, nil) — best-effort semantics.
+func (s *RebuildService) casCancelRunningTasks(ctx context.Context, key string) (int, error) {
+	cancelled := 0
+	err := s.client.Master().STM(ctx, func(stm concurrency.STM) error {
+		cancelled = 0
+		raw := stm.Get(key)
+		if raw == "" {
+			return nil
+		}
+		rec := &SpaceRebuildRecord{}
+		if err := vjson.Unmarshal([]byte(raw), rec); err != nil {
+			return fmt.Errorf("unmarshal in CAS cancel running: %v", err)
+		}
+		if rec.Status != entity.RebuildStatusRunning {
+			return nil
+		}
+		now := time.Now()
+		for _, t := range rec.Tasks {
+			if t.Dispatched || t.Status.IsTerminal() {
+				continue
+			}
+			t.Status = entity.RebuildStatusCancelled
+			t.ErrorMessage = "cancelled by user before dispatch"
+			t.CompleteTime = now
+			cancelled++
+		}
+		if cancelled == 0 {
+			return nil
+		}
+		value, err := vjson.Marshal(rec)
+		if err != nil {
+			return err
+		}
+		stm.Put(key, string(value))
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("STM cancel running tasks: %v", err)
+	}
+	return cancelled, nil
 }
 
 // loadRecord reads the etcd record. Returns (nil, nil) when not found.
@@ -529,14 +493,14 @@ func (s *RebuildService) saveRecord(ctx context.Context, key string, rec *SpaceR
 	})
 }
 
-// buildProgressFromRecord converts the persistent record into the API response.
-func buildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse {
+// rebuildProgressFromRecord converts the persistent record into the API response.
+func rebuildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse {
 	resp := &RebuildProgressResponse{
 		SpaceKey:       rec.SpaceKey(),
 		Status:         rec.Status,
-		TotalTasks:     rec.TotalReplicas,
-		CompletedTasks: rec.CompletedReplicas,
-		FailedTasks:    rec.FailedReplicas,
+		TotalTasks:     rec.TotalTasks,
+		CompletedTasks: rec.CompletedTasks,
+		FailedTasks:    rec.FailedTasks,
 		ErrorMsg:       rec.ErrorMsg,
 		EnqueuedAt:     rec.EnqueuedAt,
 		StartedAt:      rec.StartedAt,
@@ -551,31 +515,24 @@ func buildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse {
 	}
 	// Build task counts and weighted progress.
 	progressSum := 0
-	progressCount := 0
 	for _, t := range rec.Tasks {
 		switch t.Status {
-		case entity.PSRebuildTaskStatusRunning:
+		case entity.RebuildStatusRunning:
 			if t.Dispatched {
 				resp.RunningTasks++
 			} else {
 				resp.PendingTasks++
 			}
-		case entity.PSRebuildTaskStatusCompleted:
+			progressSum += t.Progress
+		case entity.RebuildStatusCompleted:
 			progressSum += 100
-			progressCount++
-			continue
-		case entity.PSRebuildTaskStatusFailed:
-			// Failed tasks are accounted for separately.
-			continue
+		case entity.RebuildStatusFailed:
+			// No progress contribution; the failure is reflected in FailedTasks.
 		}
-		progressSum += t.Progress
-		progressCount++
 	}
 	if resp.TotalTasks > 0 {
 		resp.SuccessRatio = float64(resp.CompletedTasks) / float64(resp.TotalTasks)
-	}
-	// Divide by TotalTasks so failed replicas lower overall progress.
-	if resp.TotalTasks > 0 {
+		// Divide by TotalTasks so failed replicas lower overall progress.
 		resp.OverallPercent = progressSum / resp.TotalTasks
 		if resp.OverallPercent > 100 {
 			resp.OverallPercent = 100
@@ -588,8 +545,9 @@ func buildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse {
 // Pre-flight helpers
 // ---------------------------------------------------------------------------
 
-// resolveRebuildPartitions returns the target partitions for a rebuild request.
-func resolveRebuildPartitions(space *entity.Space, partitionID uint32) ([]*entity.Partition, error) {
+// selectPartitions returns the target partitions from a space:
+// partitionID=0 selects all partitions; otherwise the one matching id.
+func selectPartitions(space *entity.Space, partitionID uint32) ([]*entity.Partition, error) {
 	if len(space.Partitions) == 0 {
 		return nil, fmt.Errorf("space %s has no partitions", space.Name)
 	}
@@ -772,53 +730,59 @@ func (sc *RebuildScheduler) tick() {
 		records = append(records, rec)
 	}
 
-	// 1. Build global PS occupancy from currently-running records.
-	psBusy := make(map[entity.NodeID]string) // nodeID -> spaceKey
+	// Global invariant (INV-0): at most one running rebuild record cluster-wide.
+	// Phase 1 advances all currently-running records (may be >1 during an
+	// upgrade window that carried over the old parallel scheduler); Phase 2
+	// admits a new pending record only when Phase 1 leaves the cluster idle.
+	// In-record serialism (one task per PS, one replica per partition) is
+	// still enforced inside dispatchPending().
+
+	// Phase 1: advance every running record (poll / dispatch / finalize).
+	runningCount := 0
 	for _, rec := range records {
-		if rec.Status != RebuildStatusRunning {
-			continue
+		if rec.Status == entity.RebuildStatusRunning {
+			runningCount++
 		}
-		for _, t := range rec.Tasks {
-			if isReplicaTerminal(t.Status) {
-				continue
-			}
-			psBusy[t.NodeID] = rec.SpaceKey()
+	}
+	if runningCount > 1 {
+		log.Warn("rebuild scheduler observed %d running records; expected <=1 (INV-0)", runningCount)
+	}
+	for _, rec := range records {
+		if rec.Status == entity.RebuildStatusRunning {
+			sc.advanceRunningRecord(ctx, rec)
 		}
 	}
 
-	// 2. Process running records first (advance dispatch / poll / finalize).
+	// Phase 2: at most one pending admission per tick, and only when
+	// nothing is running after Phase 1. reconcileRunning may have moved
+	// records to terminal / pending states, so re-check rec.Status here.
 	for _, rec := range records {
-		if rec.Status == RebuildStatusRunning {
-			sc.reconcileRunning(ctx, rec, psBusy)
+		if rec.Status == entity.RebuildStatusRunning {
+			return
 		}
 	}
-
-	// 3. Then admit pending records in FIFO order, respecting PS occupancy.
 	pending := make([]*SpaceRebuildRecord, 0)
 	for _, rec := range records {
-		if rec.Status == RebuildStatusPending {
+		if rec.Status == entity.RebuildStatusPending {
 			pending = append(pending, rec)
 		}
+	}
+	if len(pending) == 0 {
+		return
 	}
 	sort.Slice(pending, func(i, j int) bool {
 		return pending[i].EnqueuedAt.Before(pending[j].EnqueuedAt)
 	})
-	for _, rec := range pending {
-		sc.reconcilePending(ctx, rec, psBusy)
-	}
-}
-
-// isReplicaTerminal reports whether a replica task is done.
-func isReplicaTerminal(st entity.PSRebuildTaskStatus) bool {
-	return st == entity.PSRebuildTaskStatusCompleted || st == entity.PSRebuildTaskStatusFailed
+	sc.admitPending(ctx, pending[0])
 }
 
 // ---------------------------------------------------------------------------
-// reconcilePending: admit a pending space if all required PS are free.
+// admitPending: transition one pending record to running. Caller (tick)
+// guarantees no other running record exists (INV-0).
 // ---------------------------------------------------------------------------
 
-func (sc *RebuildScheduler) reconcilePending(ctx context.Context,
-	rec *SpaceRebuildRecord, psBusy map[entity.NodeID]string) {
+func (sc *RebuildScheduler) admitPending(ctx context.Context,
+	rec *SpaceRebuildRecord) {
 
 	mc := sc.client.Master()
 
@@ -830,7 +794,7 @@ func (sc *RebuildScheduler) reconcilePending(ctx context.Context,
 	space, err := mc.QuerySpaceByName(ctx, dbID, rec.SpaceName)
 	if err != nil || space == nil {
 		log.Warn("pending %s: space gone, dropping record", rec.SpaceKey())
-		rec.Status = RebuildStatusFailed
+		rec.Status = entity.RebuildStatusFailed
 		rec.ErrorMsg = "space not found"
 		rec.FinishedAt = time.Now()
 		_ = sc.persistRecord(ctx, rec)
@@ -838,89 +802,49 @@ func (sc *RebuildScheduler) reconcilePending(ctx context.Context,
 	}
 
 	// Resolve target partitions.
-	var partitions []*entity.Partition
-	if rec.PartitionID > 0 {
-		for _, p := range space.Partitions {
-			if p.Id == entity.PartitionID(rec.PartitionID) {
-				partitions = []*entity.Partition{p}
-				break
-			}
-		}
-		if len(partitions) == 0 {
-			log.Warn("pending %s: partition %d gone, marking as failed", rec.SpaceKey(), rec.PartitionID)
-			rec.Status = RebuildStatusFailed
-			rec.ErrorMsg = fmt.Sprintf("partition %d not found", rec.PartitionID)
-			rec.FinishedAt = time.Now()
-			_ = sc.persistRecord(ctx, rec)
-			return
-		}
-	} else {
-		partitions = space.Partitions
+	partitions, err := selectPartitions(space, rec.PartitionID)
+	if err != nil {
+		log.Warn("pending %s: %v, marking as failed", rec.SpaceKey(), err)
+		rec.Status = entity.RebuildStatusFailed
+		rec.ErrorMsg = err.Error()
+		rec.FinishedAt = time.Now()
+		_ = sc.persistRecord(ctx, rec)
+		return
 	}
 
 	// Build the candidate task plan.
-	tasks := make([]*PartitionRebuildTask, 0)
-	psSet := make(map[entity.NodeID]struct{})
+	tasks := make([]*RebuildTask, 0)
 	// All tasks in this pass rebuild the current target index name.
 	target := rec.CurrentTarget()
 	if target == "" {
 		log.Warn("pending %s: no current rebuild target (Indexes=%v, Idx=%d), marking as failed",
 			rec.SpaceKey(), rec.Indexes, rec.CurrentIndexIdx)
-		rec.Status = RebuildStatusFailed
+		rec.Status = entity.RebuildStatusFailed
 		rec.ErrorMsg = fmt.Sprintf("no current rebuild target (Indexes=%v, Idx=%d)", rec.Indexes, rec.CurrentIndexIdx)
 		rec.FinishedAt = time.Now()
 		_ = sc.persistRecord(ctx, rec)
 		return
 	}
 	for _, p := range partitions {
-		for replicaIdx, nodeID := range p.Replicas {
-			server, qerr := mc.QueryServer(ctx, nodeID)
-			if qerr != nil || server == nil {
-				log.Warn("pending %s: skip replica nodeID=%d: %v",
-					rec.SpaceKey(), nodeID, qerr)
-				continue
-			}
-			tasks = append(tasks, &PartitionRebuildTask{
-				PartitionID:  p.Id,
-				NodeID:       nodeID,
-				ReplicaIndex: replicaIdx,
-				PSNodeAddr:   server.RpcAddr(),
-				SpaceKey:     rec.SpaceKey(),
-				TaskType:     "rebuild",
-				IndexName:    target,
-				// Running + Dispatched=false means planned but not sent.
-				Status:     entity.PSRebuildTaskStatusRunning,
-				DropBefore: rec.DropBefore,
-				LimitCPU:   rec.LimitCPU,
-				Describe:   rec.Describe,
-				MaxRetries: rec.MaxRetries,
-			})
-			psSet[nodeID] = struct{}{}
-		}
+		tasks = append(tasks, sc.buildReplicaTasks(ctx, rec, p, target, rec.DropBefore)...)
 	}
 	if len(tasks) == 0 {
 		log.Warn("pending %s: no replicas resolved, marking as failed", rec.SpaceKey())
-		rec.Status = RebuildStatusFailed
+		rec.Status = entity.RebuildStatusFailed
 		rec.ErrorMsg = "no replicas resolved for rebuild"
 		rec.FinishedAt = time.Now()
 		_ = sc.persistRecord(ctx, rec)
 		return
 	}
 
-	// Check PS occupancy: must wait if any required PS is busy.
-	for ps := range psSet {
-		if owner, busy := psBusy[ps]; busy {
-			log.Debug("pending %s: PS %d busy by %s, wait", rec.SpaceKey(), ps, owner)
-			return
-		}
-	}
-
 	// Admit: transition pending -> running and attach the task plan.
-	rec.Status = RebuildStatusRunning
+	// Cross-space PS occupancy is no longer checked (INV-0 is enforced
+	// by the tick-level check that no other record is running).
+	rec.Status = entity.RebuildStatusRunning
 	rec.StartedAt = time.Now()
-	rec.TotalReplicas = len(tasks)
-	rec.CompletedReplicas = 0
-	rec.FailedReplicas = 0
+	rec.TotalTasks = len(tasks)
+	rec.CompletedTasks = 0
+	rec.FailedTasks = 0
 	rec.Tasks = tasks
 
 	// Persist running before dispatch so crash recovery is idempotent.
@@ -934,16 +858,7 @@ func (sc *RebuildScheduler) reconcilePending(ctx context.Context,
 		log.Info("space %s not admitted (status changed before CAS, likely cancelled)", rec.SpaceKey())
 		return
 	}
-
-	// Reserve PSs for this tick — only after CAS succeeds; a failed CAS
-	// (e.g. record cancelled between plan and admit) would otherwise
-	// leave stale psBusy entries for the rest of this tick and block
-	// unrelated pending records.
-	for ps := range psSet {
-		psBusy[ps] = rec.SpaceKey()
-	}
-	log.Info("space %s admitted, ps=%d totalReplicas=%d",
-		rec.SpaceKey(), len(psSet), len(tasks))
+	log.Info("space %s admitted, totalReplicas=%d", rec.SpaceKey(), len(tasks))
 
 	// Dispatch initial tasks in this tick.
 	sc.dispatchPending(ctx, rec)
@@ -959,14 +874,14 @@ func (sc *RebuildScheduler) reconcilePending(ctx context.Context,
 // finalize the space if all tasks are terminal.
 // ---------------------------------------------------------------------------
 
-func (sc *RebuildScheduler) reconcileRunning(ctx context.Context,
-	rec *SpaceRebuildRecord, psBusy map[entity.NodeID]string) {
+func (sc *RebuildScheduler) advanceRunningRecord(ctx context.Context,
+	rec *SpaceRebuildRecord) {
 
 	dirty := false
 
 	// (a) Poll dispatched-but-not-terminal tasks.
 	for _, t := range rec.Tasks {
-		if !t.Dispatched || isReplicaTerminal(t.Status) {
+		if !t.Dispatched || t.Status.IsTerminal() {
 			continue
 		}
 		resp, err := client.GetRebuildStatus(t.PSNodeAddr, rec.SpaceKey(),
@@ -980,7 +895,7 @@ func (sc *RebuildScheduler) reconcileRunning(ctx context.Context,
 				t.PollFailureStreak, maxPollFailureStreak, err)
 			// Stop polling forever once the failure streak crosses the budget.
 			if t.PollFailureStreak >= maxPollFailureStreak {
-				markReplicaFailed(t,
+				sc.handleReplicaFailure(rec, t,
 					fmt.Sprintf("GetRebuildStatus failed %d consecutive times: %v",
 						t.PollFailureStreak, err))
 			}
@@ -993,18 +908,19 @@ func (sc *RebuildScheduler) reconcileRunning(ctx context.Context,
 		}
 
 		if !resp.Exists {
-			// Missing PS task is terminal; finalize decides whether to retry.
-			markReplicaFailed(t,
-				fmt.Sprintf("ps reports task missing (pid=%d, nodeID=%d); partition will be retried by scheduler",
+			// Missing PS task is terminal; handleReplicaFailure decides
+			// whether to retry in place or cancel siblings.
+			sc.handleReplicaFailure(rec, t,
+				fmt.Sprintf("ps reports task missing (pid=%d, nodeID=%d)",
 					t.PartitionID, t.NodeID))
 			dirty = true
 			continue
 		}
 
 		switch resp.Status {
-		case PSRebuildTaskStatusRunning:
-			if t.Status != entity.PSRebuildTaskStatusRunning {
-				t.Status = entity.PSRebuildTaskStatusRunning
+		case entity.RebuildStatusRunning:
+			if t.Status != entity.RebuildStatusRunning {
+				t.Status = entity.RebuildStatusRunning
 				dirty = true
 			}
 			if resp.Progress != t.Progress {
@@ -1014,16 +930,16 @@ func (sc *RebuildScheduler) reconcileRunning(ctx context.Context,
 					dirty = true
 				}
 			}
-		case PSRebuildTaskStatusCompleted:
-			t.Status = entity.PSRebuildTaskStatusCompleted
+		case entity.RebuildStatusCompleted:
+			t.Status = entity.RebuildStatusCompleted
 			t.CompleteTime = time.Now()
 			t.Progress = 100
 			dirty = true
-		case PSRebuildTaskStatusFailed:
-			markReplicaFailed(t, resp.ErrorMessage)
+		case entity.RebuildStatusFailed:
+			sc.handleReplicaFailure(rec, t, resp.ErrorMessage)
 			dirty = true
 		default:
-			log.Warn("unknown PS rebuild status %d for %s pid=%d",
+			log.Warn("unknown PS rebuild status %q for %s pid=%d",
 				resp.Status, rec.SpaceKey(), t.PartitionID)
 		}
 	}
@@ -1036,8 +952,9 @@ func (sc *RebuildScheduler) reconcileRunning(ctx context.Context,
 	// Clear Rebuilding markers for terminal tasks.
 	sc.unmarkRebuildingForTerminalTasks(ctx, rec)
 
-	// (c) Recompute counters; release psBusy slots that are now drained.
-	sc.recountAndReleasePS(rec, psBusy)
+	// (c) Recompute counters. Cross-record PS occupancy no longer exists;
+	// INV-0 guarantees this record is the only running one.
+	sc.recountTaskCounters(rec)
 
 	// (d) Persist if anything changed.
 	if dirty {
@@ -1050,40 +967,34 @@ func (sc *RebuildScheduler) reconcileRunning(ctx context.Context,
 	// (e) Finalize if all replicas are terminal.
 	allTerminal := true
 	for _, t := range rec.Tasks {
-		if !isReplicaTerminal(t.Status) {
+		if !t.Status.IsTerminal() {
 			allTerminal = false
 			break
 		}
 	}
 	if allTerminal {
-		sc.finalize(ctx, rec, psBusy)
+		sc.finalize(ctx, rec)
 	}
 }
 
-// dispatchPending sends pending tasks while preserving PS and partition serialism.
+// dispatchPending sends pending tasks one at a time. Within a record, tasks
+// run strictly serially: the next task is dispatched only after every
+// previously-dispatched task has reached a terminal state. This is enforced
+// on top of INV-0 (one running record cluster-wide), giving the whole
+// scheduler a single active task at any moment.
 func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebuildRecord) bool {
 	_ = ctx
-	// Active PSs already have a dispatched non-terminal task.
-	active := make(map[entity.NodeID]bool)
-	// Active partitions rebuild one replica at a time.
-	activePartition := make(map[entity.PartitionID]bool)
+	// If any task in this record is already in flight, don't dispatch more.
 	for _, t := range rec.Tasks {
-		if t.Dispatched && !isReplicaTerminal(t.Status) {
-			active[t.NodeID] = true
-			activePartition[t.PartitionID] = true
+		if t.Dispatched && !t.Status.IsTerminal() {
+			return false
 		}
 	}
 
 	dirty := false
 	for _, t := range rec.Tasks {
-		if t.Dispatched || isReplicaTerminal(t.Status) {
+		if t.Dispatched || t.Status.IsTerminal() {
 			continue
-		}
-		if active[t.NodeID] {
-			continue // serialize on this PS
-		}
-		if activePartition[t.PartitionID] {
-			continue // one replica at a time per partition
 		}
 
 		t.DispatchAttempts++
@@ -1094,26 +1005,27 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 			t.DropBefore, t.LimitCPU, t.Describe)
 		if err != nil {
 			// Retry transient dispatch failures before failing the replica.
-			t.LastErrorMsg = err.Error()
+			t.ErrorMessage = err.Error()
 			dirty = true
 			if t.DispatchAttempts >= maxDispatchAttempts {
 				log.Error("ExecuteRebuildIndex %s pid=%d nodeID=%d gave up after %d attempts: %v",
 					rec.SpaceKey(), t.PartitionID, t.NodeID, t.DispatchAttempts, err)
-				markReplicaFailed(t,
+				sc.handleReplicaFailure(rec, t,
 					fmt.Sprintf("ExecuteRebuildIndex failed %d times: %v",
 						t.DispatchAttempts, err))
+				// If handleReplicaFailure decided to retry in place, keep
+				// scanning so we can dispatch a different task this tick;
+				// otherwise the task is terminal (Failed) and we also move on.
 				continue
 			}
 			log.Warn("ExecuteRebuildIndex %s pid=%d nodeID=%d failed (attempt=%d/%d), will retry: %v",
 				rec.SpaceKey(), t.PartitionID, t.NodeID,
 				t.DispatchAttempts, maxDispatchAttempts, err)
-			// Keep Dispatched=false so other PSs can still make progress.
-			continue
+			// Non-terminal transient failure: retry this same task next tick.
+			return dirty
 		}
 		t.Dispatched = true
-		t.Status = entity.PSRebuildTaskStatusRunning
-		active[t.NodeID] = true
-		activePartition[t.PartitionID] = true
+		t.Status = entity.RebuildStatusRunning
 		dirty = true
 		log.Info("rebuild dispatched: space=%s pid=%d nodeID=%d (attempt=%d)",
 			rec.SpaceKey(), t.PartitionID, t.NodeID, t.DispatchAttempts)
@@ -1122,46 +1034,95 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 			log.Warn("markReplicaRebuilding(rebuilding) failed for pid=%d nodeID=%d: %v",
 				t.PartitionID, t.NodeID, err)
 		}
+		// Strict serialism: at most one live task at any moment.
+		return dirty
 	}
 	return dirty
 }
 
-// recountAndReleasePS refreshes counters and frees drained PS slots.
-
-func (sc *RebuildScheduler) recountAndReleasePS(rec *SpaceRebuildRecord, psBusy map[entity.NodeID]string) {
+// recountTaskCounters refreshes Total / Completed / Failed from rec.Tasks.
+// Called after any mutation of rec.Tasks (dispatch, poll result, replan);
+// TotalReplicas may change when finalize replans a partition with a different
+// live-replica count.
+func (sc *RebuildScheduler) recountTaskCounters(rec *SpaceRebuildRecord) {
 	completed, failed := 0, 0
-	stillBusy := make(map[entity.NodeID]struct{})
 	for _, t := range rec.Tasks {
 		switch t.Status {
-		case entity.PSRebuildTaskStatusCompleted:
+		case entity.RebuildStatusCompleted:
 			completed++
-		case entity.PSRebuildTaskStatusFailed:
+		case entity.RebuildStatusFailed:
 			failed++
-		default:
-			// Non-terminal tasks keep their PS occupied.
-			stillBusy[t.NodeID] = struct{}{}
 		}
 	}
-	rec.CompletedReplicas = completed
-	rec.FailedReplicas = failed
-
-	// Release PSs no longer busy for this record.
-	spaceKey := rec.SpaceKey()
-	for nodeID, owner := range psBusy {
-		if owner != spaceKey {
-			continue
-		}
-		if _, busy := stillBusy[nodeID]; !busy {
-			delete(psBusy, nodeID)
-		}
-	}
+	rec.TotalTasks = len(rec.Tasks)
+	rec.CompletedTasks = completed
+	rec.FailedTasks = failed
 }
 
 // markReplicaFailed sets a per-replica task to terminal failed state.
-func markReplicaFailed(t *PartitionRebuildTask, msg string) {
-	t.Status = entity.PSRebuildTaskStatusFailed
-	t.LastErrorMsg = msg
+func markReplicaFailed(t *RebuildTask, msg string) {
+	t.Status = entity.RebuildStatusFailed
+	t.ErrorMessage = msg
 	t.CompleteTime = time.Now()
+}
+
+// handleReplicaFailure is the single decision point when a replica task
+// hits a failure signal (poll streak exceeded, PS reports task missing,
+// PS reports Failed, or dispatch RPC gave up).
+//
+// Behavior:
+//   - If the partition still has retry budget (PartitionRetries[pid] <
+//     MaxRetries), the task is reset in place (same nodeID, DropBefore
+//     forced to 0 so retries never re-drop the index) and PartitionRetries
+//     is incremented; the next dispatchPending pass will send it again.
+//   - Otherwise the task is marked Failed, and every other task on the
+//     same partition that has not yet been dispatched is Cancelled. This
+//     preserves at least one un-rebuilt replica per partition so the
+//     partition stays queryable; those replicas can be recovered by a
+//     future rebuild request.
+func (sc *RebuildScheduler) handleReplicaFailure(rec *SpaceRebuildRecord,
+	t *RebuildTask, msg string) {
+	if rec.PartitionRetries == nil {
+		rec.PartitionRetries = map[entity.PartitionID]int{}
+	}
+	if rec.PartitionRetries[t.PartitionID] < rec.MaxRetries {
+		rec.PartitionRetries[t.PartitionID]++
+		t.Dispatched = false
+		t.Status = entity.RebuildStatusRunning
+		t.Progress = 0
+		t.ErrorMessage = ""
+		t.DispatchAttempts = 0
+		t.PollFailureStreak = 0
+		// Retries must not drop existing index data again.
+		t.DropBefore = 0
+		t.StartTime = time.Time{}
+		t.CompleteTime = time.Time{}
+		log.Info("replica in-place retry: space=%s pid=%d nodeID=%d retry=%d/%d reason=%q",
+			rec.SpaceKey(), t.PartitionID, t.NodeID,
+			rec.PartitionRetries[t.PartitionID], rec.MaxRetries, msg)
+		return
+	}
+	// Retry budget exhausted for this partition.
+	markReplicaFailed(t, msg)
+	cancelled := 0
+	for _, sib := range rec.Tasks {
+		if sib == t || sib.PartitionID != t.PartitionID {
+			continue
+		}
+		if sib.Dispatched || sib.Status.IsTerminal() {
+			continue
+		}
+		sib.Status = entity.RebuildStatusCancelled
+		sib.ErrorMessage = fmt.Sprintf(
+			"skipped: sibling replica nodeID=%d exhausted retries; preserving remaining replicas of partition %d",
+			t.NodeID, t.PartitionID)
+		sib.CompleteTime = time.Now()
+		cancelled++
+	}
+	if cancelled > 0 {
+		log.Info("replica retry exhausted: space=%s pid=%d failed nodeID=%d; cancelled %d sibling replica task(s) to keep partition available",
+			rec.SpaceKey(), t.PartitionID, t.NodeID, cancelled)
+	}
 }
 
 // markReplicaRebuilding toggles the router-visible Rebuilding marker.
@@ -1212,7 +1173,7 @@ func (sc *RebuildScheduler) markReplicaRebuilding(ctx context.Context,
 func (sc *RebuildScheduler) unmarkRebuildingForTerminalTasks(
 	ctx context.Context, rec *SpaceRebuildRecord) {
 	for _, t := range rec.Tasks {
-		if !t.Dispatched || !isReplicaTerminal(t.Status) {
+		if !t.Dispatched || !t.Status.IsTerminal() {
 			continue
 		}
 		if err := sc.markReplicaRebuilding(ctx, t.PartitionID, t.NodeID, false); err != nil {
@@ -1225,218 +1186,167 @@ func (sc *RebuildScheduler) unmarkRebuildingForTerminalTasks(
 // ---------------------------------------------------------------------------
 // finalize: handle a record where every replica task is terminal.
 // ---------------------------------------------------------------------------
-
-func (sc *RebuildScheduler) finalize(ctx context.Context, rec *SpaceRebuildRecord, psBusy map[entity.NodeID]string) {
+func (sc *RebuildScheduler) finalize(ctx context.Context, rec *SpaceRebuildRecord) {
 	spaceKey := rec.SpaceKey()
 	// Final safety sweep for stale Rebuilding markers.
 	sc.unmarkRebuildingForTerminalTasks(ctx, rec)
 
-	// Do not release psBusy until we know no partition retry will reuse it.
-
-	// Phase 1: retry only failed partitions that still have budget.
-	if rec.PartitionRetries == nil {
-		rec.PartitionRetries = map[entity.PartitionID]int{}
-	}
-	byPartition := map[entity.PartitionID][]*PartitionRebuildTask{}
+	// Count terminal categories for the current target.
+	completed, failed, cancelled := 0, 0, 0
 	for _, t := range rec.Tasks {
-		byPartition[t.PartitionID] = append(byPartition[t.PartitionID], t)
-	}
-
-	requeuedAny := false
-	for pid, group := range byPartition {
-		anyFailed := false
-		for _, t := range group {
-			if t.Status == entity.PSRebuildTaskStatusFailed {
-				anyFailed = true
-				break
-			}
-		}
-		if !anyFailed {
-			continue
-		}
-		if rec.PartitionRetries[pid] >= rec.MaxRetries {
-			log.Info("partition %d in space %s exhausted retries (%d/%d), keeping failed",
-				pid, spaceKey, rec.PartitionRetries[pid], rec.MaxRetries)
-			continue
-		}
-		newTasks, err := sc.replanPartitionTasks(ctx, rec, pid)
-		if err != nil {
-			// Keep this partition failed if it cannot be replanned.
-			log.Warn("partition %d in space %s replan failed: %v — leaving failed", pid, spaceKey, err)
-			continue
-		}
-		if len(newTasks) == 0 {
-			log.Warn("partition %d in space %s yielded no live replicas — leaving failed", pid, spaceKey)
-			continue
-		}
-		// Replace this partition's tasks; next tick dispatches them.
-		rec.Tasks = replacePartitionTasks(rec.Tasks, pid, newTasks)
-		rec.PartitionRetries[pid]++
-		requeuedAny = true
-		log.Info("partition %d in space %s requeued for retry %d/%d (%d replicas)",
-			pid, spaceKey, rec.PartitionRetries[pid], rec.MaxRetries, len(newTasks))
-	}
-
-	// Recompute counters after retry replanning.
-	sc.recountRecord(rec)
-
-	if requeuedAny {
-		// Re-assert PS occupancy for replanned running tasks.
-		for _, t := range rec.Tasks {
-			if !isReplicaTerminal(t.Status) {
-				psBusy[t.NodeID] = spaceKey
-			}
-		}
-		// RetryCount mirrors the deepest partition retry depth.
-		rec.Status = RebuildStatusRunning
-		rec.RetryCount = maxPartitionRetry(rec.PartitionRetries)
-		rec.ErrorMsg = fmt.Sprintf("partition-level retry in progress (depth=%d/%d)",
-			rec.RetryCount, rec.MaxRetries)
-		if err := sc.persistRecord(ctx, rec); err != nil {
-			log.Error("persist partition-retry record %s: %v", spaceKey, err)
-		}
-		return
-	}
-
-	// No retry remains; release PS slots owned by this record.
-	for nodeID, owner := range psBusy {
-		if owner == spaceKey {
-			delete(psBusy, nodeID)
+		switch t.Status {
+		case entity.RebuildStatusCompleted:
+			completed++
+		case entity.RebuildStatusFailed:
+			failed++
+		case entity.RebuildStatusCancelled:
+			cancelled++
 		}
 	}
+	total := len(rec.Tasks)
 
-	// Phase 2: finish this target, then advance or mark terminal.
-	failed := rec.FailedReplicas
-	completed := rec.CompletedReplicas
-	total := rec.TotalReplicas
+	// If this target had zero failures and more index targets remain, advance
+	// in place: keep Status=Running, build the next target's tasks now, so
+	// the same space keeps its scheduler slot across the whole Indexes list
+	// without yielding to other pending records.
 	if failed == 0 && rec.HasMoreTargets() {
 		previousTarget := rec.CurrentTarget()
-		rec.CurrentIndexIdx++
-		nextTarget := rec.CurrentTarget()
-		rec.Status = RebuildStatusPending
-		rec.Tasks = nil
-		rec.PartitionRetries = nil
-		rec.RetryCount = 0
-		rec.TotalReplicas = 0
-		rec.CompletedReplicas = 0
-		rec.FailedReplicas = 0
-		rec.ErrorMsg = ""
-		// Requeue fairly against other pending records.
-		rec.EnqueuedAt = time.Now()
+		if err := sc.prepareNextTarget(ctx, rec); err != nil {
+			// Cannot plan the next target: fall through to terminal path.
+			log.Error("space %s advance target failed: %v — marking record failed", spaceKey, err)
+			rec.Status = entity.RebuildStatusFailed
+			rec.ErrorMsg = fmt.Sprintf("advance to next target: %v", err)
+			rec.FinishedAt = time.Now()
+			if perr := sc.persistRecord(ctx, rec); perr != nil {
+				log.Error("persist failed advance %s: %v", spaceKey, perr)
+			}
+			return
+		}
 		if err := sc.persistRecord(ctx, rec); err != nil {
 			log.Error("persist next-target advance %s: %v", spaceKey, err)
 			return
 		}
-		log.Info("space %s advanced rebuild target: %s -> %s (%d/%d targets done)",
-			spaceKey, previousTarget, nextTarget, rec.CurrentIndexIdx, len(rec.Indexes))
+		log.Info("space %s advanced rebuild target: %s -> %s (%d/%d targets done, cancelled=%d completed=%d)",
+			spaceKey, previousTarget, rec.CurrentTarget(),
+			rec.CurrentIndexIdx, len(rec.Indexes), cancelled, completed)
 		return
 	}
 
-	finalStatus := RebuildStatusCompleted
+	// Terminal state.
+	//   FailedTasks > 0                       → Failed
+	//   FailedTasks == 0 && completed > 0     → Completed (Cancelled tasks
+	//                                            are treated as "user asked
+	//                                            to stop that piece"; the
+	//                                            rebuild as a whole succeeded
+	//                                            for what actually ran)
+	//   FailedTasks == 0 && completed == 0    → Cancelled (nothing ran)
+	finalStatus := entity.RebuildStatusCompleted
 	finalErr := ""
-	if failed > 0 {
-		finalStatus = RebuildStatusFailed
-		finalErr = fmt.Sprintf("%d/%d replicas failed on target %s (max partition retry %d)",
-			failed, total, rec.CurrentTarget(), maxPartitionRetry(rec.PartitionRetries))
+	switch {
+	case failed > 0:
+		finalStatus = entity.RebuildStatusFailed
+		finalErr = fmt.Sprintf("%d/%d replicas failed on target %s (max partition retry %d/%d)",
+			failed, total, rec.CurrentTarget(),
+			maxPartitionRetry(rec.PartitionRetries), rec.MaxRetries)
+	case completed == 0 && cancelled > 0:
+		finalStatus = entity.RebuildStatusCancelled
+		finalErr = fmt.Sprintf("all %d tasks cancelled before completion on target %s",
+			cancelled, rec.CurrentTarget())
 	}
-	// Keep terminal records so the last result remains queryable.
+
 	rec.Status = finalStatus
 	rec.ErrorMsg = finalErr
 	rec.FinishedAt = time.Now()
 	if err := sc.persistRecord(ctx, rec); err != nil {
 		log.Error("persist finalized record %s: %v", spaceKey, err)
 	}
-	log.Info("space %s finalized: status=%s completed=%d failed=%d retry=%d targets=%d/%d err=%q",
-		spaceKey, finalStatus, completed, failed, maxPartitionRetry(rec.PartitionRetries),
+	log.Info("space %s finalized: status=%s completed=%d failed=%d cancelled=%d retry=%d targets=%d/%d err=%q",
+		spaceKey, finalStatus, completed, failed, cancelled,
+		maxPartitionRetry(rec.PartitionRetries),
 		rec.CurrentIndexIdx+1, len(rec.Indexes), finalErr)
 }
 
-// replanPartitionTasks rebuilds one partition's task plan from current metadata.
-func (sc *RebuildScheduler) replanPartitionTasks(ctx context.Context,
-	rec *SpaceRebuildRecord, pid entity.PartitionID) ([]*PartitionRebuildTask, error) {
+// prepareNextTarget advances rec.CurrentIndexIdx and rebuilds rec.Tasks for
+// the new target from live space metadata. On return the record is ready
+// for the next advanceRunningRecord tick to dispatch. Status is left as
+// Running so the record never yields its scheduler slot between targets.
+func (sc *RebuildScheduler) prepareNextTarget(ctx context.Context,
+	rec *SpaceRebuildRecord) error {
 
 	mc := sc.client.Master()
 	dbID, err := mc.QueryDBName2ID(ctx, rec.DBName)
 	if err != nil {
-		return nil, fmt.Errorf("query db: %v", err)
+		return fmt.Errorf("query db: %v", err)
 	}
 	space, err := mc.QuerySpaceByName(ctx, dbID, rec.SpaceName)
 	if err != nil || space == nil {
-		return nil, fmt.Errorf("space gone: %v", err)
+		return fmt.Errorf("space gone: %v", err)
 	}
-	var part *entity.Partition
-	for _, p := range space.Partitions {
-		if p.Id == pid {
-			part = p
-			break
-		}
+	partitions, err := selectPartitions(space, rec.PartitionID)
+	if err != nil {
+		return err
 	}
-	if part == nil {
-		return nil, fmt.Errorf("partition %d not in space", pid)
-	}
-	out := make([]*PartitionRebuildTask, 0, len(part.Replicas))
+
+	rec.CurrentIndexIdx++
 	target := rec.CurrentTarget()
+	if target == "" {
+		return fmt.Errorf("no target at index %d (Indexes=%v)", rec.CurrentIndexIdx, rec.Indexes)
+	}
+
+	tasks := make([]*RebuildTask, 0)
+	for _, p := range partitions {
+		// dropBefore=0: once the initial target has been rebuilt, subsequent
+		// targets on the same space must never re-drop, same as retries.
+		tasks = append(tasks, sc.buildReplicaTasks(ctx, rec, p, target, 0)...)
+	}
+	if len(tasks) == 0 {
+		return fmt.Errorf("no replicas resolved for target %s", target)
+	}
+
+	rec.Tasks = tasks
+	rec.PartitionRetries = nil
+	rec.RetryCount = 0
+	rec.TotalTasks = len(tasks)
+	rec.CompletedTasks = 0
+	rec.FailedTasks = 0
+	rec.ErrorMsg = ""
+	// rec.Status stays Running; rec.StartedAt stays as the whole-record start.
+	return nil
+}
+
+// buildReplicaTasks expands one partition into a RebuildTask per live
+// replica. Replicas whose PS server metadata cannot be resolved are
+// skipped (logged). dropBefore is passed separately because retries force
+// dropBefore=0 even when the record's DropBefore=1 (retrying must never
+// re-drop the index).
+func (sc *RebuildScheduler) buildReplicaTasks(ctx context.Context,
+	rec *SpaceRebuildRecord, part *entity.Partition, target string,
+	dropBefore int) []*RebuildTask {
+
+	mc := sc.client.Master()
+	out := make([]*RebuildTask, 0, len(part.Replicas))
 	for replicaIdx, nodeID := range part.Replicas {
 		server, qerr := mc.QueryServer(ctx, nodeID)
 		if qerr != nil || server == nil {
-			log.Warn("replan partition %d: skip replica nodeID=%d: %v", pid, nodeID, qerr)
+			log.Warn("%s partition %d: skip replica nodeID=%d: %v",
+				rec.SpaceKey(), part.Id, nodeID, qerr)
 			continue
 		}
-		out = append(out, &PartitionRebuildTask{
-			PartitionID:  pid,
+		out = append(out, &RebuildTask{
+			PartitionID:  part.Id,
 			NodeID:       nodeID,
 			ReplicaIndex: replicaIdx,
 			PSNodeAddr:   server.RpcAddr(),
 			SpaceKey:     rec.SpaceKey(),
-			TaskType:     "rebuild",
 			IndexName:    target,
-			Status:       entity.PSRebuildTaskStatusRunning,
-			// Retries must not drop existing index data again.
-			DropBefore: 0,
+			// Running + Dispatched=false means planned but not sent.
+			Status:     entity.RebuildStatusRunning,
+			DropBefore: dropBefore,
 			LimitCPU:   rec.LimitCPU,
 			Describe:   rec.Describe,
-			MaxRetries: rec.MaxRetries,
 		})
 	}
-	return out, nil
-}
-
-// replacePartitionTasks swaps one partition's tasks for newGroup.
-func replacePartitionTasks(all []*PartitionRebuildTask, pid entity.PartitionID,
-	newGroup []*PartitionRebuildTask) []*PartitionRebuildTask {
-
-	out := make([]*PartitionRebuildTask, 0, len(all)-1+len(newGroup))
-	inserted := false
-	for _, t := range all {
-		if t.PartitionID == pid {
-			if !inserted {
-				out = append(out, newGroup...)
-				inserted = true
-			}
-			continue
-		}
-		out = append(out, t)
-	}
-	if !inserted {
-		out = append(out, newGroup...)
-	}
 	return out
-}
-
-// recountRecord refreshes replica counters from rec.Tasks.
-func (sc *RebuildScheduler) recountRecord(rec *SpaceRebuildRecord) {
-	completed, failed := 0, 0
-	for _, t := range rec.Tasks {
-		switch t.Status {
-		case entity.PSRebuildTaskStatusCompleted:
-			completed++
-		case entity.PSRebuildTaskStatusFailed:
-			failed++
-		}
-	}
-	rec.TotalReplicas = len(rec.Tasks)
-	rec.CompletedReplicas = completed
-	rec.FailedReplicas = failed
 }
 
 // clampOneBased converts a 0-based cursor into a clamped 1-based counter.
@@ -1482,12 +1392,12 @@ func (sc *RebuildScheduler) casAdmitPending(ctx context.Context, rec *SpaceRebui
 		if err := vjson.Unmarshal([]byte(raw), current); err != nil {
 			return fmt.Errorf("unmarshal in CAS admit: %v", err)
 		}
-		if current.Status != RebuildStatusPending {
+		if current.Status != entity.RebuildStatusPending {
 			conflict = true
 			return nil
 		}
 		// rec already contains prepared tasks, counters, and StartedAt.
-		rec.Status = RebuildStatusRunning
+		rec.Status = entity.RebuildStatusRunning
 		value, err := vjson.Marshal(rec)
 		if err != nil {
 			return err

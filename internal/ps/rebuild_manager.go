@@ -24,15 +24,6 @@ import (
 	"github.com/vearch/vearch/v3/internal/pkg/log"
 )
 
-type PSRebuildTaskStatus int
-
-// PS-side rebuild task status; wire values must stay stable.
-const (
-	PSRebuildTaskStatusRunning   PSRebuildTaskStatus = 1
-	PSRebuildTaskStatusCompleted PSRebuildTaskStatus = 2
-	PSRebuildTaskStatusFailed    PSRebuildTaskStatus = 3
-)
-
 // Gamma engine IndexStatus values from internal/engine/search/engine.h.
 const (
 	engineIndexStatusUnindexed = 0
@@ -51,35 +42,16 @@ const (
 	terminalRetentionPeriod = 2 * time.Hour
 )
 
-// RebuildTask is the in-memory state of a PS-side rebuild task.
-//
-// IndexName uniquely identifies the rebuild target; FieldName + IndexType
-// are kept alongside it for the engine CGo call (gamma.RebuildFieldIndex
-// still operates by (field, type)).
-type RebuildTask struct {
-	PartitionID  uint32              `json:"partition_id"`
-	SpaceKey     string              `json:"space_key"`
-	IndexName    string              `json:"index_name"`
-	FieldName    string              `json:"field_name,omitempty"`
-	IndexType    string              `json:"index_type,omitempty"`
-	Status       PSRebuildTaskStatus `json:"status"`
-	ErrorMessage string              `json:"error_message,omitempty"`
-	Progress     int                 `json:"progress"`
-	StartTime    int64               `json:"start_time"`
-	CompleteTime int64               `json:"complete_time,omitempty"`
-
-	// Rebuild parameters retained for status and retry context.
-	DropBefore int `json:"drop_before,omitempty"`
-	LimitCPU   int `json:"limit_cpu,omitempty"`
-	Describe   int `json:"describe,omitempty"`
-}
+// RebuildTask aliases the shared entity type; master and PS use the same
+// struct with each side populating its own fields (see entity.RebuildTask).
+type RebuildTask = entity.RebuildTask
 
 // RebuildManager registers PS tasks and exposes their status.
 type RebuildManager interface {
 	StartRebuildTask(spaceKey, indexName, fieldName, indexType string, partitionID uint32,
 		dropBefore int, limitCPU int, describe int) error
 	GetRebuildTaskStatus(spaceKey, indexName string, partitionID uint32) (
-		status int, errorMsg string, exists bool, progress int)
+		status entity.RebuildStatus, errorMsg string, exists bool, progress int)
 }
 
 type PSRebuildManager struct {
@@ -108,23 +80,22 @@ func (r *PSRebuildManager) StartRebuildTask(spaceKey, indexName, fieldName, inde
 	taskKey := r.getTaskKey(spaceKey, indexName, partitionID)
 
 	r.mu.Lock()
-	if existing, ok := r.tasks[taskKey]; ok && existing.Status == PSRebuildTaskStatusRunning {
+	if existing, ok := r.tasks[taskKey]; ok && existing.Status == entity.RebuildStatusRunning {
 		r.mu.Unlock()
 		// Duplicate dispatch is idempotent.
 		log.Info("rebuild task already running for %s pid=%d indexName=%s, ignoring duplicate start",
 			spaceKey, partitionID, indexName)
 		return nil
 	}
-	now := time.Now().Unix()
 	task := &RebuildTask{
-		PartitionID: partitionID,
+		PartitionID: entity.PartitionID(partitionID),
 		SpaceKey:    spaceKey,
 		IndexName:   indexName,
 		FieldName:   fieldName,
 		IndexType:   indexType,
-		Status:      PSRebuildTaskStatusRunning,
+		Status:      entity.RebuildStatusRunning,
 		Progress:    0,
-		StartTime:   now,
+		StartTime:   time.Now(),
 		DropBefore:  dropBefore,
 		LimitCPU:    limitCPU,
 		Describe:    describe,
@@ -145,7 +116,7 @@ func (r *PSRebuildManager) executeRebuild(task *RebuildTask, dropBefore int, lim
 		}
 	}()
 
-	partitionID := entity.PartitionID(task.PartitionID)
+	partitionID := task.PartitionID
 	store := r.server.GetPartition(partitionID)
 	if store == nil {
 		r.markFailed(task, fmt.Sprintf("partition %d not found", task.PartitionID))
@@ -180,7 +151,7 @@ func (r *PSRebuildManager) executeRebuild(task *RebuildTask, dropBefore int, lim
 			}
 		}()
 		// Empty FieldName means whole-partition rebuild in the engine.
-		doneCh <- engine.RebuildFieldIndex(task.FieldName, task.IndexType,
+		doneCh <- engine.RebuildFieldIndex(task.IndexName, task.FieldName, task.IndexType,
 			dropBefore, limitCPU, describe)
 	}()
 	log.Info("rebuild engine.RebuildFieldIndex dispatched: pid=%d indexName=%s field=%s indexType=%s preStatus=%d preIndexed=%d preMaxDocid=%d dropBefore=%d limitCPU=%d describe=%d",
@@ -272,7 +243,7 @@ func (r *PSRebuildManager) monitorRebuild(task *RebuildTask, store PartitionStor
 					if err == nil {
 						log.Info("engine.RebuildIndex returned success for pid=%d despite IndexInfo failures, marking completed",
 							task.PartitionID)
-						r.markCompleted(task, preIndexed, preMaxDocid)
+						r.markCompleted(task)
 						return
 					}
 					r.markFailed(task,
@@ -304,7 +275,7 @@ func (r *PSRebuildManager) monitorRebuild(task *RebuildTask, store PartitionStor
 			// out of scope here. Otherwise we would spin until
 			// rebuildMaxDuration (24h) and mark the task failed.
 			if rebuildReturned {
-				r.markCompleted(task, indexedNum, maxDocid)
+				r.markCompleted(task)
 				log.Info("rebuild task completed for partition %d (cgo returned, engine status=%d, indexed=%d, maxDocid=%d)",
 					task.PartitionID, status, indexedNum, maxDocid)
 				return
@@ -315,7 +286,7 @@ func (r *PSRebuildManager) monitorRebuild(task *RebuildTask, store PartitionStor
 		case engineIndexStatusIndexed:
 			// Rebuild returned; INDEXED is authoritative.
 			if rebuildReturned {
-				r.markCompleted(task, indexedNum, maxDocid)
+				r.markCompleted(task)
 				log.Info("rebuild task completed for partition %d (rebuild returned, indexed=%d, maxDocid=%d)",
 					task.PartitionID, indexedNum, maxDocid)
 				return
@@ -324,7 +295,7 @@ func (r *PSRebuildManager) monitorRebuild(task *RebuildTask, store PartitionStor
 				// Wait briefly for CGO before marking completed.
 				switch r.waitDoneShort(doneCh, &rebuildReturned, task) {
 				case settleSuccess:
-					r.markCompleted(task, indexedNum, maxDocid)
+					r.markCompleted(task)
 					log.Info("rebuild task completed for partition %d (indexed=%d, maxDocid=%d, 100%%)",
 						task.PartitionID, indexedNum, maxDocid)
 					return
@@ -407,52 +378,43 @@ func (r *PSRebuildManager) updateProgress(task *RebuildTask, progress int) {
 	r.mu.Unlock()
 }
 
-func (r *PSRebuildManager) markCompleted(task *RebuildTask, indexedNum, maxDocid int) {
+func (r *PSRebuildManager) markCompleted(task *RebuildTask) {
 	r.mu.Lock()
-	task.Status = PSRebuildTaskStatusCompleted
+	task.Status = entity.RebuildStatusCompleted
 	task.Progress = 100
-	task.CompleteTime = time.Now().Unix()
+	task.CompleteTime = time.Now()
 	task.ErrorMessage = ""
 	r.mu.Unlock()
-	_ = indexedNum
-	_ = maxDocid
-	// Keep terminal state long enough for the master to poll it.
-	r.scheduleTerminalEviction(task)
 }
 
 func (r *PSRebuildManager) markFailed(task *RebuildTask, msg string) {
 	r.mu.Lock()
-	task.Status = PSRebuildTaskStatusFailed
+	task.Status = entity.RebuildStatusFailed
 	task.ErrorMessage = msg
-	task.CompleteTime = time.Now().Unix()
+	task.CompleteTime = time.Now()
 	r.mu.Unlock()
 	log.Error("rebuild task failed for partition %d: %s", task.PartitionID, msg)
-	// Keep failure visible long enough for the master to poll it.
-	r.scheduleTerminalEviction(task)
 }
 
-// scheduleTerminalEviction is a no-op placeholder retained for callers.
-// Eviction of terminal tasks is now lazy: GetRebuildTaskStatus (and
-// StartRebuildTask on task reuse) discard entries whose CompleteTime is
-// older than terminalRetentionPeriod. This avoids leaking long-lived
-// time.AfterFunc timers that hold references to the manager across PS
-// shutdown.
-func (r *PSRebuildManager) scheduleTerminalEviction(task *RebuildTask) {}
+// Terminal tasks are evicted lazily by GetRebuildTaskStatus (and by
+// StartRebuildTask on task reuse) once CompleteTime is older than
+// terminalRetentionPeriod. This avoids leaking long-lived time.AfterFunc
+// timers that hold references to the manager across PS shutdown.
 
 // terminalExpired reports whether a task has stayed in terminal state
 // past the retention window.
 func terminalExpired(task *RebuildTask) bool {
-	if task == nil || task.CompleteTime == 0 {
+	if task == nil || task.CompleteTime.IsZero() {
 		return false
 	}
-	if task.Status != PSRebuildTaskStatusCompleted && task.Status != PSRebuildTaskStatusFailed {
+	if !task.Status.IsTerminal() {
 		return false
 	}
-	return time.Since(time.Unix(task.CompleteTime, 0)) > terminalRetentionPeriod
+	return time.Since(task.CompleteTime) > terminalRetentionPeriod
 }
 
 func (r *PSRebuildManager) GetRebuildTaskStatus(spaceKey, indexName string,
-	partitionID uint32) (status int, errorMsg string, exists bool, progress int) {
+	partitionID uint32) (status entity.RebuildStatus, errorMsg string, exists bool, progress int) {
 	taskKey := r.getTaskKey(spaceKey, indexName, partitionID)
 
 	// Lazy eviction: drop retention-expired terminal tasks on read.
@@ -461,14 +423,14 @@ func (r *PSRebuildManager) GetRebuildTaskStatus(spaceKey, indexName string,
 	if found && task != nil && terminalExpired(task) {
 		delete(r.tasks, taskKey)
 		r.mu.Unlock()
-		return 0, "", false, 0
+		return "", "", false, 0
 	}
 	r.mu.Unlock()
 
 	if !found || task == nil {
-		return 0, "", false, 0
+		return "", "", false, 0
 	}
-	return int(task.Status), task.ErrorMessage, true, task.Progress
+	return task.Status, task.ErrorMessage, true, task.Progress
 }
 
 // SetRebuildManager injects a custom manager for tests or alternate wiring.

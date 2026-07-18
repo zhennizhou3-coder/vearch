@@ -114,16 +114,11 @@ func (s *Server) Start() (err error) {
 	// start backup service (including backup monitor and version manager)
 	service.Backup().Start()
 
-	// start rebuild service (including rebuild manager)
-	if config.Conf().Global.SelfManageEtcd {
-		isLeader := service.Rebuild().StartEtcdLeaderCampaign(s.ctx, 30*time.Second)
-		service.Rebuild().SetLeaderChecker(isLeader)
-	} else if s.etcdServer != nil {
-		etcdSrv := s.etcdServer.Server
-		service.Rebuild().SetLeaderChecker(func() bool {
-			return uint64(etcdSrv.ID()) == etcdSrv.Lead()
-		})
-	}
+	// start rebuild service (including rebuild manager).
+	etcdSrv := s.etcdServer.Server
+	service.Rebuild().SetLeaderChecker(func() bool {
+		return uint64(etcdSrv.ID()) == etcdSrv.Lead()
+	})
 	service.Rebuild().Start()
 
 	monitorService := &monitorService{}

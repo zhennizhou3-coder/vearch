@@ -389,7 +389,7 @@ class TestRebuildReplicaSerialization:
         for i, s in enumerate(snapshots):
             rpp = {}
             for t in s:
-                if t["status"] == 1 and t["dispatched"]:
+                if t["status"] == "running" and t["dispatched"]:
                     rpp.setdefault(t["partition_id"], []).append(t["replica_index"])
             for pid, reps in rpp.items():
                 if len(reps) > 1:
@@ -1638,6 +1638,88 @@ class TestRebuildIndexTypeMatrix:
         assert len(seen_indexes) >= 2, f"current_index didn't advance: seen={seen_indexes}"
         _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
+
+    def test_multi_index_space_runs_consecutively_without_yield(self):
+        """6.7b: When a space has multiple index targets, all of them must
+        run back-to-back under a single Running record. A second space
+        whose rebuild is enqueued *after* the first has started must NOT be
+        admitted until every target of the first space has finished.
+
+        This locks in the R3 semantics: prepareNextTarget advances the
+        target cursor in place and never yields the scheduler slot back to
+        the pending queue between targets. Under the old code the record
+        went Pending between targets, which allowed another space's older
+        pending record to be admitted mid-flight.
+        """
+        space_multi = space_name + "_comp_multi_consec_a"
+        space_single = space_name + "_comp_multi_consec_b"
+
+        # Space A: multi-vector so the record has ≥2 targets.
+        assert create_space(router_url, db_name, _multi3_cfg(space_multi)).json()["code"] == 0
+        _add_multi3_docs(space_multi)
+
+        # Space B: single-vector, fast target. Would race ahead if A ever
+        # yielded its scheduler slot mid-way through its target list.
+        assert create_space(router_url, db_name, _multi3_cfg(space_single)).json()["code"] == 0
+        _add_multi3_docs(space_single)
+
+        # Trigger A first so it wins admission.
+        assert _trigger_rebuild(db_name, space_multi).json().get("code") == 0
+        # Trigger B a moment later — B stays Pending.
+        time.sleep(0.5)
+        assert _trigger_rebuild(db_name, space_single).json().get("code") == 0
+
+        # While A is Running, B must remain Pending. Sandwich each pb
+        # read between two pa reads so we don't flag the tick where A
+        # finalizes AND B is admitted in the same scheduler pass. Both
+        # writes are persisted together in that tick; two sequential
+        # GETs would then show pa=running/completed + pb=running with
+        # no way to distinguish the legal "A finalized, then B admitted
+        # in the same tick" case from a real R3 violation ("A and B
+        # Running concurrently"). Requiring A to be Running at BOTH ends
+        # of the pb GET collapses the observation window to a range
+        # where A is provably still running.
+        deadline = time.time() + 900
+        a_finished = False
+        b_ever_running_while_a_running = False
+        b_ever_completed_while_a_running = False
+        while time.time() < deadline:
+            pa_before = _get_rebuild_progress(db_name, space_multi)
+            pb        = _get_rebuild_progress(db_name, space_single)
+            pa_after  = _get_rebuild_progress(db_name, space_multi)
+
+            a_running_throughout = (
+                pa_before["status"] == "running"
+                and pa_after["status"] == "running"
+            )
+            if a_running_throughout and pb["status"] == "running":
+                b_ever_running_while_a_running = True
+            if a_running_throughout and pb["status"] == "completed":
+                b_ever_completed_while_a_running = True
+
+            if pa_after["status"] in ("completed", "failed"):
+                a_finished = True
+                assert pa_after["status"] == "completed", pa_after
+                break
+            time.sleep(1)
+
+        assert a_finished, "space A did not finish within deadline"
+        assert not b_ever_running_while_a_running, (
+            "space B was admitted while space A was still cycling through "
+            "its index targets — R3 (no-yield between targets) is broken"
+        )
+        assert not b_ever_completed_while_a_running, (
+            "space B completed before space A finished — R3 (no-yield "
+            "between targets) is broken"
+        )
+
+        # Space B should complete once A releases the slot.
+        _wait_rebuild_completed(db_name, space_single, timeout=600)
+        _wait_index_status_indexed(db_name, space_multi)
+        _wait_index_status_indexed(db_name, space_single)
+
+        drop_space(router_url, db_name, space_multi)
+        drop_space(router_url, db_name, space_single)
 
     # def test_multi_target_fail_first_aborts_rest(self):
     #     """6.8: When the first IndexTarget fails its retries, subsequent

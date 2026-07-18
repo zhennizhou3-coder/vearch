@@ -62,8 +62,10 @@ type Engine interface {
 	ApplySnapshot(peers []proto.Peer, iter proto.SnapIterator) error
 	Optimize() error
 
-	// RebuildFieldIndex rebuilds all indexes or one (field, indexType) target.
-	RebuildFieldIndex(field, indexType string, dropBefore, limitCPU, describe int) error
+	// RebuildFieldIndex rebuilds the index identified by indexName. `field`
+	// and `indexType` are used engine-side to resolve the RawVector and
+	// index parameters.
+	RebuildFieldIndex(indexName, field, indexType string, dropBefore, limitCPU, describe int) error
 	Load() error
 	IndexInfo() (int, int, int)
 

@@ -221,17 +221,14 @@ func (handler *DocumentHandler) proxyMaster(group *gin.RouterGroup) error {
 	group.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s", URLParamDbName, URLParamSpaceName, URLParamVersionID), handler.handleMasterRequest)
 	group.DELETE(fmt.Sprintf("/backup/dbs/:%s/spaces/:%s/versions/:%s/direct", URLParamDbName, URLParamSpaceName, URLParamVersionID), handler.handleMasterRequest)
 
-	// rebuild handler (proxied to master scheduler) — all rebuild
-	// endpoints share the /index/rebuild/ prefix; cancel is a sub-path
-	// per scope (except the global cancel, which is a top-level sibling
-	// to avoid a gin static/param collision under /dbs).
-	group.POST("/index/rebuild/dbs", handler.handleMasterRequest)
+	// rebuild handler
+	group.POST("/index/rebuild", handler.handleMasterRequest)
 	group.POST(fmt.Sprintf("/index/rebuild/dbs/:%s", URLParamDbName), handler.handleMasterRequest)
 	group.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
 	group.POST(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/indexes/:%s",
 		URLParamDbName, URLParamSpaceName, URLParamIndexName), handler.handleMasterRequest)
 
-	group.GET("/index/rebuild/dbs", handler.handleMasterRequest)
+	group.GET("/index/rebuild/progress", handler.handleMasterRequest)
 	group.GET(fmt.Sprintf("/index/rebuild/dbs/:%s/progress", URLParamDbName), handler.handleMasterRequest)
 	group.GET(fmt.Sprintf("/index/rebuild/dbs/:%s/spaces/:%s/progress", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
 

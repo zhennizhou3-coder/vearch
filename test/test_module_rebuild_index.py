@@ -94,8 +94,8 @@ def _trigger_rebuild_db(db: str):
     return resp
 
 def _trigger_rebuild_global():
-    """POST /index/rebuild/dbs — rebuild all spaces across all DBs."""
-    url = f"{router_url}/index/rebuild/dbs"
+    """POST /index/rebuild — rebuild all spaces across all DBs."""
+    url = f"{router_url}/index/rebuild"
     resp = requests.post(url, auth=(username, password), json={})
     logger.info("trigger_rebuild_global url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
     return resp
@@ -120,13 +120,13 @@ def _get_rebuild_progress(db: str, space: str) -> dict:
 def _list_rebuild_progress(db: str = "") -> dict:
     """GET progress summary.
 
-    db=""  -> GET /index/rebuild/dbs              (global summary)
+    db=""  -> GET /index/rebuild/progress           (global summary)
     db=xxx -> GET /index/rebuild/dbs/xxx/progress  (db-level summary)
     """
     if db:
         url = f"{router_url}/index/rebuild/dbs/{db}/progress"
     else:
-        url = f"{router_url}/index/rebuild/dbs"
+        url = f"{router_url}/index/rebuild/progress"
     resp = requests.get(url, auth=(username, password))
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -1171,9 +1171,9 @@ class TestRebuildProgressQuery:
         for t in tasks:
             assert "partition_id" in t, t
             assert "node_id" in t, t
-            assert t["status"] in (1, 2, 3), t
+            assert t["status"] in ("running", "completed", "failed"), t
             assert 0 <= t["progress"] <= 100, t
-            assert t["status"] == 2, t
+            assert t["status"] == "completed", t
             assert t["progress"] == 100, t
 
         _wait_index_status_indexed(db_name, case_space)
@@ -1482,7 +1482,7 @@ class TestRebuildProgressQuery:
             # Group dispatched running tasks by partition_id.
             running_per_partition = {}  # partition_id -> list of replica_index
             for t in snap:
-                is_running = t["status"] == 1 and t["dispatched"] is True
+                is_running = t["status"] == "running" and t["dispatched"] is True
                 if is_running:
                     pid = t["partition_id"]
                     running_per_partition.setdefault(pid, []).append(t["replica_index"])
@@ -1505,8 +1505,8 @@ class TestRebuildProgressQuery:
         # not just the final state.
         intermediate_found = False
         for snap in snapshots:
-            dispatched_count = sum(1 for t in snap if t["dispatched"] is True and t["status"] != 2)
-            completed_count = sum(1 for t in snap if t["status"] == 2)
+            dispatched_count = sum(1 for t in snap if t["dispatched"] is True and t["status"] != "completed")
+            completed_count = sum(1 for t in snap if t["status"] == "completed")
             total_tasks = len(snap)
             if total_tasks > 0 and dispatched_count > 0 and completed_count < total_tasks:
                 intermediate_found = True
@@ -1624,13 +1624,24 @@ class TestCancelRebuild:
                         "all entries had valid reasons for cancellation failure")
 
         # The running rebuild (admitted by the scheduler) should report
-        # cancelled=False with a reason explaining it is already running.
+        # cancelled=False (the record stays Running), but may report
+        # cancelled_tasks>0 when best-effort per-task cancel skipped any
+        # not-yet-dispatched replicas.
         running_cancelled_false = [
             e for e in cancel_results
             if not e.get("cancelled") and "running" in (e.get("reason", "") + e.get("status", "")).lower()
         ]
         for e in running_cancelled_false:
             assert e["cancelled"] is False, f"running rebuild should not be cancellable: {e}"
+            # cancelled_tasks is >=0; when >0 it reflects tasks that were
+            # planned-but-not-yet-dispatched at the moment of the cancel
+            # call and are now Cancelled in the plan.
+            assert e.get("cancelled_tasks", 0) >= 0, e
+            if e.get("cancelled_tasks", 0) > 0:
+                logger.info(
+                    "best-effort task-level cancel applied: space=%s cancelled_tasks=%d",
+                    e.get("space_name"), e["cancelled_tasks"],
+                )
 
         # Verify individual progress: cancelled spaces show status='cancelled'.
         for sp in spaces:
@@ -1692,9 +1703,21 @@ class TestCancelRebuild:
                 f"cancelled=True but reason doesn't mention cancel: {entry}"
             )
         else:
-            # cancelled=False: reason must explain why cancellation was denied.
-            # The reason should mention the current status (running/completed/failed).
-            assert status.lower() in reason or "running" in reason or "cannot cancel" in reason, (
+            # cancelled=False: reason must explain the outcome. This covers
+            # three shapes:
+            #   - Terminal (completed/failed): "rebuild already <status>..."
+            #   - Running, everything already dispatched: "rebuild is running
+            #     and every task is already dispatched..."
+            #   - Running, best-effort task-level cancel applied: "cancelled
+            #     N not-yet-dispatched tasks..." (the record itself stays
+            #     Running; individual pending tasks were transitioned to
+            #     Cancelled).
+            assert (
+                status.lower() in reason
+                or "running" in reason
+                or "cannot cancel" in reason
+                or "cancelled" in reason
+            ), (
                 f"cancelled=False but reason doesn't reference status '{status}': {entry}"
             )
 
@@ -2021,6 +2044,72 @@ class TestRebuildPerField:
 
     def test_prepare_db(self):
         _ensure_clean_db()
+
+    def test_search_routes_each_field_to_its_named_index(self):
+        """Search resolves field_name -> index_name without crossing indexes.
+
+        The two documents deliberately store opposite vectors in the two
+        fields.  A zero-vector query must therefore hit a different document
+        depending on the requested field.  A missing field->index mapping, or
+        routing both fields to the same named index, makes this assertion fail.
+        """
+        case_space = space_name + "_mri_search_index_route"
+        assert create_space(
+            router_url, db_name, _multi_vector_space_config(case_space)
+        ).json()["code"] == 0
+
+        zero = [0.0] * xb.shape[1]
+        one = [1.0] * xb.shape[1]
+        data = {
+            "db_name": db_name,
+            "space_name": case_space,
+            "documents": [
+                {
+                    "_id": "doc_a",
+                    "field_int": 0,
+                    "field_vector_a": zero,
+                    "field_vector_b": one,
+                },
+                {
+                    "_id": "doc_b",
+                    "field_int": 1,
+                    "field_vector_a": one,
+                    "field_vector_b": zero,
+                },
+            ],
+        }
+        try:
+            rs = requests.post(
+                router_url + "/document/upsert?timeout=2000000",
+                auth=(username, password), json=data,
+            )
+            assert rs.json().get("code") == 0, rs.text
+            waiting_index_finish(2, timewait=1, space_name=case_space)
+
+            def search_top1(field):
+                query = {
+                    "vector_value": False,
+                    "db_name": db_name,
+                    "space_name": case_space,
+                    "vectors": [{"field": field, "feature": zero}],
+                    "fields": ["field_int"],
+                    "limit": 1,
+                }
+                response = requests.post(
+                    router_url + "/document/search?timeout=2000000",
+                    auth=(username, password), json=query,
+                )
+                body = response.json()
+                assert body.get("code") == 0, body
+                documents = body["data"]["documents"]
+                results = documents[0] if isinstance(documents[0], list) else documents
+                assert len(results) == 1, body
+                return results[0]["field_int"]
+
+            assert search_top1("field_vector_a") == 0
+            assert search_top1("field_vector_b") == 1
+        finally:
+            drop_space(router_url, db_name, case_space)
 
     def test_per_field_rebuild_hnsw(self):
         """Rebuild field_vector_a / HNSW on a multi-vector space."""
@@ -2461,8 +2550,8 @@ class TestRebuildDBLevel:
 class TestRebuildGlobalScope:
     """Exercise the global rebuild endpoints.
 
-    POST /index/rebuild/dbs                           — trigger all DBs
-    GET  /index/rebuild/dbs/progress                   — global summary
+    POST /index/rebuild                            — trigger all DBs
+    GET  /index/rebuild/progress                    — global summary
     POST /index/rebuild/cancel                     — cancel all DBs
     """
 
@@ -2537,8 +2626,8 @@ class TestRebuildGlobalScope:
 
     """Exercise the global rebuild endpoints.
 
-    POST /index/rebuild/dbs                           — trigger all DBs
-    GET  /index/rebuild/dbs/progress                   — global summary
+    POST /index/rebuild                            — trigger all DBs
+    GET  /index/rebuild/progress                    — global summary
     POST /index/rebuild/cancel                     — cancel all DBs
     """
 

@@ -5,6 +5,7 @@ list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
 
 option(BUILD_TEST "Build tests" off)
 option(BUILD_WITH_GPU "Build gamma with gpu index support" off)
+option(BUILD_WITH_NPU "Build gamma with NPU index support" off)
 option(BUILD_WITH_SCANN "Build gamma with scann index support" off)
 option(BUILD_WITH_DISKANN "Build gamma with diskann index support" on)
 # Backward-compatible knobs from vendored DiskANN integration.
@@ -129,9 +130,13 @@ if(NOT BUILD_WITH_GPU)
     list(FILTER ALL_SOURCES EXCLUDE REGEX "${CMAKE_CURRENT_SOURCE_DIR}/index/impl/gpu/.*")
 endif()
 
+if(NOT BUILD_WITH_NPU)
+    list(FILTER ALL_SOURCES EXCLUDE REGEX "${CMAKE_CURRENT_SOURCE_DIR}/index/impl/npu/.*")
+endif()
+
 set(LIB_SRCS ${ALL_SOURCES} ${RELAYOUT_SRCS})
 
-if(NOT BUILD_WITH_GPU)
+if(NOT BUILD_WITH_GPU AND NOT BUILD_WITH_NPU)
     add_library(gamma SHARED ${LIB_SRCS})
 
     add_library(gamma_avx2 SHARED ${LIB_SRCS})
@@ -300,6 +305,13 @@ if(BUILD_WITH_GPU)
     endif()
 endif()
 
+if(BUILD_WITH_NPU)
+    message(STATUS "With NPU (Ascend)")
+
+    add_definitions(-DBUILD_WITH_NPU)
+    set(GAMMA_NPU ${CMAKE_CURRENT_SOURCE_DIR}/index/impl/npu)
+endif()
+
 if(BUILD_WITH_GPU)
     file(GLOB_RECURSE GAMMA_GPU_SOURCES
         ${GAMMA_GPU}/*.h
@@ -342,6 +354,59 @@ if(BUILD_WITH_GPU)
             -lbz2
     )
 
+elseif(BUILD_WITH_NPU)
+    find_path(ASCEND_MXINDEX_INCLUDE_DIR
+        NAMES faiss/ascend/AscendIndex.h
+        PATHS /usr/local/Ascend/mxIndex/include
+        NO_DEFAULT_PATH
+    )
+
+    if(ASCEND_MXINDEX_INCLUDE_DIR)
+        message(STATUS "Found AscendIndex.h in: ${ASCEND_MXINDEX_INCLUDE_DIR}")
+    else()
+        message(FATAL_ERROR "AscendIndex.h NOT FOUND in /usr/local/Ascend/mxIndex/include")
+    endif()
+
+    find_path(ASCEND_CANN_INCLUDE_DIR
+        NAMES acl/acl.h
+        PATHS /usr/local/Ascend/cann/include
+        NO_DEFAULT_PATH
+    )
+
+    if(NOT ASCEND_CANN_INCLUDE_DIR)
+        message(FATAL_ERROR
+            "Ascend CANN headers not found in /usr/local/Ascend/cann/include. "
+            "Please install CANN toolkit or set ASCEND_CANN_INCLUDE_DIR."
+        )
+    endif()
+
+    find_library(ASCENDFAISS_LIBRARY NAMES ascendfaiss REQUIRED)
+
+    file(GLOB_RECURSE GAMMA_NPU_SOURCES
+        ${GAMMA_NPU}/*.h
+        ${GAMMA_NPU}/*.hpp
+        ${GAMMA_NPU}/*.cpp
+        ${GAMMA_NPU}/*.cc
+        ${GAMMA_NPU}/*.c)
+
+    # Remove any NPU .cc already present in LIB_SRCS to avoid duplication
+    list(FILTER LIB_SRCS EXCLUDE REGEX "${GAMMA_NPU}/.*\\.(cc|cpp|c)$")
+
+    add_library(gamma SHARED ${LIB_SRCS} ${GAMMA_NPU_SOURCES})
+
+    target_include_directories(gamma
+        PRIVATE
+            ${GAMMA_NPU}
+            ${FAISS_INCLUDE_DIR}
+            ${ASCEND_MXINDEX_INCLUDE_DIR}
+            ${ASCEND_CANN_INCLUDE_DIR}
+    )
+
+    target_link_libraries(gamma
+        PRIVATE
+            ${LIBRARIES}
+            -lascendfaiss
+    )
 else()
     message(STATUS "With Generic" ${LIBRARIES})
     target_link_libraries(gamma ${LIBRARIES})
@@ -415,14 +480,14 @@ install(TARGETS gamma
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
-if(NOT BUILD_WITH_GPU AND BUILD_GAMMA_OPT_LEVEL STREQUAL "avx2")
+if(NOT BUILD_WITH_GPU AND NOT BUILD_WITH_NPU AND BUILD_GAMMA_OPT_LEVEL STREQUAL "avx2")
     install(TARGETS gamma_avx2
         EXPORT gamma-targets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     )
 endif()
-if(NOT BUILD_WITH_GPU AND BUILD_GAMMA_OPT_LEVEL STREQUAL "avx512")
+if(NOT BUILD_WITH_GPU AND NOT BUILD_WITH_NPU AND BUILD_GAMMA_OPT_LEVEL STREQUAL "avx512")
     install(TARGETS gamma_avx2 gamma_avx512
         EXPORT gamma-targets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

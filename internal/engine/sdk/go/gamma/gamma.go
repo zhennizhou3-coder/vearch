@@ -8,11 +8,11 @@
 package gamma
 
 /*
-#cgo CFLAGS : -I../../../c_api
-#cgo LDFLAGS: -L../../../../../build/gamma_build -lgamma
+ #cgo CFLAGS : -I../../../c_api
+ #cgo LDFLAGS: -L../../../../../build/gamma_build -lgamma
 
-#include "gamma_api.h"
-#include <stdlib.h>
+ #include "gamma_api.h"
+ #include <stdlib.h>
 */
 import "C"
 import (
@@ -145,12 +145,14 @@ func BuildIndex(engine unsafe.Pointer) int {
 	return int(C.BuildIndex(engine))
 }
 
-func RebuildFieldIndex(engine unsafe.Pointer, fieldName, indexType string, dropBeforeRebuild int, limitCPU int, describe int) int {
+func RebuildFieldIndex(engine unsafe.Pointer, indexName, fieldName, indexType string, dropBeforeRebuild int, limitCPU int, describe int) int {
+	cIndexName := C.CString(indexName)
+	defer C.free(unsafe.Pointer(cIndexName))
 	cFieldName := C.CString(fieldName)
 	defer C.free(unsafe.Pointer(cFieldName))
 	cIndexType := C.CString(indexType)
 	defer C.free(unsafe.Pointer(cIndexType))
-	return int(C.RebuildFieldIndex(engine, cFieldName, cIndexType,
+	return int(C.RebuildFieldIndex(engine, cIndexName, cFieldName, cIndexType,
 		C.int(dropBeforeRebuild), C.int(limitCPU), C.int(describe)))
 }
 

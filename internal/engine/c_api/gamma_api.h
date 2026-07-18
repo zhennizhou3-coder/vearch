@@ -118,9 +118,9 @@ int RebuildIndex(void *engine, int drop_before_rebuild, int limit_cpu,
  * @param describe  describe level
  * @return 0 on success, non-zero on failure
  */
-int RebuildFieldIndex(void *engine, const char *field_name,
-                      const char *index_type, int drop_before_rebuild,
-                      int limit_cpu, int describe);
+int RebuildFieldIndex(void *engine, const char *index_name,
+                      const char *field_name, const char *index_type,
+                      int drop_before_rebuild, int limit_cpu, int describe);
 
 /**
  * @brief dump datas into disk accord to Config

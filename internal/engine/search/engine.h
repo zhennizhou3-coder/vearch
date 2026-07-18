@@ -88,7 +88,8 @@ class Engine {
    * @param describe  describe level
    * @return 0 on success, non-zero on failure
    */
-  int RebuildFieldIndex(const std::string &field_name,
+  int RebuildFieldIndex(const std::string &index_name,
+                        const std::string &field_name,
                         const std::string &index_type,
                         int drop_before_rebuild, int limit_cpu, int describe);
 

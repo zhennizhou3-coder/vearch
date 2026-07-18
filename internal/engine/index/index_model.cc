@@ -14,11 +14,11 @@
 size_t IndexModel::ComputeIVFTrainingNum(size_t nlist) const {
   size_t num;
   if ((size_t)training_threshold_ < nlist * vearch::min_points_per_centroid) {
-    num = nlist * vearch::min_points_per_centroid;
+    num = (size_t)training_threshold_;
     LOG(WARNING) << "training_threshold[" << training_threshold_
-                 << "] > ncentroids[" << nlist << "] * "
-                 << vearch::min_points_per_centroid
-                 << ", clamped up to " << num << ".";
+                 << "] is below the recommended minimum for ncentroids["
+                 << nlist << "] (" << nlist * vearch::min_points_per_centroid
+                 << "), using configured value " << num << ".";
   } else if ((size_t)training_threshold_ <=
              nlist * vearch::max_points_per_centroid) {
     num = (size_t)training_threshold_;
@@ -52,14 +52,10 @@ int IndexModel::GetTrainingVectors(size_t threshold,
     LOG(ERROR) << "Fail to sample training vectors, ret=" << ret;
     return ret;
   }
-  // if (valid_count < threshold) {
-  //   LOG(ERROR) << "valid vector count [" << valid_count
-  //              << "] less than training threshold [" << threshold << "]";
-  //   return -1;
-  // }
-  if (valid_count < threshold){
-    LOG(WARNING) << "valid vector count [" << valid_count
-                 << "] less than training threshold [" << threshold << "]. So select all valid";
+  if (valid_count < threshold) {
+    LOG(ERROR) << "valid vector count [" << valid_count
+               << "] less than training threshold [" << threshold << "]";
+    return -1;
   }
   // SampleTrainingVectors must return the whole sample as one contiguous
   // block (a single Add) so that train_data owns all num_got vectors.

@@ -40,7 +40,6 @@ jobs:
         # rebuild module tests are exercised by the dedicated CI_rebuild workflow;
         # exclude them here to keep the standalone CI focused and avoid duplicate runs.
         pytest test_module_* -x --log-cli-level=INFO \
-          --ignore=test_module_rebuild_smoke.py \
           --ignore=test_module_rebuild_index.py \
           --ignore=test_module_rebuild_comprehensive.py \
           --ignore=test_module_rebuild_chaos.py

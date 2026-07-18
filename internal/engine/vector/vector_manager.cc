@@ -14,6 +14,10 @@
 #include "index/impl/gpu/gamma_index_ivfflat_gpu.h"
 #include "index/impl/gpu/gamma_index_ivfpq_gpu.h"
 #endif
+#ifdef BUILD_WITH_NPU
+#include "index/impl/npu/gamma_index_ivfflat_npu.h"
+#include "index/impl/npu/gamma_index_ivfrabitq_npu.h"
+#endif
 
 #include "raw_vector_factory.h"
 #include "util/utils.h"
@@ -160,12 +164,13 @@ void VectorManager::DestroyRawVectors() {
 }
 
 Status VectorManager::CreateVectorIndex(
+    const std::string &index_name,
     const std::string &index_type, const std::string &index_params, RawVector *vec,
     int training_threshold, bool destroy_vec,
     std::map<std::string, IndexModel *> &vector_indexes) {
   std::string vec_name = vec->MetaInfo()->Name();
   LOG(INFO) << desc_ << "create index model [" << index_type
-            << "] for vector: " << vec_name;
+            << "] name=" << index_name << " for vector: " << vec_name;
 
   IndexModel *index_model =
       dynamic_cast<IndexModel *>(reflector().GetNewIndex(index_type));
@@ -196,7 +201,7 @@ Status VectorManager::CreateVectorIndex(
   }
   // init indexed count
   index_model->indexed_count_ = 0;
-  vector_indexes[IndexName(vec_name, index_type)] = index_model;
+  vector_indexes[index_name] = index_model;
 
   return Status::OK();
 }
@@ -217,36 +222,43 @@ void VectorManager::DestroyVectorIndexes() {
 Status VectorManager::RemoveVectorIndex(const std::string &field_name) {
   pthread_rwlock_wrlock(&index_rwmutex_);
 
-  // Find and remove all indexes related to this field
-  std::vector<std::string> indexes_to_remove;
-  for (const auto &[name, index] : vector_indexes_) {
-    std::string vec_name;
-    std::string index_type;
-    GetVectorNameAndIndexType(name, vec_name, index_type);
-
-    if (vec_name == field_name) {
-      indexes_to_remove.push_back(name);
-    }
-  }
-
-  if (indexes_to_remove.empty()) {
+  // One-index-per-field: route field -> index_name; the map key is now the
+  // caller-supplied index_name and no longer parseable back to (field, type).
+  auto route_it = field_to_index_name_.find(field_name);
+  if (route_it == field_to_index_name_.end()) {
     LOG(DEBUG) << desc_ << "no vector index found for field: " << field_name;
+    pthread_rwlock_unlock(&index_rwmutex_);
     return Status::OK();
   }
+  const std::string index_name = route_it->second;
 
-  // Remove the found indexes
-  for (const std::string &index_name : indexes_to_remove) {
-    auto it = vector_indexes_.find(index_name);
-    if (it != vector_indexes_.end()) {
-      if (it->second != nullptr) {
-        delete it->second;
-      }
-      vector_indexes_.erase(it);
-      LOG(INFO) << desc_ << "removed vector index: " << index_name;
+  auto it = vector_indexes_.find(index_name);
+  if (it != vector_indexes_.end()) {
+    if (it->second != nullptr) {
+      delete it->second;
+    }
+    vector_indexes_.erase(it);
+    LOG(INFO) << desc_ << "removed vector index: " << index_name;
+  }
+  // Also drop the realtime buffer index (same key) if present.
+  auto buf_it = vector_memory_buffer_indexes_.find(index_name);
+  if (buf_it != vector_memory_buffer_indexes_.end()) {
+    if (buf_it->second != nullptr) {
+      delete buf_it->second;
+    }
+    vector_memory_buffer_indexes_.erase(buf_it);
+  }
+
+  // Drop this field's entries from the parallel config vectors (do not
+  // clear all — that would wipe other fields' configuration).
+  for (int i = static_cast<int>(index_names_.size()) - 1; i >= 0; --i) {
+    if (index_names_[i] == index_name) {
+      index_names_.erase(index_names_.begin() + i);
+      index_types_.erase(index_types_.begin() + i);
+      index_params_.erase(index_params_.begin() + i);
     }
   }
-  index_types_.clear();
-  index_params_.clear();
+  field_to_index_name_.erase(route_it);
 
   pthread_rwlock_unlock(&index_rwmutex_);
 
@@ -259,8 +271,8 @@ Status VectorManager::RemoveVectorIndex(const std::string &field_name) {
     LOG(INFO) << desc_ << "clean index directory: " << delete_dir;
   }
 
-  LOG(INFO) << desc_ << "successfully cleaned " << indexes_to_remove.size()
-            << " vector index(es) for field: " << field_name;
+  LOG(INFO) << desc_ << "successfully cleaned vector index for field: "
+            << field_name << " (index_name=" << index_name << ")";
   return Status::OK();
 }
 
@@ -283,9 +295,10 @@ Status VectorManager::CreateVectorIndexes(
       std::string &vec_name = index->MetaInfo()->Name();
 
       for (size_t i = 0; i < index_types_.size(); ++i) {
-        Status status =
-            CreateVectorIndex(index_types_[i], index_params_[i], index,
-                              training_threshold, false, vector_indexes);
+        Status status = CreateVectorIndex(index_names_[i], index_types_[i],
+                                          index_params_[i], index,
+                                          training_threshold, false,
+                                          vector_indexes);
         if (!status.ok()) {
           LOG(ERROR) << desc_ << vec_name
                      << " create index failed: " << status.ToString();
@@ -379,10 +392,12 @@ Status VectorManager::ResolveRebuildTarget(const std::string &field_name,
   return Status::OK();
 }
 
-Status VectorManager::ReCreateVectorIndex(const std::string &field_name,
+Status VectorManager::ReCreateVectorIndex(const std::string &index_name,
+                                          const std::string &field_name,
                                           const std::string &index_type,
                                           int training_threshold) {
-  std::string target_index_name = IndexName(field_name, index_type);
+  // std::string target_index_name = IndexName(field_name, index_type);
+  std::string target_index_name = index_name;
 
   pthread_rwlock_wrlock(&index_rwmutex_);
 
@@ -407,10 +422,10 @@ Status VectorManager::ReCreateVectorIndex(const std::string &field_name,
     return status;
   }
 
-  // Create the new index for this specific (field, type).
+  // Create the new index for this specific (field, type) under index_name.
   std::map<std::string, IndexModel *> new_indexes;
-  status = CreateVectorIndex(index_type, index_param, vec, training_threshold,
-                             false, new_indexes);
+  status = CreateVectorIndex(index_name, index_type, index_param, vec,
+                             training_threshold, false, new_indexes);
   if (!status.ok()) {
     LOG(ERROR) << desc_ << "CreateVectorIndex for " << target_index_name
                << " failed: " << status.ToString();
@@ -434,11 +449,14 @@ Status VectorManager::ReCreateVectorIndex(const std::string &field_name,
   return Status::OK();
 }
 
-Status VectorManager::RebuildVectorIndex(const std::string &field_name,
+Status VectorManager::RebuildVectorIndex(const std::string &index_name,
+                                         const std::string &field_name,
                                          const std::string &index_type,
                                          int training_threshold,
                                          bool do_train) {
-  std::string target_index_name = IndexName(field_name, index_type);
+  // std::string target_index_name = IndexName(field_name, index_type);
+  std::string target_index_name = index_name;
+
 
   RawVector *vec = nullptr;
   std::string index_param;
@@ -449,8 +467,8 @@ Status VectorManager::RebuildVectorIndex(const std::string &field_name,
 
   // Step 1: Create a new index model (without destroying the old one).
   std::map<std::string, IndexModel *> new_indexes;
-  status = CreateVectorIndex(index_type, index_param, vec, training_threshold,
-                             false, new_indexes);
+  status = CreateVectorIndex(index_name, index_type, index_param, vec,
+                             training_threshold, false, new_indexes);
   if (!status.ok()) {
     LOG(ERROR) << desc_ << "RebuildVectorIndex CreateVectorIndex for "
                << target_index_name << " failed: " << status.ToString();
@@ -514,12 +532,14 @@ Status VectorManager::CreateVectorTable(TableInfo &table,
     std::string &vec_name = vector_info.name;
     std::string index_type;
     std::string index_param;
+    std::string index_name;
 
     // Find vector index type from table.Indexes() by matching field_name
     for (const auto &idx : table_indexes) {
       if (idx.field_name == vec_name && idx.type != "") {
         index_type = idx.type;
         index_param = idx.params;
+        index_name = idx.name;
         break;
       }
     }
@@ -529,9 +549,19 @@ Status VectorManager::CreateVectorTable(TableInfo &table,
       LOG(ERROR) << msg.str();
       return Status::ParamError(msg.str());
     }
+    // Fallback: IndexInfo.name may be empty on legacy/mock inputs; synthesize
+    // a stable identifier so vector_indexes_ still has a unique key.
+    if (index_name.empty()) {
+      index_name = IndexName(vec_name, index_type);
+      LOG(WARNING) << desc_ << vec_name
+                   << " IndexInfo.name is empty; falling back to '"
+                   << index_name << "'";
+    }
 
+    index_names_.push_back(index_name);
     index_types_.push_back(index_type);
     index_params_.push_back(index_param);
+    field_to_index_name_[vec_name] = index_name;
     vec_status = CreateRawVector(vector_info, index_type, table, &vec,
                                  vector_cf_ids[i], storage_mgr);
     if (!vec_status.ok()) {
@@ -564,8 +594,10 @@ Status VectorManager::CreateVectorTable(TableInfo &table,
       vector_memory_buffers_[vec_name] = vec_buffer;
 
       status =
-          CreateVectorIndex(flat_index_type, index_params_[i], vec_buffer,
-                            table.TrainingThreshold(), true, vector_memory_buffer_indexes_);
+          CreateVectorIndex(index_name,
+                            flat_index_type, index_params_[i], vec_buffer,
+                            table.TrainingThreshold(), true,
+                            vector_memory_buffer_indexes_);
       if (!status.ok()) {
         LOG(ERROR) << desc_ << vec_name
                    << " create index failed: " << status.ToString();
@@ -582,7 +614,8 @@ Status VectorManager::CreateVectorTable(TableInfo &table,
 
     for (size_t i = 0; i < index_types_.size(); ++i) {
       status =
-          CreateVectorIndex(index_types_[i], index_params_[i], vec,
+          CreateVectorIndex(index_name,
+                            index_types_[i], index_params_[i], vec,
                             table.TrainingThreshold(), true, vector_indexes_);
       if (!status.ok()) {
         LOG(ERROR) << desc_ << vec_name
@@ -592,7 +625,7 @@ Status VectorManager::CreateVectorTable(TableInfo &table,
       // update TrainingThreshold when TrainingThreshold = 0
       if (!table.TrainingThreshold()) {
         IndexModel *index =
-            vector_indexes_[IndexName(vec_name, index_types_[i])];
+            vector_indexes_[index_name];
         if (index) {
           table.SetTrainingThreshold(index->training_threshold_);
         }
@@ -674,8 +707,11 @@ int VectorManager::Update(
     }
 
     pthread_rwlock_rdlock(&index_rwmutex_);
-    for (std::string &index_type : index_types_) {
-      auto it = vector_indexes_.find(IndexName(name, index_type));
+    // Route field_name -> index_name; one-index-per-field, so the lookup
+    // is O(log N) instead of scanning all index_types_.
+    auto route_it = field_to_index_name_.find(name);
+    if (route_it != field_to_index_name_.end()) {
+      auto it = vector_indexes_.find(route_it->second);
       if (it != vector_indexes_.end() && it->second->SupportIncrement()) {
         it->second->updated_vids_.push(docid);
       }
@@ -751,21 +787,29 @@ int VectorManager::AddRTVecsToIndex(bool &index_is_dirty) {
       LOG(INFO) << "no extra vectors existed for indexing";
 #endif
     } else {
-      int64_t MAX_NUM_PER_INDEX = 1000;
+      int64_t max_batch_size = 1000;
 #ifdef BUILD_WITH_GPU
       if (dynamic_cast<gpu::GammaIVFPQGPUIndex *>(index_model) || dynamic_cast<gpu::GammaIVFFlatGPUIndex *>(index_model)) {
-        MAX_NUM_PER_INDEX = 100000;
+        max_batch_size = 100000;
       }
 #endif
+
+#ifdef BUILD_WITH_NPU
+      if (dynamic_cast<npu::GammaIVFRABITQNPUIndex *>(index_model) ||
+          dynamic_cast<npu::GammaIVFFlatNPUIndex *>(index_model)) {
+        max_batch_size = 1000000;
+      }
+#endif
+
       int index_count =
-          (total_stored_vecs - indexed_vec_count) / MAX_NUM_PER_INDEX + 1;
+          (total_stored_vecs - indexed_vec_count) / max_batch_size + 1;
 
       for (int i = 0; i < index_count; i++) {
         int64_t start_docid = index_model->indexed_count_;
         size_t count_per_index =
             (i == (index_count - 1) ? total_stored_vecs - start_docid
-                                    : MAX_NUM_PER_INDEX);
-        if (count_per_index == 0 || (int64_t)count_per_index > MAX_NUM_PER_INDEX || start_docid < indexed_vec_count) break;
+                                    : max_batch_size);
+        if (count_per_index == 0 || (int64_t)count_per_index > max_batch_size || start_docid < indexed_vec_count) break;
 
         std::vector<int64_t> vids(count_per_index);
         std::iota(vids.begin(), vids.end(), start_docid);
@@ -814,8 +858,12 @@ int VectorManager::AddRTVecsToIndex(bool &index_is_dirty) {
           index_model->indexed_count_ += count_per_index;
           index_is_dirty = true;
           if (enable_realtime_) {
-            std::string vec_name, index_type;
-            GetVectorNameAndIndexType(name, vec_name, index_type);
+            // Field name comes from the RawVector on this index, since the
+            // map key (name) is now user-supplied index_name and no longer
+            // encodes the field.
+            std::string vec_name = index_model->vector_
+                                       ? index_model->vector_->MetaInfo()->Name()
+                                       : "";
             auto vector_buffer_it = vector_memory_buffers_.find(vec_name);
             if (vector_buffer_it != vector_memory_buffers_.end()) {
               RawVector *raw_vector_buffer = vector_buffer_it->second;
@@ -920,16 +968,25 @@ Status VectorManager::Search(GammaQuery &query, GammaResult *results) {
     std::string &name = vec_query.name;
     vec_names[i] = name;
 
-    std::string index_name = name;
     if (index_types_.size() == 0) {
       std::string err = "No index type specified for vector query " + name;
       return Status::InvalidArgument(err);
     }
-    std::string index_type = index_types_[0];
-    if (index_types_.size() > 1 && vec_query.index_type != "") {
-      index_type = vec_query.index_type;
+
+    // Route field_name (user query) -> index_name (map key). Fall back to
+    // legacy IndexName(field, type) synthesis when the mapping is missing
+    // (defensive; CreateVectorTable populates the map at boot).
+    std::string index_name;
+    auto route_it = field_to_index_name_.find(name);
+    if (route_it != field_to_index_name_.end()) {
+      index_name = route_it->second;
+    } else {
+      std::string index_type = index_types_[0];
+      if (index_types_.size() > 1 && vec_query.index_type != "") {
+        index_type = vec_query.index_type;
+      }
+      index_name = IndexName(name, index_type);
     }
-    index_name = IndexName(name, index_type);
 
     pthread_rwlock_rdlock(&index_rwmutex_);
 
@@ -1015,7 +1072,8 @@ Status VectorManager::Search(GammaQuery &query, GammaResult *results) {
 
     if (enable_realtime_) {
       all_vector_buffer_results[i].init(n, query.condition->topn);
-      std::string index_name = IndexName(name, "FLAT");
+      // Realtime buffer index shares the same index_name key as the main
+      // index (resolved above via field_to_index_name_).
       auto buffer_iter = vector_memory_buffer_indexes_.find(index_name);
       if (buffer_iter != vector_memory_buffer_indexes_.end()) {
         IndexModel *buffer_index = buffer_iter->second;
@@ -1319,8 +1377,10 @@ int VectorManager::Dump(const std::string &path, int64_t dump_docid,
   pthread_rwlock_rdlock(&index_rwmutex_);
   std::map<std::string, int64_t> vector_index_counts;
   for (const auto &[name, index] : vector_indexes_) {
-    std::string vec_name, index_type;
-    GetVectorNameAndIndexType(name, vec_name, index_type);
+    // Read the owning field from the RawVector attached to this index; the
+    // map key is now user-supplied index_name.
+    std::string vec_name =
+        index->vector_ ? index->vector_->MetaInfo()->Name() : "";
     vector_index_counts[vec_name] = index->indexed_count_;
     Status status = index->Dump(path);
     if (!status.ok()) {
@@ -1442,16 +1502,16 @@ int VectorManager::Load(const std::vector<std::string> &index_dirs,
   if (index_dirs.size() > 0) {
     for (const auto &[name, index] : vector_indexes_) {
       int64_t load_num = 0;
-      std::string vec_name, index_type;
-      GetVectorNameAndIndexType(name, vec_name, index_type);
+      // Field name from the attached RawVector; map key is now user-supplied.
+      std::string vec_name =
+          index->vector_ ? index->vector_->MetaInfo()->Name() : "";
 
       int64_t vector_index_count = 0;
       if (vec_index_counts.find(vec_name) != vec_index_counts.end()) {
         vector_index_count = vec_index_counts[vec_name];
       } else {
         LOG(ERROR) << desc_ << "vector index [" << name
-                   << "] not found in raw_vectors, vec_name=" << vec_name
-                   << ", index_type=" << index_type;
+                   << "] not found in raw_vectors, vec_name=" << vec_name;
         return -1;
       }
       bool has_delete = false;
@@ -1461,8 +1521,7 @@ int VectorManager::Load(const std::vector<std::string> &index_dirs,
         }
       } else {
         LOG(ERROR) << desc_ << "vector index [" << name
-                   << "] not found in raw_vectors, vec_name=" << vec_name
-                   << ", index_type=" << index_type;
+                   << "] not found in raw_vectors, vec_name=" << vec_name;
         return -1;
       }
       // old version or don't dump vector_index_num
@@ -1542,17 +1601,26 @@ Status VectorManager::CompactVector() {
 }
 
 void VectorManager::ResetIndexTypesAndParams() {
+  index_names_.clear();
   index_types_.clear();
   index_params_.clear();
+  field_to_index_name_.clear();
   LOG(INFO) << desc_ << "Reset index types and parameters";
 }
 
-void VectorManager::AddIndexTypeAndParam(const std::string &index_type,
+void VectorManager::AddIndexTypeAndParam(const std::string &index_name,
+                                         const std::string &field_name,
+                                         const std::string &index_type,
                                          const std::string &index_param) {
+  index_names_.push_back(index_name);
   index_types_.push_back(index_type);
   index_params_.push_back(index_param);
-  LOG(INFO) << desc_ << "Added index type: " << index_type
-            << ", index param: " << index_param;
+  if (!field_name.empty()) {
+    field_to_index_name_[field_name] = index_name;
+  }
+  LOG(INFO) << desc_ << "Added index name: " << index_name
+            << ", field: " << field_name << ", type: " << index_type
+            << ", param: " << index_param;
 }
 
 bool VectorManager::SupportIncrement() {

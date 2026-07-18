@@ -39,6 +39,8 @@ class IndexType:
     HNSW = "HNSW"
     GPU_IVFPQ = "GPU_IVFPQ"
     GPU_IVFFLAT = "GPU_IVFFLAT"
+    NPU_IVFFLAT = "NPU_IVFFLAT"
+    NPU_IVFRABITQ = "NPU_IVFRABITQ"
     SSG = "SSG"
     IVFPQ_RELAYOUT = "IVFPQ_RELAYOUT"
     SCANN = "SCANN"
@@ -206,3 +208,41 @@ class GPUIvfFlatIndex(Index):
             "nprobe": nprobe
         }
         super().__init__(index_name, IndexType.GPU_IVFFLAT, params)
+
+
+class NPUIvfFlatIndex(Index):
+    def __init__(
+        self,
+        index_name: str,
+        metric_type: str,
+        ncentroids: int,
+        training_threshold: Optional[int] = None,
+        nprobe: int = 64
+    ):
+        params = {
+            "metric_type": metric_type,
+            "ncentroids": ncentroids,
+            "training_threshold": training_threshold
+            if training_threshold
+            else int(ncentroids * 39),
+            "nprobe": nprobe
+        }
+        super().__init__(index_name, IndexType.NPU_IVFFLAT, params)
+
+
+class NPUIvfRaBitQIndex(Index):
+    def __init__(
+        self,
+        index_name: str,
+        ncentroids: int,
+        training_threshold: Optional[int] = None,
+        nprobe: int = 64
+    ):
+        params = {
+            "ncentroids": ncentroids,
+            "training_threshold": training_threshold
+            if training_threshold
+            else int(ncentroids * 39),
+            "nprobe": nprobe
+        }
+        super().__init__(index_name, IndexType.NPU_IVFRABITQ, params)

@@ -6,7 +6,7 @@
     # you data save to disk path ,If you are in a production environment, You'd better set absolute paths
     data = ["datas/","datas1/"]
     # log path , If you are in a production environment, You'd better set absolute paths
-    log = "/home/zhouzn/rebuild/vearch/logs/"
+    log = "logs/"
     # default log type for any model
     level = "debug"
     # master <-> ps <-> router will use this key to send or receive data
@@ -80,7 +80,7 @@
     # when behind leader this value, will stop the server for search
     raft_diff_count = 10000
     replica_auto_recover_time = 1800 # second
-    pprof_port = 16060
+    pprof_port = 6060
     # if set true, this ps only use in db meta config
     private = false
     # seconds
