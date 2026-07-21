@@ -1962,7 +1962,16 @@ class TestRebuildPSFailureExtras:
             logger.info("post-failure search response code=%s",
                          sr.json().get("code"))
         finally:
-            cl.start_ps(2, wait_ready=True, timeout=30)
+            # best-effort:mid-rebuild kill 后 ps2 冷启动可能超过 30s
+            # (raft 追赶 + Gamma 引擎 reload + master lease 重认),
+            # 30s 超时不代表清理失败 — 下一条测试的 _ensure_all_ps_alive
+            # 会兜底 kill+restart 走完整的 KeepAlive 注册流程。
+            # 参见同文件 1.5 用例(test_partition_retry_forces_drop_before_zero)
+            # 的同款 pattern。
+            try:
+                cl.start_ps(2, wait_ready=True, timeout=30)
+            except Exception:
+                pass
         drop_space(router_url, db_name, case_space)
 
     def test_multi_target_fail_first_aborts_rest(self):
@@ -2430,6 +2439,12 @@ def _idx_wait_rebuild_completed(
             pytest.fail(
                 f"rebuild failed for {db}/{space}: {json.dumps(progress, indent=2)}"
             )
+        if status == "cancelled":
+            # A user cancel makes cancelled a legitimate terminal state.
+            # Return snapshots so the caller can inspect the final record;
+            # callers expecting a full rebuild should assert on
+            # completed_tasks / status themselves.
+            return snapshots
         time.sleep(poll_interval)
     pytest.fail(
         f"rebuild did not complete within {timeout}s for {db}/{space}; "

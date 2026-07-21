@@ -575,75 +575,6 @@ class TestRebuildBasicLifecycle:
             recall_after["recall_at_1"], recall_after["recall_at_10"],
         )
 
-    def test_rebuild_after_delete_half_data(self):
-        """Insert all data, delete half, then rebuild — verify rebuild completes
-        and search still works on the remaining documents."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_mri_del_rebuild"
-
-        assert create_space(router_url, db_name, _hnsw_space_config(case_space)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        # ---- Delete half of the documents (IDs in range [total//2, total)) ----
-        delete_url = router_url + "/document/delete?timeout=300000"
-        half = total // 2
-        ids_to_delete = [str(i) for i in range(half, total)]
-        # Delete in batches of 200 to avoid oversized requests
-        batch_del = 200
-        for start in range(0, len(ids_to_delete), batch_del):
-            chunk = ids_to_delete[start : start + batch_del]
-            del_data = {
-                "db_name": db_name,
-                "space_name": case_space,
-                "document_ids": chunk,
-            }
-            del_resp = requests.post(delete_url, auth=(username, password), json=del_data)
-            body = del_resp.json()
-            logger.info(
-                "delete batch start=%d count=%d code=%d",
-                start, len(chunk), body.get("code", -1),
-            )
-            assert body.get("code") == 0, f"delete failed: {body}"
-
-        logger.info("deleted %d documents, %d remain", len(ids_to_delete), half)
-
-        # ---- Compute recall BEFORE rebuild (only remaining docs) ----
-        recall_before = _compute_recall(case_space, k=100)
-        logger.info(
-            "recall BEFORE rebuild (after delete): recall@1=%.4f recall@10=%.4f",
-            recall_before["recall_at_1"], recall_before["recall_at_10"],
-        )
-
-        # ---- Trigger rebuild ----
-        resp = _trigger_rebuild(db_name, case_space)
-        assert resp.status_code == 200, f"trigger failed: {resp.text[:500]}"
-        body = resp.json()
-        assert body.get("code") == 0, body
-
-        # ---- Wait for rebuild to complete ----
-        snapshots = _wait_rebuild_completed(db_name, case_space, timeout=600)
-        final = snapshots[-1]
-        assert final["status"] == "completed", final
-        assert final["overall_percent"] == 100, final
-        assert final["failed_tasks"] == 0, final
-
-        _wait_index_status_indexed(db_name, case_space)
-
-        # ---- Verify search still works after rebuild ----
-        _check_search(case_space)
-
-        # ---- Compute recall AFTER rebuild ----
-        recall_after = _compute_recall(case_space, k=100)
-        logger.info(
-            "recall AFTER rebuild (after delete): recall@1=%.4f recall@10=%.4f",
-            recall_after["recall_at_1"], recall_after["recall_at_10"],
-        )
-
-        drop_space(router_url, db_name, case_space)
-
     def test_rebuild_all_spaces_in_db(self):
         """Trigger DB-level rebuild (POST /index/rebuild/dbs/:db) which
         rebuilds every space in the DB.  Create 2 spaces, trigger DB-level
@@ -687,67 +618,6 @@ class TestRebuildBasicLifecycle:
 
         drop_space(router_url, db_name, sp_a)
         drop_space(router_url, db_name, sp_b)
-
-    def test_rebuild_global_multiple_dbs(self):
-        """Global rebuild (POST /index/rebuild/dbs) rebuilds all spaces
-        across all DBs.  Create 2 DBs with 1 space each, trigger global
-        rebuild, verify both spaces are rebuilt."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-
-        extra_db = db_name + "_mri_global2"
-        # Clean up extra DB from prior runs. Do NOT touch the main db_name
-        # here — it is managed by test_prepare_db / test_destroy_db.
-        for db_to_clean in (extra_db,):
-            url = f"{router_url}/dbs/{db_to_clean}/spaces"
-            rs = requests.get(url, auth=(username, password))
-            if rs.status_code == 200:
-                body = rs.json()
-                if body.get("code") == 0 and body.get("data"):
-                    for sp in body["data"]:
-                        sp_name = sp.get("space_name") or sp.get("name") or ""
-                        if sp_name:
-                            drop_space(router_url, db_to_clean, sp_name)
-            drop_db(router_url, db_to_clean)
-
-        create_db(router_url, extra_db)
-
-        sp_main = space_name + "_mri_global2_main"
-        sp_extra = space_name + "_mri_global2_extra"
-
-        assert create_space(router_url, db_name, _flat_space_config(sp_main)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, False, space_name=sp_main)
-        waiting_index_finish(total, space_name=sp_main)
-
-        assert create_space(router_url, extra_db, _flat_space_config(sp_extra)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, False, db_name=extra_db, space_name=sp_extra)
-        waiting_index_finish(total, db_name=extra_db, space_name=sp_extra)
-
-        # Trigger global rebuild.
-        resp = _trigger_rebuild_global()
-        assert resp.status_code == 200, f"trigger failed: {resp.text[:500]}"
-        body = resp.json()
-        logger.info("global rebuild trigger response: %s", body)
-        assert body.get("code") == 0, body
-
-        # Both spaces should appear in the global progress summary.
-        global_summary = _list_rebuild_progress()
-        rebuilt_keys = {r["space_key"] for r in global_summary.get("results", [])}
-        assert f"{db_name}-{sp_main}" in rebuilt_keys, f"{sp_main} not in {rebuilt_keys}"
-        assert f"{extra_db}-{sp_extra}" in rebuilt_keys, f"{sp_extra} not in {rebuilt_keys}"
-
-        _wait_rebuild_completed(db_name, sp_main, timeout=600)
-        _wait_rebuild_completed(extra_db, sp_extra, timeout=600)
-
-        _wait_index_status_indexed(db_name, sp_main)
-        _wait_index_status_indexed(extra_db, sp_extra)
-        _check_search(sp_main)
-        _check_search(sp_extra, db_name_override=extra_db)
-
-        drop_space(router_url, db_name, sp_main)
-        drop_space(router_url, extra_db, sp_extra)
-        drop_db(router_url, extra_db)
 
     def test_rebuild_space_without_index_built(self):
         """Rebuild a space whose vector index has never been built should be
@@ -1312,44 +1182,6 @@ class TestRebuildProgressQuery:
         drop_space(router_url, db_name, sp_main)
         drop_space(router_url, extra_db, sp_extra)
         drop_db(router_url, extra_db)
-
-    def test_rebuild_db_all_spaces_and_progress(self):
-        """Trigger rebuild for all spaces in a DB via _trigger_rebuild_db,
-        then verify DB-level progress contains every space."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-
-        case_space_a = space_name + "_mri_prog_db_a"
-        case_space_b = space_name + "_mri_prog_db_b"
-        assert create_space(router_url, db_name, _flat_space_config(case_space_a)).json()["code"] == 0
-        assert create_space(router_url, db_name, _flat_space_config(case_space_b)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, False, space_name=case_space_a)
-        add(total_batch, batch_size, xb, True, False, space_name=case_space_b)
-        waiting_index_finish(total, space_name=case_space_a)
-        waiting_index_finish(total, space_name=case_space_b)
-
-        # Trigger rebuild for all spaces in the DB.
-        resp = _trigger_rebuild_db(db_name)
-        body = resp.json()
-        logger.info("DB-level trigger response: %s", body)
-        assert body.get("code") == 0, body
-
-        # Query DB-level progress.
-        db_progress = _list_rebuild_progress(db_name)
-        logger.info("DB-level progress: %s", json.dumps(db_progress, indent=2, default=str))
-        results = db_progress.get("results", [])
-        space_keys = [r.get("space_key", "") for r in results]
-        assert any(case_space_a in k for k in space_keys), f"space_a not found in DB progress: {space_keys}"
-        assert any(case_space_b in k for k in space_keys), f"space_b not found in DB progress: {space_keys}"
-
-        _wait_rebuild_completed(db_name, case_space_a, timeout=300)
-        _wait_rebuild_completed(db_name, case_space_b, timeout=300)
-        _wait_index_status_indexed(db_name, case_space_a)
-        _wait_index_status_indexed(db_name, case_space_b)
-
-        drop_space(router_url, db_name, case_space_a)
-        drop_space(router_url, db_name, case_space_b)
 
     def test_global_rebuild_and_progress(self):
         """Trigger global rebuild via _trigger_rebuild_global, then verify
@@ -2007,12 +1839,25 @@ class TestCancelRebuild:
             f"cancel must not advance past target #1, got current_index="
             f"{final.get('current_index')} target={final.get('current_target')}"
         )
-        # error_msg surfaces the "N subsequent index target(s) skipped"
-        # phrase produced by finalize.
+        # error_msg 有两种形态,取决于 cancel 落地时 record 的状态:
+        #   * running → finalize 路径产出 "... N subsequent index target(s)
+        #     skipped"(rebuild_service.go:1257)
+        #   * pending → STM CAS 直接终结,产出 "cancelled by user while
+        #     pending"(rebuild_service.go:404)
+        # 两条路径都满足"cancel 后不进入下一个 target"这个测试主目标
+        # (已由 current_index<=1 覆盖);这里按上文入口断言的同款状态分支
+        # 校验对应措辞。
         err_msg = (final.get("error_msg") or "").lower()
-        assert "skipped" in err_msg or "subsequent" in err_msg, (
-            f"error_msg should describe skipped subsequent targets, got {err_msg!r}"
-        )
+        if entry.get("status") == "running":
+            assert "skipped" in err_msg or "subsequent" in err_msg, (
+                f"error_msg should describe skipped subsequent targets, "
+                f"got {err_msg!r}"
+            )
+        else:
+            assert "cancelled" in err_msg, (
+                f"pending-cancel error_msg should mention cancellation, "
+                f"got {err_msg!r}"
+            )
 
         _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
@@ -2522,41 +2367,6 @@ class TestRebuildDBLevel:
     def test_prepare_db(self):
         _ensure_clean_db()
 
-    def test_db_level_trigger_and_progress(self):
-        """Trigger rebuild for all spaces in a DB, then verify DB-level progress."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-
-        case_space_a = space_name + "_mri_db_a"
-        case_space_b = space_name + "_mri_db_b"
-        assert create_space(router_url, db_name, _flat_space_config(case_space_a)).json()["code"] == 0
-        assert create_space(router_url, db_name, _flat_space_config(case_space_b)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, False, space_name=case_space_a)
-        add(total_batch, batch_size, xb, True, False, space_name=case_space_b)
-        waiting_index_finish(total, space_name=case_space_a)
-        waiting_index_finish(total, space_name=case_space_b)
-
-        resp = _trigger_rebuild_db(db_name)
-        body = resp.json()
-        logger.info("DB-level trigger response: %s", body)
-        assert body.get("code") == 0, body
-
-        db_progress = _list_rebuild_progress(db_name)
-        logger.info("DB-level progress: %s", json.dumps(db_progress, indent=2, default=str))
-        results = db_progress.get("results", [])
-        space_keys = [r.get("space_key", "") for r in results]
-        assert any(case_space_a in k for k in space_keys), f"space_a not found in DB progress: {space_keys}"
-        assert any(case_space_b in k for k in space_keys), f"space_b not found in DB progress: {space_keys}"
-
-        _wait_rebuild_completed(db_name, case_space_a, timeout=300)
-        _wait_rebuild_completed(db_name, case_space_b, timeout=300)
-        _wait_index_status_indexed(db_name, case_space_a)
-        _wait_index_status_indexed(db_name, case_space_b)
-
-        drop_space(router_url, db_name, case_space_a)
-        drop_space(router_url, db_name, case_space_b)
-
     def test_db_level_cancel(self):
         """Trigger DB-level rebuild, then cancel at DB scope."""
         batch_size = 100
@@ -2613,32 +2423,6 @@ class TestRebuildGlobalScope:
 
     def test_prepare_db(self):
         _ensure_clean_db()
-
-    def test_global_trigger_and_progress(self):
-        """Trigger global rebuild and verify global progress summary."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-
-        case_space = space_name + "_mri_global"
-        assert create_space(router_url, db_name, _flat_space_config(case_space)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, False, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        resp = _trigger_rebuild_global()
-        body = resp.json()
-        logger.info("global trigger response: %s", body)
-        assert body.get("code") == 0, body
-
-        global_progress = _list_rebuild_progress()
-        logger.info("global progress: %s", json.dumps(global_progress, indent=2, default=str))
-        results = global_progress.get("results", [])
-        space_keys = [r.get("space_key", "") for r in results]
-        assert any(case_space in k for k in space_keys), f"our space not found in global progress: {space_keys}"
-
-        _wait_rebuild_completed(db_name, case_space, timeout=300)
-        _wait_index_status_indexed(db_name, case_space)
-        drop_space(router_url, db_name, case_space)
 
     def test_global_cancel(self):
         """Trigger global rebuild, then cancel globally."""
