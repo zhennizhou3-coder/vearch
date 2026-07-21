@@ -23,6 +23,7 @@ import (
 	"github.com/vearch/vearch/v3/internal/entity"
 	"github.com/vearch/vearch/v3/internal/pkg/log"
 	json "github.com/vearch/vearch/v3/internal/pkg/vjson"
+	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
 type PartitionService struct {
@@ -156,12 +157,33 @@ func (s *PartitionService) PartitionInfo(ctx context.Context, db *DBService, spa
 	return resultInsideDbs, nil
 }
 
+// RegisterPartition persists a PS-reported partition snapshot.
 func (s *PartitionService) RegisterPartition(ctx context.Context, partition *entity.Partition) error {
 	log.Info("register partition:[%d] ", partition.Id)
-	marshal, err := json.Marshal(partition)
-	if err != nil {
-		return err
-	}
 	mc := s.client.Master()
-	return mc.Put(ctx, entity.PartitionKey(partition.Id), marshal)
+	key := entity.PartitionKey(partition.Id)
+
+	return mc.STM(ctx, func(stm concurrency.STM) error {
+		raw := stm.Get(key)
+		if raw != "" {
+			cur := &entity.Partition{}
+			if err := json.Unmarshal([]byte(raw), cur); err != nil {
+				return fmt.Errorf("unmarshal current partition %d: %w", partition.Id, err)
+			}
+			if partition.ReStatusMap == nil {
+				partition.ReStatusMap = make(map[uint64]uint32)
+			}
+			for nodeID, st := range cur.ReStatusMap {
+				if st == entity.ReplicasRebuildingIndex {
+					partition.ReStatusMap[nodeID] = entity.ReplicasRebuildingIndex
+				}
+			}
+		}
+		marshal, err := json.Marshal(partition)
+		if err != nil {
+			return err
+		}
+		stm.Put(key, string(marshal))
+		return nil
+	})
 }

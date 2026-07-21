@@ -81,7 +81,8 @@ func (ca *clusterAPI) handleError(c *gin.Context, err error) int {
 			vearchpb.ErrorEnum_USER_EXIST, vearchpb.ErrorEnum_ROLE_EXIST:
 			httpCode = response.New(c).JsonError(errors.NewErrUnprocessable(err))
 		case vearchpb.ErrorEnum_DB_NOT_EXIST, vearchpb.ErrorEnum_SPACE_NOT_EXIST, vearchpb.ErrorEnum_ALIAS_NOT_EXIST,
-			vearchpb.ErrorEnum_USER_NOT_EXIST, vearchpb.ErrorEnum_ROLE_NOT_EXIST, vearchpb.ErrorEnum_PARTITION_SERVER_NOT_EXIST:
+			vearchpb.ErrorEnum_USER_NOT_EXIST, vearchpb.ErrorEnum_ROLE_NOT_EXIST, vearchpb.ErrorEnum_PARTITION_SERVER_NOT_EXIST,
+			vearchpb.ErrorEnum_REBUILD_RECORD_NOT_EXIST:
 			httpCode = response.New(c).JsonError(errors.NewErrNotFound(err))
 		case vearchpb.ErrorEnum_PARAM_ERROR, vearchpb.ErrorEnum_CONFIG_ERROR:
 			httpCode = response.New(c).JsonError(errors.NewErrBadRequest(err))
@@ -1324,7 +1325,7 @@ func (ca *clusterAPI) getRebuildProgress(c *gin.Context) {
 	progress, err := ca.masterService.Rebuild().GetRebuildProgress(c, dbName, spaceName)
 	if err != nil {
 		log.Error("getRebuildProgress failed: %v", err)
-		response.New(c).JsonError(errors.NewErrInternal(err))
+		ca.handleError(c, err)
 		return
 	}
 

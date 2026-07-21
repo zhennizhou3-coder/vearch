@@ -194,9 +194,9 @@ class TestIndexFlush:
         ["training_threshold", "index_type"],
         [
             [1, "FLAT"],
-            [3999, "IVFPQ"],
-            [3999, "IVFFLAT"],
-            [3999, "IVFRABITQ"],
+            [9999, "IVFPQ"],
+            [9999, "IVFFLAT"],
+            [9999, "IVFRABITQ"],
             [1, "HNSW"],
             [10000, "DISKANN_STATIC"],
         ],

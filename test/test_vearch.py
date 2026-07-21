@@ -563,10 +563,10 @@ class VearchCase:
     [
         [1, "FLAT", "MemoryOnly"],
         [1, "FLAT", "RocksDB"],
-        [990, "IVFPQ", "MemoryOnly"],
-        [990, "IVFPQ", "RocksDB"],
+        [10000, "IVFPQ", "MemoryOnly"],
+        [10000, "IVFPQ", "RocksDB"],
         [1, "HNSW", ""],
-        [990, "IVFFLAT", ""],
+        [10000, "IVFFLAT", ""],
     ],
 )
 def test_vearch_basic_usage(training_threshold: int, index_type: str, store_type: str):
@@ -579,9 +579,9 @@ def test_vearch_basic_usage(training_threshold: int, index_type: str, store_type
     ["training_threshold", "index_type"],
     [
         [1, "FLAT"],
-        [990, "IVFPQ"],
+        [10000, "IVFPQ"],
         [1, "HNSW"],
-        [990, "IVFFLAT"],
+        [10000, "IVFFLAT"],
     ],
 )
 def test_vearch_basic_usage_with_realtime(training_threshold: int, index_type: str):
@@ -595,10 +595,10 @@ def test_vearch_basic_usage_with_realtime(training_threshold: int, index_type: s
     [
         [1, "FLAT", "MemoryOnly"],
         [1, "FLAT", "RocksDB"],
-        [990, "IVFPQ", "MemoryOnly"],
-        [990, "IVFPQ", "RocksDB"],
+        [10000, "IVFPQ", "MemoryOnly"],
+        [10000, "IVFPQ", "RocksDB"],
         [1, "HNSW", ""],
-        [990, "IVFFLAT", ""],
+        [10000, "IVFFLAT", ""],
     ],
 )
 def test_vearch_usage_operator_metadata(training_threshold: int, index_type: str, store_type: str):
@@ -615,7 +615,7 @@ def test_vearch_usage_operator_metadata(training_threshold: int, index_type: str
     [
         [1, "FLAT", "NOTSUPPORTTYPE"],
         [1, "HNSW", "RocksDB"],
-        [990, "IVFFLAT", "MemoryOnly"],
+        [10000, "IVFFLAT", "MemoryOnly"],
     ],
 )
 def test_vearch_create_space(training_threshold: int, index_type: str, store_type: str):

@@ -26,6 +26,7 @@ import (
 	"github.com/vearch/vearch/v3/internal/entity"
 	"github.com/vearch/vearch/v3/internal/pkg/log"
 	"github.com/vearch/vearch/v3/internal/pkg/vjson"
+	"github.com/vearch/vearch/v3/internal/proto/vearchpb"
 	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
@@ -195,6 +196,8 @@ func (s *RebuildService) StartRebuild(ctx context.Context, req *RebuildRequest) 
 }
 
 // GetRebuildProgress returns the current progress for one space.
+// Returns a REBUILD_RECORD_NOT_EXIST error when no record exists for
+// (dbName, spaceName). Callers/handlers should surface that as 404.
 func (s *RebuildService) GetRebuildProgress(ctx context.Context, dbName, spaceName string) (*RebuildProgressResponse, error) {
 	key := entity.RebuildSpaceKey(dbName, spaceName)
 	rec, err := s.loadRecord(ctx, key)
@@ -202,10 +205,8 @@ func (s *RebuildService) GetRebuildProgress(ctx context.Context, dbName, spaceNa
 		return nil, err
 	}
 	if rec == nil {
-		return &RebuildProgressResponse{
-			SpaceKey: dbName + "-" + spaceName,
-			Status:   entity.RebuildStatusNotFound,
-		}, nil
+		return nil, vearchpb.NewError(vearchpb.ErrorEnum_REBUILD_RECORD_NOT_EXIST,
+			fmt.Errorf("rebuild record for %s/%s does not exist", dbName, spaceName))
 	}
 	return rebuildProgressFromRecord(rec), nil
 }
@@ -253,8 +254,6 @@ func (s *RebuildService) listRebuildProgressByPrefix(ctx context.Context, prefix
 			summary.RunningCount++
 		case entity.RebuildStatusPending:
 			summary.PendingCount++
-		case entity.RebuildStatusNotFound:
-			summary.NotFoundCount++
 		}
 	}
 
@@ -477,20 +476,6 @@ func (s *RebuildService) loadRecord(ctx context.Context, key string) (*SpaceRebu
 		return nil, err
 	}
 	return rec, nil
-}
-
-func (s *RebuildService) saveRecord(ctx context.Context, key string, rec *SpaceRebuildRecord) error {
-	value, err := vjson.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	return s.client.Master().STM(ctx, func(stm concurrency.STM) error {
-		if existing := stm.Get(key); existing != "" {
-			return fmt.Errorf("rebuild record for %s already exists", key)
-		}
-		stm.Put(key, string(value))
-		return nil
-	})
 }
 
 // rebuildProgressFromRecord converts the persistent record into the API response.
@@ -983,7 +968,6 @@ func (sc *RebuildScheduler) advanceRunningRecord(ctx context.Context,
 // on top of INV-0 (one running record cluster-wide), giving the whole
 // scheduler a single active task at any moment.
 func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebuildRecord) bool {
-	_ = ctx
 	// If any task in this record is already in flight, don't dispatch more.
 	for _, t := range rec.Tasks {
 		if t.Dispatched && !t.Status.IsTerminal() {
@@ -991,11 +975,23 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 		}
 	}
 
+	mc := sc.client.Master()
 	dirty := false
 	for _, t := range rec.Tasks {
 		if t.Dispatched || t.Status.IsTerminal() {
 			continue
 		}
+
+		// Refresh PSNodeAddr before every dispatch
+		server, qerr := mc.QueryServer(ctx, t.NodeID)
+		if qerr != nil || server == nil {
+			log.Error("QueryServer nodeID=%d failed for %s pid=%d: %v; failing replica",
+				t.NodeID, rec.SpaceKey(), t.PartitionID, qerr)
+			sc.handleReplicaFailure(rec, t,
+				fmt.Sprintf("server nodeID=%d unregistered: %v", t.NodeID, qerr))
+			return true
+		}
+		t.PSNodeAddr = server.RpcAddr()
 
 		t.DispatchAttempts++
 		t.DispatchAt = time.Now()
@@ -1013,10 +1009,7 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 				sc.handleReplicaFailure(rec, t,
 					fmt.Sprintf("ExecuteRebuildIndex failed %d times: %v",
 						t.DispatchAttempts, err))
-				// If handleReplicaFailure decided to retry in place, keep
-				// scanning so we can dispatch a different task this tick;
-				// otherwise the task is terminal (Failed) and we also move on.
-				continue
+				return true
 			}
 			log.Warn("ExecuteRebuildIndex %s pid=%d nodeID=%d failed (attempt=%d/%d), will retry: %v",
 				rec.SpaceKey(), t.PartitionID, t.NodeID,
@@ -1173,7 +1166,7 @@ func (sc *RebuildScheduler) markReplicaRebuilding(ctx context.Context,
 func (sc *RebuildScheduler) unmarkRebuildingForTerminalTasks(
 	ctx context.Context, rec *SpaceRebuildRecord) {
 	for _, t := range rec.Tasks {
-		if !t.Dispatched || !t.Status.IsTerminal() {
+		if !t.Status.IsTerminal() {
 			continue
 		}
 		if err := sc.markReplicaRebuilding(ctx, t.PartitionID, t.NodeID, false); err != nil {
@@ -1411,15 +1404,32 @@ func (sc *RebuildScheduler) casAdmitPending(ctx context.Context, rec *SpaceRebui
 	return !conflict, nil
 }
 
-// persistRecord writes the in-memory record back to etcd.
+// persistRecord writes the in-memory record back to etcd, preserving any
+// task-level Cancelled markers that CancelRebuild may have set between the
+// tick's initial load and this write
 func (sc *RebuildScheduler) persistRecord(ctx context.Context, rec *SpaceRebuildRecord) error {
-	value, err := vjson.Marshal(rec)
-	if err != nil {
-		return err
-	}
 	key := entity.RebuildSpaceKey(rec.DBName, rec.SpaceName)
 	return sc.client.Master().STM(ctx, func(stm concurrency.STM) error {
-		_ = stm.Get(key) // include in read set for CAS retry
+		raw := stm.Get(key)
+		if raw == "" {
+			return fmt.Errorf("persist %s: record gone from etcd", key)
+		}
+		current := &SpaceRebuildRecord{}
+		if err := vjson.Unmarshal([]byte(raw), current); err != nil {
+			return fmt.Errorf("persist %s: unmarshal current: %w", key, err)
+		}
+		if current.Status == entity.RebuildStatusCancelled {
+			log.Info("persistRecord %s: etcd record is Cancelled; skipping persist", key)
+			return nil
+		}
+		// Merge task-level Cancelled markers so they survive this write.
+		if merged := rec.MergeCancelledFrom(current); merged > 0 {
+			log.Info("persistRecord %s: preserved %d task-level cancels from concurrent CancelRebuild", key, merged)
+		}
+		value, err := vjson.Marshal(rec)
+		if err != nil {
+			return fmt.Errorf("persist %s: marshal: %w", key, err)
+		}
 		stm.Put(key, string(value))
 		return nil
 	})

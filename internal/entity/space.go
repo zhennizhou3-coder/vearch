@@ -352,16 +352,16 @@ func (index *Index) UnmarshalJSON(bs []byte) error {
 				}
 			}
 
+			// training_threshold >= ncentroids * min_points_per_centroid (=39)
 			if indexParams.TrainingThreshold != 0 {
-				if indexParams.TrainingThreshold < indexParams.Ncentroids {
-					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than ncentroids:[%d]", indexParams.TrainingThreshold, indexParams.Ncentroids))
-				}
 				if indexParams.TrainingThreshold < MinTrainingThreshold {
 					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than [%d]", indexParams.TrainingThreshold, MinTrainingThreshold))
 				}
-			} else {
-				if indexParams.Ncentroids != 0 && indexParams.Ncentroids*DefaultMinPointsPerCentroid < MinTrainingThreshold {
-					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than [%d]", indexParams.TrainingThreshold, MinTrainingThreshold))
+				if indexParams.Ncentroids != 0 {
+					required := indexParams.Ncentroids * DefaultMinPointsPerCentroid
+					if indexParams.TrainingThreshold < required {
+						return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should be >= ncentroids[%d] * %d = %d", indexParams.TrainingThreshold, indexParams.Ncentroids, DefaultMinPointsPerCentroid, required))
+					}
 				}
 			}
 			if indexParams.Nprobe != 0 && indexParams.Nprobe > indexParams.Ncentroids {
@@ -649,6 +649,15 @@ func MergeFieldIndexes(props map[string]*SpaceProperties, indexes *[]*Index) err
 			if field.Index.Type == CompositeIndexType {
 				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
 					fmt.Errorf("field[%s] index type[COMPOSITE] can not set in fields", fieldName))
+			}
+			for _, idx := range *indexes {
+				if idx == nil {
+					continue
+				}
+				if fieldName == idx.FieldName && idx.Type != CompositeIndexType {
+					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
+						fmt.Errorf("field[%s] index duplicated", fieldName))
+				}
 			}
 			index := &Index{
 				Name:      field.Index.Name,

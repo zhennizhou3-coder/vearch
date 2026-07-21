@@ -5,7 +5,7 @@
 # -*- coding: UTF-8 -*-
 
 """
-Chaos / fault-injection tests for index rebuild.
+Cluster-dependent tests for index rebuild.
 
 Covers:
   Category 1: PS process failure during rebuild
@@ -21,6 +21,10 @@ isolated environment only.
 """
 
 import json
+import os
+import shutil
+import random
+import concurrent.futures
 import time
 import threading
 import re
@@ -1861,8 +1865,12 @@ class TestRebuildPSFailureExtras:
         to the router forever, even after the user manually fixes the
         underlying cause.
 
-        Setup: max_retries=0 + persistent ps2 kill = guaranteed real
-        failure path, not retry-induced or cancel-induced.
+        Setup: max_retries=1 + persistent ps2 kill. API 契约里
+        max_retries=0 表示"use default" (defaultMaxRetries=3),不是
+        "零重试"; 想在最少的重试次数下走完 "in-place retry → markFailed
+        → sibling cancel → unmarkRebuildingForTerminalTasks" 全链路,
+        max_retries=1 就够 — 一次 in-place retry 之后 markFailed,同款
+        marker 清扫路径,不会因为 retry 计数不同产生分支。
         """
         case_space = space_name + "_chaos_restatus_fail"
         _ensure_all_ps_alive()
@@ -1874,9 +1882,10 @@ class TestRebuildPSFailureExtras:
             f"msg={body.get('msg')}")
         _populate(case_space, total=5000)
 
-        # max_retries=0 → first replica failure terminates the record.
+        # max_retries=1 → 一次 in-place retry 后 markFailed,触发 sibling cancel
+        # + unmarkRebuildingForTerminalTasks 完整清扫路径。
         assert _trigger_rebuild(db_name, case_space,
-                                max_retries=0).json().get("code") == 0
+                                max_retries=1).json().get("code") == 0
         _wait_until_running(db_name, case_space, timeout=60)
         time.sleep(2)
 
@@ -2270,3 +2279,1481 @@ class TestRebuildPSFailureExtras:
 
     def test_destroy_db(self):
         _ensure_clean_db()
+
+
+# ===========================================================================
+# Multi-node coverage extracted from test_module_rebuild_index.py
+# ===========================================================================
+
+_IDX_PROGRESS_REQUIRED_KEYS = {
+    "space_key",
+    "total_tasks",
+    "completed_tasks",
+    "failed_tasks",
+    "running_tasks",
+    "pending_tasks",
+    "success_ratio",
+    "overall_percent",
+    "status",
+}
+
+def _idx_trigger_rebuild(
+    db: str,
+    space: str,
+    index_name: str = "",
+    max_retries: int = 0,
+):
+    """POST /index/rebuild/dbs/:db/spaces/:space[/indexes/:index_name]
+    """
+    payload = {}
+    if index_name:
+        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/indexes/{index_name}"
+    else:
+        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}"
+    if max_retries > 0:
+        payload["max_retries"] = max_retries
+    resp = requests.post(url, auth=(username, password), json=payload)
+    logger.info("trigger_rebuild url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
+    return resp
+
+def _idx_trigger_rebuild_db(db: str):
+    """POST /index/rebuild/dbs/:db — rebuild all spaces in a DB."""
+    url = f"{router_url}/index/rebuild/dbs/{db}"
+    resp = requests.post(url, auth=(username, password), json={})
+    logger.info("trigger_rebuild_db url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
+    return resp
+
+def _idx_trigger_rebuild_global():
+    """POST /index/rebuild — rebuild all spaces across all DBs."""
+    url = f"{router_url}/index/rebuild"
+    resp = requests.post(url, auth=(username, password), json={})
+    logger.info("trigger_rebuild_global url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
+    return resp
+
+def _idx_trigger_rebuild_drop(db, space):
+      url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}"
+      return requests.post(url, auth=(username, password),
+                           json={"drop_before_rebuild": True})
+
+def _idx_get_rebuild_progress(db: str, space: str) -> dict:
+    """GET /index/rebuild/dbs/:db/spaces/:space/progress"""
+    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/progress"
+    resp = requests.get(url, auth=(username, password))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("code") == 0, body
+    data = body.get("data", {}) or {}
+    missing = _IDX_PROGRESS_REQUIRED_KEYS - set(data.keys())
+    assert not missing, f"progress response missing keys {missing}: {data}"
+    return data
+
+def _idx_list_rebuild_progress(db: str = "") -> dict:
+    """GET progress summary.
+
+    db=""  -> GET /index/rebuild/progress           (global summary)
+    db=xxx -> GET /index/rebuild/dbs/xxx/progress  (db-level summary)
+    """
+    if db:
+        url = f"{router_url}/index/rebuild/dbs/{db}/progress"
+    else:
+        url = f"{router_url}/index/rebuild/progress"
+    resp = requests.get(url, auth=(username, password))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("code") == 0, body
+    return body.get("data", {})
+
+def _idx_cancel_rebuild(db: str, space: str):
+    """POST /index/rebuild/dbs/:db/spaces/:space/cancel"""
+    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/cancel"
+    resp = requests.post(url, auth=(username, password))
+    return resp
+
+def _idx_cancel_rebuild_db(db: str):
+    """POST /index/rebuild/dbs/:db/cancel — cancel all rebuilds in a DB."""
+    url = f"{router_url}/index/rebuild/dbs/{db}/cancel"
+    resp = requests.post(url, auth=(username, password))
+    return resp
+
+def _idx_cancel_rebuild_global():
+    """POST /index/rebuild/cancel — cancel all rebuilds globally."""
+    url = f"{router_url}/index/rebuild/cancel"
+    resp = requests.post(url, auth=(username, password))
+    return resp
+
+def _idx_wait_rebuild_completed(
+    db: str,
+    space: str,
+    timeout: int = 600,
+    poll_interval: int = 3,
+) -> list:
+    """Poll progress until terminal. Returns chronological snapshots.
+
+    Note on monotonicity: overall_percent is the progress of the *current*
+    rebuild target, not the aggregate across all targets. When a multi-
+    index rebuild advances from target N to N+1, master resets
+    Tasks/TotalTasks for the new target and overall_percent drops back
+    toward 0 (see rebuild_service.prepareNextTarget). We only require
+    monotonicity *within* a single target (same current_index).
+    """
+    deadline = time.time() + timeout
+    snapshots = []
+    last_overall = -1
+    last_current_index = -1
+    while time.time() < deadline:
+        progress = _idx_get_rebuild_progress(db, space)
+        snapshots.append(progress)
+        status = progress["status"]
+        overall = progress.get("overall_percent", 0)
+        current_index = progress.get("current_index", 0)
+
+        if current_index == last_current_index:
+            assert overall >= last_overall, (
+                f"overall_percent decreased within target #{current_index}: "
+                f"{last_overall} -> {overall}\n"
+                f"snapshot: {json.dumps(progress, indent=2)}"
+            )
+        last_overall = overall
+        last_current_index = current_index
+
+        logger.info(
+            "progress: status=%s target=%d overall=%d%% completed=%d/%d running=%d pending=%d failed=%d ratio=%.2f",
+            status, current_index, overall,
+            progress["completed_tasks"], progress["total_tasks"],
+            progress["running_tasks"], progress["pending_tasks"],
+            progress["failed_tasks"], progress["success_ratio"],
+        )
+
+        if status == "completed":
+            return snapshots
+        if status == "failed":
+            pytest.fail(
+                f"rebuild failed for {db}/{space}: {json.dumps(progress, indent=2)}"
+            )
+        time.sleep(poll_interval)
+    pytest.fail(
+        f"rebuild did not complete within {timeout}s for {db}/{space}; "
+        f"last snapshot: {json.dumps(snapshots[-1] if snapshots else {}, indent=2)}"
+    )
+
+def _idx_wait_index_status_indexed(
+    db: str,
+    space: str,
+    max_rounds: int = 180,
+    poll_interval: int = 5,
+) -> None:
+    """Wait until every partition reports engine IndexStatus == INDEXED (2)."""
+    url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
+    for round_i in range(max_rounds):
+        rs = requests.get(url, auth=(username, password))
+        assert rs.status_code == 200, rs.text
+        body = rs.json()
+        assert body.get("code") == 0, body
+        data = body.get("data", {})
+        partitions = data.get("partitions", [])
+        idx_statuses = [p.get("index_status", -1) for p in partitions]
+        logger.info(
+            "index_status round=%d status=%s partitions=%s",
+            round_i, data.get("status"), idx_statuses,
+        )
+        if data.get("status") != "red" and partitions and all(s == 2 for s in idx_statuses):
+            return
+        time.sleep(poll_interval)
+    pytest.fail(f"index_status did not reach INDEXED for {db}/{space} within {max_rounds} rounds")
+
+def _idx_check_search(case_space_name: str, times: int = 5, db_name_override: str = ""):
+    """Light search smoke test after rebuild."""
+    target_db = db_name_override or db_name
+    url = router_url + "/document/search?timeout=2000000"
+    for i in range(times):
+        data = {
+            "vector_value": True,
+            "db_name": target_db,
+            "space_name": case_space_name,
+            "vectors": [{"field": "field_vector", "feature": xb[i : i + 1].flatten().tolist()}],
+        }
+        rs = requests.post(url, auth=(username, password), json=data)
+        body = rs.json()
+        if body.get("code") != 0:
+            logger.warning("search returned non-zero code: %s", body)
+            continue
+        documents = body["data"]["documents"]
+        assert len(documents) == 1
+
+def _idx_compute_recall(case_space_name: str, k: int = 100) -> dict:
+    """Compute recall@1 and recall@10 against SIFT10K groundtruth.
+
+    Returns a dict with keys ``recall_at_1`` and ``recall_at_10``, each
+    in [0.0, 1.0].
+
+    The groundtruth ``gt`` is indexed by query index; each query's
+    nearest-neighbour ground truth is ``gt[i][:1]`` (recall@1) and
+    ``gt[i][:10]`` (recall@10).  We search the space and check whether
+    the returned ``field_int`` values (which equal the document ID in
+    the standard add() flow) overlap with the groundtruth set.
+    """
+    url = router_url + "/document/search?timeout=2000000"
+    nq = xq.shape[0]
+    recall1_hits = 0
+    recall10_hits = 0
+
+    for i in range(nq):
+        data = {
+            "vector_value": False,
+            "db_name": db_name,
+            "space_name": case_space_name,
+            "vectors": [{"field": "field_vector", "feature": xq[i].tolist()}],
+            "fields": ["field_int"],
+            "limit": k,
+        }
+        rs = requests.post(url, auth=(username, password), json=data)
+        body = rs.json()
+        if body.get("code") != 0:
+            logger.warning("search returned non-zero code for query %d: %s", i, body)
+            continue
+        documents = body["data"]["documents"]
+        if not documents:
+            continue
+        # documents is a list of result-lists (one per query vector).
+        # With a single query vector it is [[result1, result2, ...]].
+        results = documents[0] if isinstance(documents[0], list) else documents
+        returned_ids = set()
+        for r in results:
+            fid = r.get("field_int")
+            if fid is not None:
+                returned_ids.add(fid)
+        # field_int in add() = index*batch_size + j (0-based).
+        # SIFT groundtruth IDs match field_int values directly (0-based).
+        gt1 = set([int(gt[i][0])])
+        gt10 = set(int(g) for g in gt[i][:10])
+        if returned_ids & gt1:
+            recall1_hits += 1
+        if returned_ids & gt10:
+            recall10_hits += 1
+
+    return {
+        "recall_at_1": recall1_hits / nq if nq else 0.0,
+        "recall_at_10": recall10_hits / nq if nq else 0.0,
+    }
+
+def _idx_check_search_field(case_space_name: str, field: str, times: int = 3, db_name_override: str = ""):
+    """Search smoke test targeting a specific vector field."""
+    target_db = db_name_override or db_name
+    url = router_url + "/document/search?timeout=2000000"
+    for i in range(times):
+        data = {
+            "vector_value": True,
+            "db_name": target_db,
+            "space_name": case_space_name,
+            "vectors": [{"field": field, "feature": xb[i : i + 1].flatten().tolist()}],
+        }
+        rs = requests.post(url, auth=(username, password), json=data)
+        body = rs.json()
+        if body.get("code") != 0:
+            logger.warning("search returned non-zero code: %s", body)
+            continue
+        documents = body["data"]["documents"]
+        assert len(documents) == 1
+
+def _idx_ensure_clean_db():
+    """Drop all spaces then drop DB, then create a fresh DB.
+
+    Step 1/2 are async on the master side (drop_space returns once master
+    accepts the request, but partitions are torn down on PS afterwards;
+    similarly drop_db can race with residual space removal). We poll
+    after each destructive step until the master view actually clears.
+
+    The final create_db is asserted — silent failure here had been
+    masquerading as a "code=1 / db_not_exist" failure on the next
+    create_space, which is exactly the flaky CI hit we just observed.
+    """
+    spaces_url = f"{router_url}/dbs/{db_name}/spaces"
+    db_url = f"{router_url}/dbs/{db_name}"
+
+    # Step 1: List existing spaces under the DB and drop each.
+    rs = requests.get(spaces_url, auth=(username, password))
+    logger.info("list spaces response: status=%d body=%s",
+                rs.status_code, rs.text[:500])
+    if rs.status_code == 200:
+        body = rs.json()
+        if body.get("code") == 0 and body.get("data"):
+            for sp in body["data"]:
+                sp_name = sp.get("space_name") or sp.get("name") or ""
+                if sp_name:
+                    logger.info("dropping residual space: %s", sp_name)
+                    drop_resp = drop_space(router_url, db_name, sp_name)
+                    logger.info("drop_space %s result: status=%d body=%s",
+                                sp_name, drop_resp.status_code,
+                                drop_resp.text[:200])
+
+    # Wait until all spaces actually disappear from the master view (max 30s).
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        rs = requests.get(spaces_url, auth=(username, password))
+        if rs.status_code != 200:
+            break  # DB itself already gone -> nothing left to drop
+        body = rs.json()
+        if not body.get("data"):
+            break
+        time.sleep(0.5)
+    else:
+        logger.warning("_ensure_clean_db: spaces did not fully drop within 30s; "
+                       "last list: %s", rs.text[:500])
+
+    # Step 2: Drop DB (ignore "not found"; we created it ourselves anyway).
+    drop_resp = drop_db(router_url, db_name)
+    logger.info("drop_db result: status=%d body=%s",
+                drop_resp.status_code, drop_resp.text[:200])
+
+    # Wait until the DB itself is gone (max 15s).
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        r = requests.get(db_url, auth=(username, password))
+        # Master returns non-200 OR code != 0 once the DB is fully removed.
+        if r.status_code != 200 or r.json().get("code") != 0:
+            break
+        time.sleep(0.5)
+    else:
+        logger.warning("_ensure_clean_db: db %s still visible after drop within 15s",
+                       db_name)
+
+    # Step 3: Create fresh DB — assert success so a silent failure cannot
+    # cascade into "db_not_exist" on later create_space.
+    create_resp = create_db(router_url, db_name)
+    logger.info("create_db result: status=%d body=%s",
+                create_resp.status_code, create_resp.text[:200])
+    assert create_resp.status_code == 200, (
+        f"create_db {db_name} HTTP {create_resp.status_code}: "
+        f"{create_resp.text[:500]}")
+    create_body = create_resp.json()
+    assert create_body.get("code") == 0, (
+        f"create_db {db_name} business error: {create_resp.text[:500]}")
+
+# ---------------------------------------------------------------------------
+# Space config factories
+# ---------------------------------------------------------------------------
+
+def _idx_hnsw_space_config(name: str, partition_num: int = 2, replica_num: int = 1) -> dict:
+    embedding_size = xb.shape[1]
+    return {
+        "name": name, "partition_num": partition_num, "replica_num": replica_num,
+        "fields": [
+            {"name": "field_int", "type": "integer"},
+            {"name": "field_long", "type": "long"},
+            {"name": "field_float", "type": "float"},
+            {"name": "field_double", "type": "double"},
+            {"name": "field_string", "type": "string", "index": {"name": "field_string", "type": "SCALAR"}},
+            {"name": "field_vector", "type": "vector",
+             "index": {"name": "gamma", "type": "HNSW",
+                       "params": {"metric_type": "InnerProduct", "nlinks": 32, "efConstruction": 40, "training_threshold": 1}},
+             "dimension": embedding_size},
+        ],
+    }
+
+def _idx_flat_space_config(name: str, partition_num: int = 1, replica_num: int = 1) -> dict:
+    embedding_size = xb.shape[1]
+    return {
+        "name": name, "partition_num": partition_num, "replica_num": replica_num,
+        "fields": [
+            {"name": "field_int", "type": "integer"},
+            {"name": "field_vector", "type": "vector",
+             "index": {"name": "gamma", "type": "FLAT",
+                       "params": {"metric_type": "L2", "training_threshold": 1}},
+             "dimension": embedding_size},
+        ],
+    }
+
+def _idx_multi_vector_space_config(name: str, partition_num: int = 1) -> dict:
+    """Space with two vector fields, each carrying one index."""
+    embedding_size = xb.shape[1]
+    return {
+        "name": name, "partition_num": partition_num, "replica_num": 1,
+        "fields": [
+            {"name": "field_int", "type": "integer"},
+            {"name": "field_vector_a", "type": "vector",
+             "index": {"name": "gamma_a", "type": "HNSW",
+                       "params": {"metric_type": "L2", "nlinks": 32, "efConstruction": 40, "training_threshold": 1}},
+             "dimension": embedding_size},
+            {"name": "field_vector_b", "type": "vector",
+             "index": {"name": "gamma_b", "type": "FLAT",
+                       "params": {"metric_type": "L2", "training_threshold": 1}},
+             "dimension": embedding_size},
+        ],
+    }
+
+def _idx_ivfflat_space_config(name: str, partition_num: int = 1) -> dict:
+    embedding_size = xb.shape[1]
+    return {
+        "name": name, "partition_num": partition_num, "replica_num": 1,
+        "fields": [
+            {"name": "field_int", "type": "integer"},
+            {"name": "field_vector", "type": "vector",
+             "index": {"name": "gamma", "type": "IVFFLAT",
+                       "params": {"metric_type": "L2", "ncentroids": 128, "training_threshold": 3999}},
+             "dimension": embedding_size},
+        ],
+    }
+
+def _idx_ivfpq_space_config(name: str, partition_num: int = 1) -> dict:
+    embedding_size = xb.shape[1]
+    return {
+        "name": name, "partition_num": partition_num, "replica_num": 1,
+        "fields": [
+            {"name": "field_int", "type": "integer"},
+            {"name": "field_vector", "type": "vector",
+             "index": {"name": "gamma", "type": "IVFPQ",
+                       "params": {"metric_type": "InnerProduct", "ncentroids": 128, "nsubvector": 32, "training_threshold": 3999}},
+             "dimension": embedding_size},
+        ],
+    }
+
+# ---------------------------------------------------------------------------
+# 1. Basic lifecycle
+# ---------------------------------------------------------------------------
+
+def _idx_add_multi_vector_docs(space_name: str):
+    """Insert documents with two vector fields (field_vector_a, field_vector_b).
+
+    The generic ``add()`` helper hard-codes ``field_vector``, which does not
+    exist on multi-vector spaces. We build the payload inline instead.
+
+    Module-level (not bound to any class) so every test class can reuse it.
+    """
+    batch_size = 100
+    total = xb.shape[0]
+    total_batch = int(total / batch_size)
+    url = router_url + "/document/upsert?timeout=2000000"
+    for i in range(total_batch):
+        docs = []
+        for j in range(batch_size):
+            doc_id = i * batch_size + j
+            docs.append({
+                "_id": str(doc_id),
+                "field_int": doc_id,
+                "field_vector_a": xb[i * batch_size + j].tolist(),
+                "field_vector_b": xb[i * batch_size + j].tolist(),
+            })
+        data = {"db_name": db_name, "space_name": space_name, "documents": docs}
+        rs = requests.post(url, auth=(username, password), json=data)
+        body = rs.json()
+        if body.get("code") != 0:
+            logger.error("add multi-vector docs batch %d error: %s", i, body)
+        assert body.get("code") == 0, f"add docs failed batch {i}: {body}"
+    waiting_index_finish(total, space_name=space_name)
+
+
+class TestRebuildProgressQuery:
+    """Verify progress API shape, monotonicity, and detail."""
+
+    def setup_class(self):
+        pass
+
+    def test_prepare_db(self):
+        _idx_ensure_clean_db()
+
+
+
+
+
+
+
+    def test_replicas_rebuilt_sequentially_per_partition(self):
+        """Verify that replicas of the same partition are rebuilt one at a time
+        (sequential), not concurrently.
+
+        The scheduler enforces two constraints in dispatchPending():
+          1. Per-PS serial: at most one active task per PS node.
+          2. Per-partition serial: at most one active replica per partition.
+
+        By creating a space with replica_num >= 2 (replicas on different PS
+        nodes), the per-PS constraint does not block parallel dispatch — the
+        per-partition constraint is the only bottleneck. We rapidly poll the
+        progress API during rebuild and check that in every snapshot, each
+        partition has at most one running (dispatched=true, status=running)
+        task.
+
+        Ref: rebuild_service.go dispatchPending(), lines 1231-1311.
+        """
+        batch_size = 100
+        total = xb.shape[0]
+        total_batch = int(total / batch_size)
+
+        case_space = space_name + "_mri_seq_replica"
+        replica_num = 2
+        partition_num = 2
+
+        # Create space with multiple replicas and multiple partitions.
+        config = _idx_hnsw_space_config(case_space, partition_num=partition_num, replica_num=replica_num)
+        resp = create_space(router_url, db_name, config)
+        body = resp.json()
+        if body.get("code") != 0:
+            # If the cluster has insufficient PS nodes for multi-replica
+            # placement, skip gracefully rather than fail.
+            logger.warning(
+                "Could not create multi-replica space (code=%d, msg=%s). "
+                "Skipping replica-serialization test — cluster may have < %d PS nodes.",
+                body.get("code"), body.get("msg", ""), replica_num,
+            )
+            pytest.skip(
+                f"Cluster cannot host replica_num={replica_num} "
+                f"(need >= {replica_num} PS nodes): {body}"
+            )
+
+        # Insert enough data so that rebuild takes measurable time.
+        add(total_batch, batch_size, xb, True, True, space_name=case_space)
+        waiting_index_finish(total, space_name=case_space)
+
+        # Trigger rebuild.
+        resp = _idx_trigger_rebuild(db_name, case_space)
+        assert resp.json().get("code") == 0, resp.text
+
+        # Rapidly poll progress and collect task snapshots while rebuild is
+        # in progress. We want to capture intermediate states where only a
+        # subset of replicas are dispatched.
+        snapshots = []
+        deadline = time.time() + 600
+        poll_interval = 0.5  # Fast polling to catch intermediate states.
+        while time.time() < deadline:
+            progress = _idx_get_rebuild_progress(db_name, case_space)
+            tasks = progress.get("tasks") or []
+            # Capture the task details relevant to the serial check.
+            snapshot = []
+            for t in tasks:
+                snapshot.append({
+                    "partition_id": t.get("partition_id"),
+                    "replica_index": t.get("replica_index"),
+                    "status": t.get("status"),
+                    "dispatched": t.get("dispatched", False),
+                    "progress": t.get("progress", 0),
+                })
+            snapshots.append(snapshot)
+
+            status = progress["status"]
+            if status in ("completed", "failed"):
+                break
+            time.sleep(poll_interval)
+
+        # Verify: in every snapshot, at most one dispatched-and-running task
+        # per partition_id. This is the per-partition serial constraint.
+        violations = []
+        for i, snap in enumerate(snapshots):
+            # Group dispatched running tasks by partition_id.
+            running_per_partition = {}  # partition_id -> list of replica_index
+            for t in snap:
+                is_running = t["status"] == "running" and t["dispatched"] is True
+                if is_running:
+                    pid = t["partition_id"]
+                    running_per_partition.setdefault(pid, []).append(t["replica_index"])
+            for pid, replicas in running_per_partition.items():
+                if len(replicas) > 1:
+                    violations.append(
+                        f"snapshot {i}: partition {pid} has {len(replicas)} "
+                        f"concurrently running replicas: {replicas}"
+                    )
+
+        assert not violations, (
+            "Per-partition serial constraint violated — found snapshots with "
+            "multiple concurrently running replicas in the same partition:\n"
+            + "\n".join(violations)
+        )
+
+        # Verify: we captured at least one snapshot showing the rebuild in
+        # an intermediate state (some tasks dispatched, not all completed).
+        # This ensures the test actually observed the scheduler behavior,
+        # not just the final state.
+        intermediate_found = False
+        for snap in snapshots:
+            dispatched_count = sum(1 for t in snap if t["dispatched"] is True and t["status"] != "completed")
+            completed_count = sum(1 for t in snap if t["status"] == "completed")
+            total_tasks = len(snap)
+            if total_tasks > 0 and dispatched_count > 0 and completed_count < total_tasks:
+                intermediate_found = True
+                break
+
+        if not intermediate_found:
+            logger.warning(
+                "No intermediate snapshot captured — rebuild may have completed "
+                "too fast to observe per-partition serialization. The constraint "
+                "was not violated, but the test coverage is limited."
+            )
+
+        # Wait for rebuild to complete and clean up.
+        _idx_wait_rebuild_completed(db_name, case_space, timeout=300)
+        _idx_wait_index_status_indexed(db_name, case_space)
+
+        drop_space(router_url, db_name, case_space)
+
+    def test_destroy_db(self):
+        drop_db(router_url, db_name)
+
+
+# ===========================================================================
+# Multi-node coverage extracted from test_module_rebuild_comprehensive.py
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+def _comp_trigger_rebuild(db, space, index_name="", max_retries=0,
+                     drop_before_rebuild=False, describe=0, partition_id=-1,
+                     ensure_indexed=True):
+    """POST rebuild with optional parameters.
+
+    ensure_indexed: gate on every partition reaching index_status==INDEXED
+        before triggering. waiting_index_finish() only waits the *aggregate*
+        index_num to reach total — it does NOT guarantee per-partition
+        index_status has flipped to INDEXED. There is a window (wider for
+        range-partitioned spaces, where index build is more staggered) in
+        which the doc count is complete but some partition is still
+        UNINDEXED. Triggering then is rejected by the server with
+        "rebuild requires an existing index", the rebuild never starts, and
+        the progress poller times out. Gating here makes every trigger
+        deterministic. Pass ensure_indexed=False only when the space is
+        intentionally not (yet) fully indexed at trigger time.
+    """
+    if ensure_indexed:
+        _comp_wait_index_status_indexed(db, space)
+    payload = {}
+    if index_name:
+        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/indexes/{index_name}"
+    else:
+        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}"
+    if max_retries > 0:
+        payload["max_retries"] = max_retries
+    if drop_before_rebuild:
+        payload["drop_before_rebuild"] = True
+    if describe > 0:
+        payload["describe"] = describe
+    if partition_id >= 0:
+        payload["partition_id"] = partition_id
+    resp = requests.post(url, auth=(username, password), json=payload)
+    logger.info("trigger_rebuild url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
+    return resp
+
+
+def _comp_trigger_rebuild_db(db):
+    url = f"{router_url}/index/rebuild/dbs/{db}"
+    return requests.post(url, auth=(username, password), json={})
+
+
+def _comp_get_rebuild_progress(db, space):
+    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/progress"
+    resp = requests.get(url, auth=(username, password))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("code") == 0, body
+    return body.get("data", {}) or {}
+
+
+def _comp_cancel_rebuild(db, space):
+    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/cancel"
+    return requests.post(url, auth=(username, password))
+
+
+def _comp_wait_rebuild_completed(db, space, timeout=600, poll_interval=3, allow_failed=False):
+    """Poll progress until terminal. Returns chronological snapshots.
+
+    Note on monotonicity: overall_percent is the progress of the *current*
+    rebuild target, not the aggregate across all targets. When a multi-index
+    rebuild advances from target N to N+1, master resets Tasks/TotalTasks
+    for the new target and overall_percent drops back toward 0. We only
+    require monotonicity *within* a single target (same current_index).
+    """
+    deadline = time.time() + timeout
+    snapshots = []
+    last_overall = -1
+    last_current_index = -1
+    while time.time() < deadline:
+        progress = _comp_get_rebuild_progress(db, space)
+        snapshots.append(progress)
+        status = progress["status"]
+        overall = progress.get("overall_percent", 0)
+        current_index = progress.get("current_index", 0)
+        if current_index == last_current_index:
+            assert overall >= last_overall, (
+                f"overall_percent decreased within target #{current_index}: "
+                f"{last_overall} -> {overall}"
+            )
+        last_overall = overall
+        last_current_index = current_index
+        logger.info(
+            "progress: status=%s target=%d overall=%d%% completed=%d/%d running=%d failed=%d",
+            status, current_index, overall,
+            progress["completed_tasks"], progress["total_tasks"],
+            progress["running_tasks"], progress["failed_tasks"],
+        )
+        if status == "completed":
+            return snapshots
+        if status == "failed":
+            if allow_failed:
+                return snapshots
+            pytest.fail(f"rebuild failed for {db}/{space}: {json.dumps(progress, indent=2)}")
+        if status == "cancelled":
+            return snapshots
+        time.sleep(poll_interval)
+    pytest.fail(f"rebuild did not complete within {timeout}s for {db}/{space}")
+
+
+def _comp_wait_index_status_indexed(db, space, max_rounds=180, poll_interval=5):
+    url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
+    for r in range(max_rounds):
+        rs = requests.get(url, auth=(username, password))
+        body = rs.json()
+        data = body.get("data", {})
+        partitions = data.get("partitions", [])
+        statuses = [p.get("index_status", -1) for p in partitions]
+        if data.get("status") != "red" and partitions and all(s == 2 for s in statuses):
+            return
+        time.sleep(poll_interval)
+    pytest.fail(f"index_status did not reach INDEXED for {db}/{space}")
+
+
+def _comp_ensure_clean_db():
+    url = f"{router_url}/dbs/{db_name}/spaces"
+    rs = requests.get(url, auth=(username, password))
+    if rs.status_code == 200:
+        body = rs.json()
+        if body.get("code") == 0 and body.get("data"):
+            for sp in body["data"]:
+                sp_name = sp.get("space_name") or sp.get("name") or ""
+                if sp_name:
+                    drop_space(router_url, db_name, sp_name)
+    drop_db(router_url, db_name)
+    create_db(router_url, db_name)
+
+
+def _comp_check_search(case_space_name, times=5, db_name_override=""):
+    target_db = db_name_override or db_name
+    url = router_url + "/document/search?timeout=2000000"
+    for i in range(times):
+        data = {"vector_value": True, "db_name": target_db, "space_name": case_space_name,
+                "vectors": [{"field": "field_vector", "feature": xb[i:i+1].flatten().tolist()}]}
+        rs = requests.post(url, auth=(username, password), json=data)
+        body = rs.json()
+        if body.get("code") != 0:
+            logger.warning("search returned non-zero code: %s", body)
+            continue
+        assert len(body["data"]["documents"]) == 1
+
+
+def _comp_get_space_detail(db, space):
+    url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
+    rs = requests.get(url, auth=(username, password))
+    body = rs.json()
+    assert body.get("code") == 0, body
+    return body.get("data", {})
+
+
+def _comp_delete_documents(db, space, doc_ids):
+    url = router_url + "/document/delete?timeout=300000"
+    batch = 200
+    for start in range(0, len(doc_ids), batch):
+        chunk = doc_ids[start:start+batch]
+        del_data = {"db_name": db, "space_name": space, "document_ids": [str(d) for d in chunk]}
+        resp = requests.post(url, auth=(username, password), json=del_data)
+        assert resp.json().get("code") == 0, f"delete failed: {resp.json()}"
+
+
+def _comp_query_document(db, space, doc_id):
+    url = router_url + "/document/query"
+    data = {"db_name": db, "space_name": space, "document_ids": [doc_id], "fields": ["field_int", "field_vector"]}
+    return requests.post(url, auth=(username, password), json=data).json()
+
+
+# ---------------------------------------------------------------------------
+# Space config factories
+# ---------------------------------------------------------------------------
+
+
+def _comp_hnsw_cfg(name, pn=2, rn=1):
+    dim = xb.shape[1]
+    return {"name": name, "partition_num": pn, "replica_num": rn,
+            "fields": [
+                {"name": "field_int", "type": "integer"},
+                {"name": "field_long", "type": "long"},
+                {"name": "field_float", "type": "float"},
+                {"name": "field_double", "type": "double"},
+                {"name": "field_string", "type": "string", "index": {"name": "field_string", "type": "SCALAR"}},
+                {"name": "field_vector", "type": "vector",
+                 "index": {"name": "gamma", "type": "HNSW",
+                           "params": {"metric_type": "InnerProduct", "nlinks": 32, "efConstruction": 40, "training_threshold": 1}},
+                 "dimension": dim},
+            ]}
+
+def _comp_hnsw_range_partition_cfg(name, pn=1, rn=2):
+    dim = xb.shape[1]
+    return {"name": name, "partition_num": pn, "replica_num": rn,
+            "fields": [
+                {"name": "field_int", "type": "integer"},
+                {"name": "field_date", "type": "date"},
+                {"name": "field_vector", "type": "vector",
+                 "index": {"name": "gamma", "type": "HNSW",
+                           "params": {"metric_type": "InnerProduct", "nlinks": 32, "efConstruction": 40, "training_threshold": 1}},
+                 "dimension": dim},
+            ],
+            "partition_rule": {
+                "type": "RANGE",
+                "field": "field_date",
+                "ranges": [
+                    {"name": "p0", "value": "2026-01-02"},
+                    {"name": "p1", "value": "2026-01-03"},
+                ],
+            }}
+
+def _comp_flat_cfg(name, pn=1, rn=1):
+    dim = xb.shape[1]
+    return {"name": name, "partition_num": pn, "replica_num": rn,
+            "fields": [{"name": "field_int", "type": "integer"},
+                       {"name": "field_vector", "type": "vector",
+                        "index": {"name": "gamma", "type": "FLAT", "params": {"metric_type": "L2", "training_threshold": 1}},
+                        "dimension": dim}]}
+
+def _comp_ivfflat_cfg(name, pn=1, rn=1):
+    dim = xb.shape[1]
+    return {"name": name, "partition_num": pn, "replica_num": rn,
+            "fields": [{"name": "field_int", "type": "integer"},
+                       {"name": "field_vector", "type": "vector",
+                        "index": {"name": "gamma", "type": "IVFFLAT",
+                                  "params": {"metric_type": "L2", "ncentroids": 128, "training_threshold": 3999}},
+                        "dimension": dim}]}
+
+def _comp_ivfpq_cfg(name, pn=1, rn=1):
+    dim = xb.shape[1]
+    return {"name": name, "partition_num": pn, "replica_num": rn,
+            "fields": [{"name": "field_int", "type": "integer"},
+                       {"name": "field_vector", "type": "vector",
+                        "index": {"name": "gamma", "type": "IVFPQ",
+                                  "params": {"metric_type": "InnerProduct", "ncentroids": 128, "nsubvector": 32, "training_threshold": 3999}},
+                        "dimension": dim}]}
+
+def _comp_ivfrabitq_cfg(name, pn=1, rn=1):
+    dim = xb.shape[1]
+    return {"name": name, "partition_num": pn, "replica_num": rn,
+            "fields": [{"name": "field_int", "type": "integer"},
+                       {"name": "field_vector", "type": "vector",
+                        "index": {"name": "gamma", "type": "IVFRABITQ",
+                                  "params": {"metric_type": "InnerProduct", "ncentroids": 128, "training_threshold": 3999}},
+                        "dimension": dim}]}
+
+def _comp_multi3_cfg(name, pn=1, rn=1):
+    """3 vector fields: HNSW + IVFFLAT + IVFPQ.
+    """
+    dim = xb.shape[1]
+    return {"name": name, "partition_num": pn, "replica_num": rn,
+            "fields": [
+                {"name": "field_int", "type": "integer"},
+                {"name": "field_vector_a", "type": "vector",
+                 "index": {"name": "gamma_a", "type": "HNSW",
+                           "params": {"metric_type": "L2", "nlinks": 32, "efConstruction": 40, "training_threshold": 1}},
+                 "dimension": dim},
+                {"name": "field_vector_b", "type": "vector",
+                 "index": {"name": "gamma_b", "type": "IVFFLAT",
+                           "params": {"metric_type": "L2", "ncentroids": 32, "nprobe": 8, "training_threshold": 1248}},
+                 "dimension": dim},
+                {"name": "field_vector_c", "type": "vector",
+                 "index": {"name": "gamma_c", "type": "IVFPQ",
+                           "params": {"metric_type": "InnerProduct", "ncentroids": 32, "nprobe": 8, "nsubvector": 32, "training_threshold": 1248}},
+                 "dimension": dim},
+            ]}
+
+
+def _comp_add_multi3_docs(space_name, n_fields=3):
+    """Insert docs with multiple vector fields."""
+    batch_size, total = 100, xb.shape[0]
+    total_batch = int(total / batch_size)
+    url = router_url + "/document/upsert?timeout=2000000"
+    field_names = ["field_vector_a", "field_vector_b", "field_vector_c"]
+    for i in range(total_batch):
+        docs = []
+        for j in range(batch_size):
+            doc = {"_id": str(i*batch_size+j), "field_int": i*batch_size+j}
+            for k in range(min(n_fields, len(field_names))):
+                doc[field_names[k]] = xb[i*batch_size+j].tolist()
+            docs.append(doc)
+        rs = requests.post(url, auth=(username, password), json={"db_name": db_name, "space_name": space_name, "documents": docs})
+        assert rs.json().get("code") == 0
+    waiting_index_finish(total, space_name=space_name)
+
+def _comp_add_range_partition_docs(space_name, total=10000, batch_size=100):
+    """Insert docs into named range partitions p0 and p1."""
+    url = router_url + "/document/upsert?timeout=2000000"
+    for i in range(total // batch_size):
+        docs = []
+        for j in range(batch_size):
+            idx = i * batch_size + j
+            docs.append({
+                "_id": str(idx),
+                "field_int": idx,
+                "field_date": "2026-01-01" if idx < total // 2 else "2026-01-02",
+                "field_vector": xb[idx].tolist(),
+            })
+        rs = requests.post(url, auth=(username, password),
+                           json={"db_name": db_name, "space_name": space_name,
+                                 "documents": docs},
+                           timeout=30)
+        assert rs.json().get("code") == 0, rs.text
+    waiting_index_finish(total, space_name=space_name)
+
+
+# ===========================================================================
+# 3. Per-partition serialization visibility
+# ===========================================================================
+
+
+
+class TestRebuildReplicaSerialization:
+
+    def setup_class(self):
+        pass
+
+    def test_prepare_db(self):
+        _comp_ensure_clean_db()
+
+    def test_only_one_replica_per_partition_running(self):
+        """3.1: At most 1 running replica per partition at any snapshot."""
+        batch_size, total = 100, xb.shape[0]
+        total_batch = int(total / batch_size)
+        case_space = space_name + "_comp_serial"
+        rn, pn = 2, 2
+
+        resp = create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=pn, rn=rn))
+        if resp.json().get("code") != 0:
+            pytest.skip(f"Cluster cannot host replica_num={rn}: {resp.json()}")
+
+        add(total_batch, batch_size, xb, True, True, space_name=case_space)
+        waiting_index_finish(total, space_name=case_space)
+
+        resp = _comp_trigger_rebuild(db_name, case_space)
+        assert resp.json().get("code") == 0
+
+        snapshots = []
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            progress = _comp_get_rebuild_progress(db_name, case_space)
+            tasks = progress.get("tasks") or []
+            snap = [{"partition_id": t.get("partition_id"), "replica_index": t.get("replica_index"),
+                      "status": t.get("status"), "dispatched": t.get("dispatched", False)} for t in tasks]
+            snapshots.append(snap)
+            if progress["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.2)
+
+        violations = []
+        for i, s in enumerate(snapshots):
+            rpp = {}
+            for t in s:
+                if t["status"] == "running" and t["dispatched"]:
+                    rpp.setdefault(t["partition_id"], []).append(t["replica_index"])
+            for pid, reps in rpp.items():
+                if len(reps) > 1:
+                    violations.append(f"snap {i}: pid {pid} has {len(reps)} running replicas")
+
+        assert not violations, "Per-partition serial violated:\n" + "\n".join(violations)
+
+        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
+        _comp_wait_index_status_indexed(db_name, case_space)
+        drop_space(router_url, db_name, case_space)
+
+
+    def test_search_skips_rebuilding_replica(self):
+        """3.2 STRICT: rebuild 期间任意时刻打到正在 rebuild 的 nodeID 的
+        search 请求数 ≈ 0。
+
+        外部可观测信号有限(search 响应不暴露 nodeID),用三层交叉验证:
+
+        1. 用 partition_names 单 partition 定向查询 + client_type=Random:
+           router 应在剩余 N-1 个未 rebuilding 副本间轮询,Rebuilding
+           副本应被完全跳过。
+        2. 后台轮询 ReStatusMap,记录每个 (pid, nodeID) 何时进入
+           Rebuilding(=3) 状态。
+        3. PS 日志解析每个 PS 的 rebuild 实际开始/结束时间。
+        4. 关键断言:rebuild window 内打到目标 partition 的 search
+           响应延迟 P99 应不显著高于 baseline(若 router 漏过 Rebuilding
+           副本,该副本 CGO 占满 CPU,latency 会暴涨)。
+
+        要求多 PS 集群(由 scripts/cluster.sh 启动)。
+        """
+        batch_size, total = 100, xb.shape[0]
+        case_space = space_name + "_comp_search_skip_strict"
+        rn, pn = 2, 1
+
+        resp = create_space(router_url, db_name, _comp_hnsw_range_partition_cfg(case_space, pn=pn, rn=rn))
+        if resp.json().get("code") != 0:
+            pytest.skip(f"cluster cannot host range partition replica_num={rn}: {resp.json()}")
+        _comp_add_range_partition_docs(case_space, total=total, batch_size=batch_size)
+
+        # Use a real partition_rule range name. Plain hash partitions do not
+        # support partition_names and would fail with "space partition rule is nil".
+        detail = _comp_get_space_detail(db_name, case_space)
+        partitions = detail.get("partitions", [])
+        assert len(partitions) >= 2, f"need ≥2 partitions, got {partitions}"
+        target_pname = "p0"
+
+        # === 第 1 阶段:baseline 测 latency 分布 ===
+        baseline_latencies = []
+        url = router_url + "/document/search?timeout=5000"
+
+        def _search_targeted(pname=None):
+            data = {"vector_value": False, "db_name": db_name,
+                    "space_name": case_space,
+                    "vectors": [{"field": "field_vector",
+                                 "feature": xb[0].tolist()}],
+                    "limit": 5}
+            if pname:
+                data["partition_names"] = [pname]
+            t0 = time.time()
+            try:
+                rs = requests.post(url, auth=(username, password),
+                                   json=data, timeout=5)
+                dt = (time.time() - t0) * 1000
+                body = rs.json()
+                ok = (rs.status_code == 200 and body.get("code") == 0)
+                if not ok:
+                    logger.info("3.2 targeted search failed: status=%s body=%s",
+                                rs.status_code, rs.text[:500])
+                return ok, dt
+            except Exception as e:
+                logger.info("3.2 targeted search exception: %s", e)
+                return False, (time.time() - t0) * 1000
+
+        # 收集 baseline 5s
+        baseline_end = time.time() + 5
+        while time.time() < baseline_end:
+            ok, lat = _search_targeted(target_pname)
+            if ok:
+                baseline_latencies.append(lat)
+            time.sleep(0.02)
+        if not baseline_latencies:
+            pytest.skip("baseline search produced no successful responses")
+        baseline_latencies.sort()
+        baseline_p99 = baseline_latencies[max(0, int(len(baseline_latencies) * 0.99) - 1)]
+        logger.info("3.2 baseline: n=%d p99=%.1fms",
+                     len(baseline_latencies), baseline_p99)
+
+        # === 第 2 阶段:rebuild + 并发 search,实时记录 ReStatusMap ===
+        rebuild_latencies = []
+        restatus_snapshots = []  # list of (ts, {pid: {nodeID: state_str}})
+        stop_evt = threading.Event()
+
+        def _restatus_poller():
+            while not stop_evt.is_set():
+                try:
+                    d = _comp_get_space_detail(db_name, case_space)
+                    snap = {}
+                    for p in d.get("partitions", []):
+                        # detail API exposes per-replica rebuild state under
+                        # "replica_status" with string values
+                        # (ReplicasOK / ReplicasRebuildingIndex / ReplicasNotReady),
+                        # NOT a numeric "status_map".
+                        rsm = p.get("replica_status") or {}
+                        snap[p.get("pid")] = {int(k): v for k, v in rsm.items()}
+                    restatus_snapshots.append((time.time(), snap))
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+        def _search_loop():
+            while not stop_evt.is_set():
+                ok, lat = _search_targeted(target_pname)
+                if ok:
+                    rebuild_latencies.append((time.time(), lat))
+                time.sleep(0.02)
+
+        poller = threading.Thread(target=_restatus_poller, daemon=True)
+        searcher = threading.Thread(target=_search_loop, daemon=True)
+        poller.start()
+        searcher.start()
+
+        resp = _comp_trigger_rebuild(db_name, case_space)
+        trigger_body = resp.json()
+        assert trigger_body.get("code") == 0, trigger_body
+        assert trigger_body.get("data", {}).get("failed", 0) == 0, trigger_body
+        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
+
+        stop_evt.set()
+        poller.join(timeout=5)
+        searcher.join(timeout=5)
+
+        # === 第 3 阶段:断言 ===
+        # 3a. 至少观察到一帧 Rebuilding 状态(否则集群没经过被验证的状态)
+        seen_rebuilding = any(
+            any(s == "ReplicasRebuildingIndex" for nodes in snap.values() for s in nodes.values())
+            for _, snap in restatus_snapshots)
+        assert seen_rebuilding, (
+            "ReStatusMap 全程没出现 Rebuilding 状态;rebuild 太快或 polling "
+            "频率不够,无法验证路由过滤")
+
+        # 3b. rebuild 期间 search 必须保持成功(没有 fail 暴增)
+        rebuild_count = len(rebuild_latencies)
+        assert rebuild_count > 0, "rebuild 期间无成功 search,可能集群异常"
+
+        # 3c. p99 latency 在 rebuild 期间不应显著高于 baseline
+        rebuild_lats_sorted = sorted(lat for _, lat in rebuild_latencies)
+        rebuild_p99 = rebuild_lats_sorted[max(0, int(len(rebuild_lats_sorted) * 0.99) - 1)]
+        logger.info("3.2 rebuild: n=%d p99=%.1fms (baseline p99=%.1fms)",
+                     rebuild_count, rebuild_p99, baseline_p99)
+        # 容忍 5x 退化(rebuild PS 抢 CPU 会让同机器其他 PS 也略慢)
+        # 若 router 漏过 Rebuilding 副本,p99 会几十倍涨
+        assert rebuild_p99 < max(baseline_p99 * 5, 50), (
+            f"rebuild 期间 p99 latency 暴涨: baseline={baseline_p99:.1f}ms, "
+            f"rebuild={rebuild_p99:.1f}ms (>5x);疑似 search 被路由到了 "
+            f"Rebuilding 副本")
+
+        # 3d. 终态后所有 replica_status 应回到 ReplicasOK
+        post_detail = _comp_get_space_detail(db_name, case_space)
+        for p in post_detail.get("partitions", []):
+            rsm = p.get("replica_status") or {}
+            for nid, st in rsm.items():
+                assert st == "ReplicasOK", (
+                    f"rebuild 完成后 pid={p.get('pid')} node={nid} "
+                    f"state={st} 仍未回到 ReplicasOK")
+
+        drop_space(router_url, db_name, case_space)
+
+    def test_leader_rebuild_falls_back_to_follower(self):
+        """3.3 STRICT: 验证 router 在 leader 重建时把 Leader-类型查询
+        fallback 到 follower。
+
+        强化点(相比之前的 weak 版只验"无错"):
+        1. 监控 router 日志,断言出现 N 条 'leader=... rebuilding,
+           fallback to nodeID=' 行(对应 client.go SelectNodeByClientType
+           的 Leader case fallback 分支)。
+        2. 监控 ReStatusMap,验证 leader 副本至少进入过 Rebuilding 状态
+           (否则 fallback 路径未被实际触发,本测试无效)。
+        3. Leader 类型查询全程 code=0。
+
+        per-partition serialization 保证 leader 总会轮到被重建,所以
+        在 timeout 内大概率能观察到 fallback。
+        """
+        batch_size, total = 100, xb.shape[0]
+        total_batch = int(total / batch_size)
+        case_space = space_name + "_comp_leader_fb_strict"
+        rn = 2
+
+        resp = create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=1, rn=rn))
+        if resp.json().get("code") != 0:
+            pytest.skip(f"cluster cannot host replica_num={rn}: {resp.json()}")
+        add(total_batch, batch_size, xb, True, True, space_name=case_space)
+        waiting_index_finish(total, space_name=case_space)
+
+        # 记录 leader nodeID 与 rebuild 起止时间作为日志扫描的时间窗
+        detail = _comp_get_space_detail(db_name, case_space)
+        partitions = detail.get("partitions", [])
+        assert len(partitions) >= 1
+        leader_id = partitions[0].get("leader") or partitions[0].get("LeaderID")
+        logger.info("3.3 leader nodeID before rebuild: %s", leader_id)
+
+        # 后台 leader 查询 + ReStatusMap 监控
+        url = router_url + "/document/search?timeout=5000"
+        leader_query_results = []  # list of (ok, code)
+        leader_seen_rebuilding = [False]
+        stop_evt = threading.Event()
+
+        def _leader_query_loop():
+            while not stop_evt.is_set():
+                data = {"vector_value": False, "db_name": db_name,
+                        "space_name": case_space,
+                        "load_balance": "leader",  # vearch 字段名
+                        "vectors": [{"field": "field_vector",
+                                     "feature": xb[0].tolist()}],
+                        "limit": 1}
+                try:
+                    rs = requests.post(url, auth=(username, password),
+                                       json=data, timeout=5)
+                    body = rs.json() if rs.status_code == 200 else {}
+                    leader_query_results.append(
+                        (rs.status_code == 200, body.get("code")))
+                except Exception:
+                    leader_query_results.append((False, None))
+                time.sleep(0.05)  # ~20 QPS
+
+        def _restatus_poller():
+            while not stop_evt.is_set():
+                try:
+                    d = _comp_get_space_detail(db_name, case_space)
+                    for p in d.get("partitions", []):
+                        rsm = p.get("replica_status") or {}
+                        if leader_id is not None:
+                            st = rsm.get(str(leader_id)) or rsm.get(int(leader_id))
+                            if st == "ReplicasRebuildingIndex":
+                                leader_seen_rebuilding[0] = True
+                except Exception:
+                    pass
+                time.sleep(0.2)
+
+        # 记录 rebuild 触发前的时间用于 router 日志时间窗
+        t_start = time.time()
+
+        searcher = threading.Thread(target=_leader_query_loop, daemon=True)
+        poller = threading.Thread(target=_restatus_poller, daemon=True)
+        searcher.start()
+        poller.start()
+
+        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
+        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
+
+        stop_evt.set()
+        searcher.join(timeout=5)
+        poller.join(timeout=5)
+        t_end = time.time()
+
+        # === 断言 1:leader 类型查询无失败 ===
+        total_q = len(leader_query_results)
+        ok_q = sum(1 for ok, code in leader_query_results if ok and code == 0)
+        bad_q = total_q - ok_q
+        assert total_q > 0, "no leader-type queries issued"
+        err_rate = bad_q / total_q
+        assert err_rate < 0.05, (
+            f"Leader-type query error rate too high: {bad_q}/{total_q} "
+            f"= {err_rate:.2%} (sample fail: "
+            f"{[r for r in leader_query_results if not r[0] or r[1] != 0][:3]})")
+        logger.info("3.3 leader queries: %d ok / %d total", ok_q, total_q)
+
+        # === 断言 2:扫 router 日志找 fallback 行 ===
+        from utils import cluster_helpers as cl
+        fallback_lines = []
+        for ridx in (1, 2):
+            log_dir = cl.LOG_DIR / f"router{ridx}"
+            if not log_dir.exists():
+                continue
+            for f in log_dir.glob("*.log"):
+                try:
+                    txt = f.read_text(errors="ignore")
+                    for line in txt.splitlines():
+                        if ("rebuilding, fallback to nodeID=" in line):
+                            fallback_lines.append(line)
+                except OSError:
+                    continue
+
+        # === 断言 3:三种结果之一 ===
+        if leader_seen_rebuilding[0]:
+            # 见过 leader 处于 Rebuilding → router 必须有 fallback 日志
+            assert fallback_lines, (
+                f"leader 副本观察到处于 Rebuilding 状态,但 router 日志里没有 "
+                f"任何 'leader=... rebuilding, fallback to nodeID=' 行 → "
+                f"router fallback 路径未生效!")
+            logger.info("3.3 fallback verified: %d fallback log lines found, "
+                         "sample: %s", len(fallback_lines),
+                         fallback_lines[0] if fallback_lines else "")
+        else:
+            # leader 在 rebuild 期间没被选中重建,fallback 路径没有触发
+            # (per-partition 串行下,leader 顺序取决于 partition.Replicas
+            # 切片次序,我们没法强制控制).这种情况下 fallback 路径
+            # 没被验证,但测试还是有价值——验证了"无错"。
+            logger.info("3.3 leader replica was never marked Rebuilding "
+                         "during this run; fallback path not exercised. "
+                         "Test passes on the weaker invariant of "
+                         "'no errors'. fallback log count = %d",
+                         len(fallback_lines))
+            # 不强制 assert fallback_lines,因为时序原因可能没触发
+
+        drop_space(router_url, db_name, case_space)
+
+
+    def test_destroy_db_3(self):
+        drop_db(router_url, db_name)
+
+
+class TestRebuildConcurrentWrites:
+
+    def test_prepare_db(self):
+        _comp_ensure_clean_db()
+
+
+
+    def test_search_no_errors_during_rebuild(self):
+        """5.3: 持续 search 期间触发 rebuild,running 窗口内错误率应当低。
+
+        过去把 [baseline + rebuild_running + post_stop] 三段都揉成一个
+        err_rate,假阳性很高 — baseline 阶段的偶发错和 post 阶段集群刚
+        收尾的瞬态错都会把分子顶起来。改成按时间戳分段统计 rebuild
+        running 窗口内的 err_rate,并把错误样本打印到日志(否则失败
+        时只看到 "22.6%" 完全不知道是什么错)。
+
+        阈值放到 10%(在单机 chaos 集群上跑 rn=2 时,master→router cache
+        同步空挡 + per-partition 串行重建副本切换都会带来 1-3% 的瞬态错,
+        2% 不现实)。如果 ≥10% 那才是真有问题。
+        """
+        batch_size, total = 100, 10000
+        case_space = space_name + "_comp_search_load"
+
+        # rn=2 是本测试的硬前提:重建期间唯一 replica 被标 Rebuilding 后
+        # router 的 random 路由会把它过滤干净 (`randIDs=[]`),
+        # `replicaRoundRobin.Next(_, [])` 返回 nodeID=0,最后撞
+        # `create_rpcclient_failed` (code 703)。这条 503 错跟 rebuild
+        # 本身无关,纯粹是「单点 + 副本被滤」的副作用。如果集群规模
+        # 不够放 rn=2,直接 skip — 否则这条测试的语义不成立。
+        cfg = _comp_hnsw_cfg(case_space, pn=1, rn=2)
+        resp = create_space(router_url, db_name, cfg)
+        if resp.json().get("code") != 0:
+            pytest.skip(
+                f"5.3 needs ≥2 PS to satisfy rn=2: {resp.json()}")
+        # 即便 create_space 返回 0,也要验证 placement 真的给了 2 份
+        # — 有些集群配置下 rn 会被静默降级,空看 code 不靠谱。
+        detail0 = _comp_get_space_detail(db_name, case_space)
+        placement_check = []
+        for p in detail0.get("partitions", []):
+            rsm = p.get("replica_status") or {}
+            placement_check.append((p.get("pid"), len(rsm), list(rsm.keys())))
+        # 注意 rsm 可能在创建后还没立刻写满,这里只用 raft_status.Replicas
+        # 这条权威源做断言。
+        first = (detail0.get("partitions") or [{}])[0]
+        raft_replicas = (first.get("raft_status") or {}).get("Replicas") or {}
+        if len(raft_replicas) < 2:
+            drop_space(router_url, db_name, case_space)
+            pytest.skip(
+                f"5.3 partition was placed with only {len(raft_replicas)} replica(s): "
+                f"{raft_replicas} (placement={placement_check}); test requires "
+                f"≥2 to survive single-replica Rebuilding window")
+        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
+        waiting_index_finish(total, space_name=case_space)
+
+        stop_evt = threading.Event()
+        # 改成存 (timestamp, kind, detail) 三元组,kind ∈ {ok, http_err, exception}
+        events = []
+        events_lock = threading.Lock()
+
+        def search_loop():
+            url = router_url + "/document/search?timeout=10000"
+            i = 0
+            while not stop_evt.is_set():
+                data = {"vector_value": False, "db_name": db_name, "space_name": case_space,
+                        "vectors": [{"field": "field_vector", "feature": xb[i % total].tolist()}]}
+                ts = time.time()
+                try:
+                    rs = requests.post(url, auth=(username, password), json=data, timeout=10)
+                    # 关键: vearch router 在 status_code != 200 时 body 仍是
+                    # JSON 带 {code, msg};不要 silently 丢掉。
+                    try:
+                        body = rs.json()
+                    except Exception:
+                        body = {}
+                    code = body.get("code")
+                    if rs.status_code == 200 and code == 0:
+                        with events_lock:
+                            events.append((ts, "ok", None))
+                    else:
+                        # 把 HTTP status + vearch code + msg 全捕获
+                        with events_lock:
+                            events.append((ts, "http_err",
+                                           (rs.status_code, code,
+                                            (body.get("msg") or "")[:160])))
+                except Exception as e:
+                    with events_lock:
+                        events.append((ts, "exception", repr(e)[:160]))
+                i += 1
+                time.sleep(0.02)
+
+        t = threading.Thread(target=search_loop, daemon=True)
+        t.start()
+        time.sleep(2)  # 让 baseline 阶段先跑一会儿,稍后剔除
+
+        rebuild_start = time.time()
+        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
+
+        # 后台同步快照 ReStatusMap, 用于诊断 503/703 类错误时 partition 副本
+        # 状态: 重建途中是否出现「所有 replica 同时被标 Rebuilding」的窗口
+        # (即 router 视角下没有任何可用 replica → nodeID=0 → code=703)。
+        restatus_snapshots = []  # list of (ts, {nodeID: state})
+
+        def restatus_poller():
+            while not stop_evt.is_set():
+                try:
+                    d = _comp_get_space_detail(db_name, case_space)
+                    for p in d.get("partitions", []):
+                        rsm = p.get("replica_status") or {}
+                        restatus_snapshots.append((time.time(), dict(rsm)))
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.1)
+
+        rs_thread = threading.Thread(target=restatus_poller, daemon=True)
+        rs_thread.start()
+
+        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
+        rebuild_end = time.time()
+
+        time.sleep(2)
+        stop_evt.set()
+        t.join(timeout=5)
+        rs_thread.join(timeout=5)
+
+        # === 分段统计 ===
+        # baseline:   ts < rebuild_start
+        # during:     rebuild_start <= ts <= rebuild_end (这是我们要 assert 的窗口)
+        # post:       ts > rebuild_end
+        baseline = [e for e in events if e[0] < rebuild_start]
+        during   = [e for e in events if rebuild_start <= e[0] <= rebuild_end]
+        post     = [e for e in events if e[0] > rebuild_end]
+
+        def summarize(label, slice_):
+            ok = sum(1 for _, k, _ in slice_ if k == "ok")
+            errs = [e for e in slice_ if e[1] != "ok"]
+            rate = len(errs) / max(1, len(slice_))
+            logger.info("5.3 %s: n=%d ok=%d err=%d rate=%.2f%%",
+                        label, len(slice_), ok, len(errs), rate * 100)
+            # 打前 5 条错误的细节,失败时方便定位
+            if errs:
+                for ts, kind, detail in errs[:5]:
+                    logger.info("    sample err (%s): %s", kind, detail)
+                # 按 (kind, http_status, vearch_code) 聚合 — 看错误是不是同源
+                from collections import Counter
+                buckets = Counter()
+                for _, kind, detail in errs:
+                    if kind == "http_err" and isinstance(detail, tuple) and len(detail) >= 2:
+                        # detail = (status_code, vearch_code, msg)
+                        buckets[(kind, detail[0], detail[1])] += 1
+                    else:
+                        buckets[(kind, None, None)] += 1
+                logger.info("    error breakdown (kind, http_status, vearch_code): %s",
+                            dict(buckets))
+            return rate, errs
+
+        summarize("baseline", baseline)
+        during_rate, during_errs = summarize("during rebuild", during)
+        summarize("post", post)
+
+        rebuild_secs = rebuild_end - rebuild_start
+        logger.info("5.3 rebuild window duration: %.1fs", rebuild_secs)
+
+        # 把 ReStatusMap 时序压成一行行 (相邻同状态 dedup), 看是否真出现
+        # 「所有 replica 同时 Rebuilding」的窗口。
+        prev_state = None
+        for ts, rsm in restatus_snapshots:
+            # 只统计有非 ReplicasOK 的快照 (Rebuilding=3 / NotReady=2 都算)
+            non_ok = {nid: st for nid, st in rsm.items()
+                      if st != "ReplicasOK"}
+            if non_ok != prev_state:
+                logger.info("    ReStatusMap @%.2fs: %s",
+                            ts - rebuild_start, rsm)
+                prev_state = non_ok
+        # 直接判:是否存在「所有 replica 同时 Rebuilding」的瞬间
+        all_rebuilding_windows = []
+        for ts, rsm in restatus_snapshots:
+            if rsm and all(st == "ReplicasRebuildingIndex" for st in rsm.values()):
+                all_rebuilding_windows.append(ts)
+        if all_rebuilding_windows:
+            duration = all_rebuilding_windows[-1] - all_rebuilding_windows[0]
+            logger.warning(
+                "5.3 detected 'all replicas Rebuilding' window: "
+                "%d snapshots span %.2fs — this is the root cause of 703 errors",
+                len(all_rebuilding_windows), duration)
+
+        assert len(during) >= 5, (
+            f"during-rebuild 样本太少 (n={len(during)});rebuild 太快或 search "
+            f"loop 太慢,无法统计真实 error rate")
+
+        # 真正的 assert:rebuild 窗口内 error rate < 10%。这个阈值容忍
+        # master→router cache 同步空挡 + per-partition 串行重建副本切换
+        # 这类瞬态错;真出现 ≥10% 那才是回归。
+        assert during_rate < 0.10, (
+            f"search error rate during rebuild = {during_rate:.2%}, "
+            f"超出 10% 容忍线;查看日志 'sample err' / 'error breakdown' "
+            f"定位是哪一种错")
+        drop_space(router_url, db_name, case_space)
+
+    def test_destroy_db_5(self):
+        drop_db(router_url, db_name)

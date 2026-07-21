@@ -1786,50 +1786,9 @@ func (r *routerRequest) ForceMergeExecute() *vearchpb.ForceMergeResponse {
 	return forceMergeResponse
 }
 
-// RebuildIndexExecute Execute request
-func (r *routerRequest) RebuildIndexExecute() *vearchpb.IndexResponse {
-	var wg sync.WaitGroup
-	partitionLen := len(r.sendMap)
-	respChain := make(chan *vearchpb.PartitionData, partitionLen)
-	for partitionID, pData := range r.sendMap {
-		wg.Add(1)
-		c := context.WithValue(r.ctx, share.ReqMetaDataKey, copyMap(r.md))
-		go func(ctx context.Context, pid entity.PartitionID, d *vearchpb.PartitionData) {
-			defer wg.Done()
-			replyPartition := new(vearchpb.PartitionData)
-			defer func() {
-				if r := recover(); r != nil {
-					d.Err = &vearchpb.Error{Code: vearchpb.ErrorEnum_RECOVER, Msg: fmt.Sprintf("[Recover] partitionID: [%v], err: [%v]", pid, r)}
-					respChain <- d
-				}
-			}()
-			partition, e := r.client.Master().Cache().PartitionByCache(ctx, r.space.Name, pid)
-			if e != nil {
-				panic(e.Error())
-			}
-			responsePartition := r.ReplicaRebuildIndexExecute(partition, ctx, d, replyPartition)
-			respChain <- responsePartition
-		}(c, partitionID, pData)
-	}
-	wg.Wait()
-	close(respChain)
-	respShards := new(vearchpb.SearchStatus)
-	respShards.Total = int32(partitionLen)
-	respShards.Failed = 0
-	indexResponse := &vearchpb.IndexResponse{}
-	var errMsg strings.Builder
-	for resp := range respChain {
-		if resp.Err == nil {
-			respShards.Successful++
-		} else {
-			respShards.Failed++
-			errMsg.WriteString(resp.Err.Msg)
-		}
-	}
-	respShards.Msg = errMsg.String()
-	indexResponse.Shards = respShards
-	return indexResponse
-}
+// RebuildIndexExecute / ReplicaRebuildIndexExecute were removed with the
+// migration of /index/rebuild to the master-orchestrated path (router
+// proxies to master; master dispatches to PS via ExecuteRebuildIndex).
 
 // FlushExecute Execute request
 func (r *routerRequest) FlushExecute() *vearchpb.FlushResponse {
@@ -1878,39 +1837,6 @@ func (r *routerRequest) FlushExecute() *vearchpb.FlushResponse {
 
 // ReplicaForceMergeExecute Execute request
 func (r *routerRequest) ReplicaForceMergeExecute(partition *entity.Partition, ctx context.Context, d *vearchpb.PartitionData, replyPartition *vearchpb.PartitionData) *vearchpb.PartitionData {
-	var wgOther sync.WaitGroup
-	nodeIds := partition.Replicas
-	replicaNum := len(nodeIds)
-	respChain := make(chan *vearchpb.PartitionData, replicaNum)
-	senderResp := new(vearchpb.PartitionData)
-	for i := 0; i < replicaNum; i++ {
-		wgOther.Add(1)
-		go func(nodeId entity.NodeID) {
-			defer wgOther.Done()
-			err := r.client.PS().GetOrCreateRPCClient(ctx, nodeId).Execute(ctx, UnaryHandler, d, replyPartition)
-			if err != nil {
-				replyPartition.Err = vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, err).GetError()
-			} else {
-				respChain <- replyPartition
-			}
-		}(nodeIds[i])
-	}
-	wgOther.Wait()
-	close(respChain)
-
-	for res := range respChain {
-		if res.Err != nil {
-			senderResp.Err = res.Err
-			break
-		}
-		senderResp.Err = res.Err
-	}
-
-	return senderResp
-}
-
-// ReplicaRebuildIndexExecute Execute request
-func (r *routerRequest) ReplicaRebuildIndexExecute(partition *entity.Partition, ctx context.Context, d *vearchpb.PartitionData, replyPartition *vearchpb.PartitionData) *vearchpb.PartitionData {
 	var wgOther sync.WaitGroup
 	nodeIds := partition.Replicas
 	replicaNum := len(nodeIds)

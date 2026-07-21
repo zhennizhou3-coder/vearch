@@ -1,17 +1,17 @@
 name: CI Rebuild Index
 
 # ---------------------------------------------------------------------------
-# 触发条件 + 执行顺序
+# 触发条件 + 测试分组
 # ---------------------------------------------------------------------------
 # 1) push / pull_request / workflow_dispatch 时触发整条 pipeline。
-# 2) rebuild-fast(comprehensive + DiskANN)先跑;通过后 rebuild-chaos
-#    (needs: rebuild-fast)接着跑故障注入测试。
+# 2) rebuild-fast 在 standalone 环境运行非集群测试。
+# 3) rebuild-chaos 在 3-master / 3-ps / 2-router 环境运行集群测试。
 #
 # 设计权衡:
-#   - comprehensive 直接包含 DiskANN,避免单独 -k 跑 DiskANN 时绕过
-#     test_prepare_db 造成 db_not_exist。
-#   - chaos job 复用同一套 docker-compose 集群:cluster_helpers.py 是双模式的,
-#     docker 模式下 kill_ps→`docker kill vearch-psN`、日志走 `docker exec`。
+#   - test_module_rebuild.py 不依赖多节点、节点启停或故障注入，使用
+#     standalone 环境即可。
+#   - test_cluster_rebuild.py 依赖多副本和集群故障注入，使用 docker-compose
+#     集群；cluster_helpers.py 在 docker 模式下负责节点启停和日志读取。
 # ---------------------------------------------------------------------------
 
 on:
@@ -22,55 +22,38 @@ on:
 
 jobs:
   rebuild-fast:
-    name: 'Rebuild comprehensive tests'
+    name: 'Rebuild standalone tests'
     runs-on: ubuntu-latest
-    timeout-minutes: 90     # comprehensive + DiskANN 可能比纯 fast 更久
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: linux/amd64
+          - platform: amd64
             docker-arch: ''
-          - platform: linux/arm64
+          - platform: arm64
             docker-arch: '--platform linux/arm64'
-    env:
-      TARGET_PLATFORM: ${{ matrix.platform }}
 
     steps:
     - uses: actions/checkout@v4
 
-    # 复用现有的 cluster setup composite action — 它会:
-    # 1) build vearch docker image
-    # 2) docker-compose up 一套 3-master / 3-ps / 2-router 集群
-    # 3) 装 Python + pytest 依赖
-    - uses: ./.github/actions/set_cluster_env
+    # 构建镜像并以 `all` 模式启动单节点 Vearch，再安装 pytest 依赖。
+    - uses: ./.github/actions/set_standalone_env
       with:
         build-type: github
 
-    # ---- 模块测试:基础 lifecycle ----
-    # test_module_rebuild_index.py 覆盖:
-    #   trigger / progress / cancel / 多 target / DB-level / 全局 rebuild
-    - name: Run basic rebuild module tests
+    - name: Run standalone rebuild tests
       run: |
         cd test
-        pytest test_module_rebuild_index.py \
-          -x --log-cli-level=INFO
-
-    - name: Run comprehensive rebuild tests
-      run: |
-        cd test
-        pytest test_module_rebuild_comprehensive.py \
+        pytest test_module_rebuild.py \
           -x -rs --log-cli-level=INFO
 
-    # ---- 失败时把 master / PS / router 日志都打上来,debug 方便 ----
-    # `if: failure()` 只在前面的 step 挂掉时才跑。
-    - name: Upload cluster logs on failure
+    - name: Upload standalone logs on failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
-        name: rebuild-fast-logs
+        name: rebuild-standalone-logs
         path: |
-          cloud/logs/
           test/*.log
         retention-days: 7
 
@@ -80,11 +63,11 @@ jobs:
   # chaos 测试通过 test/utils/cluster_helpers.py 注入故障。该 helper 是双模式
   # 的(bare / docker),docker 模式下 kill_ps→`docker kill vearch-psN`、
   # start_ps→`docker start`、日志走 `docker exec ... cat /vearch/logs/*.log`。
-  # 所以这个 job 直接复用 rebuild-fast 的 docker-compose 集群(set_cluster_env),
+  # 所以这个 job 直接使用 set_cluster_env 构建并启动 docker-compose 集群，
   # 不再单独 build 裸二进制 + cluster.sh。
   # ---------------------------------------------------------------------------
   rebuild-chaos:
-    name: 'Chaos rebuild (PS kill, master failover)'
+    name: 'Rebuild cluster tests'
     # needs: rebuild-fast
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -109,7 +92,7 @@ jobs:
       with:
         build-type: github
 
-    - name: Run chaos rebuild tests
+    - name: Run cluster rebuild tests
       # --maxfail=3 收齐多个 failing case 的日志,而不是首发 fail 就退。
       # -p no:cacheprovider 避免 .pytest_cache 堆在 runner 上。
       # --timeout=600 + thread method:单条测试 hang 600s 后强制 fail,
@@ -118,7 +101,7 @@ jobs:
       run: |
         cd test
         pip install pytest-timeout
-        pytest test_module_rebuild_chaos.py \
+        pytest test_cluster_rebuild.py \
           --maxfail=3 --log-cli-level=INFO \
           --timeout=600 --timeout-method=thread \
           -p no:cacheprovider
@@ -133,4 +116,3 @@ jobs:
         path: |
           test/*.log
         retention-days: 14
-

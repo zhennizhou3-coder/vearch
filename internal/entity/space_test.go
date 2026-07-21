@@ -16,6 +16,7 @@ package entity_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/vearch/vearch/v3/internal/entity"
@@ -106,7 +107,7 @@ func TestSpace_Validate(t *testing.T) {
 		PartitionNum    int
 		ReplicaNum      uint8
 		Fields          json.RawMessage
-		Index           *entity.Index
+		Indexes         []*entity.Index
 		SpaceProperties map[string]*entity.SpaceProperties
 	}
 	tests := []struct {
@@ -164,11 +165,57 @@ func TestSpace_Validate(t *testing.T) {
 				PartitionNum:    tt.fields.PartitionNum,
 				ReplicaNum:      tt.fields.ReplicaNum,
 				Fields:          tt.fields.Fields,
-				Index:           tt.fields.Index,
+				Indexes:         tt.fields.Indexes,
 				SpaceProperties: tt.fields.SpaceProperties,
 			}
 			if err := space.Validate(); (err != nil) != tt.wantErr {
 				t.Errorf("Space.Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseIndex_TrainingThreshold(t *testing.T) {
+	// Engine (ComputeIVFTrainingNum) requires
+	// training_threshold >= ncentroids * DefaultMinPointsPerCentroid (=39).
+	tests := []struct {
+		name          string
+		indexType     string
+		ncentroids    int
+		trainingValue int
+		wantErr       bool
+	}{
+		{
+			name:          "IVFPQ below ncentroids*39 should fail",
+			indexType:     "IVFPQ",
+			ncentroids:    1000,
+			trainingValue: 1000,
+			wantErr:       true,
+		},
+		{
+			name:          "IVFPQ exactly at ncentroids*39 should pass",
+			indexType:     "IVFPQ",
+			ncentroids:    100,
+			trainingValue: 3900,
+			wantErr:       false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := fmt.Sprintf(`{
+				"name": "gamma",
+				"type": "%s",
+				"params": {
+					"metric_type": "L2",
+					"ncentroids": %d,
+					"nsubvector": 16,
+					"training_threshold": %d
+				}
+			}`, tt.indexType, tt.ncentroids, tt.trainingValue)
+			idx := &entity.Index{}
+			err := json.Unmarshal([]byte(raw), idx)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Index.UnmarshalJSON error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}

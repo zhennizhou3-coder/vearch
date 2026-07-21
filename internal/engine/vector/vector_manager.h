@@ -8,8 +8,11 @@
 
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "common/gamma_common_data.h"
 #include "index/index_model.h"
@@ -19,6 +22,25 @@
 #include "vector/raw_vector.h"
 
 namespace vearch {
+
+// Per-vector-index lifecycle state, keyed by index_name (matching the
+// vector_indexes_ map key). Field-level rebuild flips only the target
+// index's status; sibling indexes are untouched, which is the whole point
+// of the rebuild-without-stopping-the-indexing-thread refactor.
+enum class VectorIndexStatus : int {
+  UNINDEXED = 0,   // model created, training not yet started
+  INDEXING  = 1,   // training in flight (initial build or rebuild)
+  INDEXED   = 2,   // training finished; background loop consumes realtime vecs
+  FAILED    = 3,   // rebuild path hit an error; monitor treats this as terminal
+};
+
+// Snapshot of one vector index's state, returned by
+// VectorManager::IndexStatuses. Callers get a copy so they don't need to
+// hold VectorManager's rwlock while reading.
+struct IndexStatusSnapshot {
+  std::string name;
+  VectorIndexStatus status;
+};
 
 class VectorManager {
  public:
@@ -145,6 +167,19 @@ class VectorManager {
 
   int MinIndexedNum();
 
+  // Snapshot every vector index's per-index status under index_rwmutex_
+  // rdlock and return by value, so EngineStatus() / the rebuild monitor
+  // can read without holding the lock themselves. Consumers (rebuild
+  // manager) key by index_name.
+  std::vector<IndexStatusSnapshot> IndexStatuses();
+
+  // Set the status of one specific index
+  void SetIndexStatus(const std::string &index_name, VectorIndexStatus st);
+
+  // Bulk variant that writes `st` for every key in `m`
+  void SetAllStatuses(const std::map<std::string, IndexModel *> &m,
+                      VectorIndexStatus st);
+
   bitmap::BitmapManager *Bitmap() { return docids_bitmap_; };
 
   void Close();  // release all resource
@@ -224,6 +259,13 @@ class VectorManager {
   // key = index_name (IndexInfo.name; falls back to IndexName(field, type)
   // when the caller has no user-supplied name).
   std::map<std::string, IndexModel *> vector_indexes_;
+  // Per-index status keyed by the same index_name. Written under
+  // index_rwmutex_ wrlock alongside vector_indexes_ so the key set stays
+  // consistent between the two structures. Read (IndexStatuses) under
+  // rdlock. This is what powers EngineStatus.per_index_status and lets
+  // the rebuild monitor track the specific index it triggered instead of
+  // the coarse engine-wide index_status_.
+  std::unordered_map<std::string, VectorIndexStatus> vector_index_status_;
   // vector memory buffer for realtime, key = field_name (1:1 with the field)
   std::map<std::string, RawVector *> vector_memory_buffers_;
   // Realtime FLAT index shadowing the main index. Key is the SAME index_name

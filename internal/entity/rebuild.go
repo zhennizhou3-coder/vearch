@@ -25,8 +25,10 @@ import (
 // "running" for either use. Values are stable and must not be renamed.
 //
 // Tasks only ever take Running / Completed / Failed. Pending / Cancelled are
-// space-level record states; NotFound is a synthetic value produced by GET
-// when no record exists and is never persisted.
+// space-level record states. Callers that need to distinguish "record does
+// not exist" from these lifecycle states should look at the API error code
+// (vearchpb.ErrorEnum_REBUILD_RECORD_NOT_EXIST) instead of the status
+// field — record existence is orthogonal to lifecycle state.
 type RebuildStatus string
 
 const (
@@ -35,7 +37,6 @@ const (
 	RebuildStatusCompleted RebuildStatus = "completed"
 	RebuildStatusFailed    RebuildStatus = "failed"
 	RebuildStatusCancelled RebuildStatus = "cancelled"
-	RebuildStatusNotFound  RebuildStatus = "not_found"
 )
 
 // IsTerminal reports whether the scheduler is done with a record in this state.
@@ -131,7 +132,7 @@ type RebuildRequest struct {
 	DropBefore  bool   `json:"drop_before_rebuild,omitempty"`
 	LimitCPU    int    `json:"limit_cpu,omitempty"`
 	Describe    int    `json:"describe,omitempty"`
-	MaxRetries  int    `json:"max_retries,omitempty"` // Optional: max retry times for the whole space, 0 == use default
+	MaxRetries  int    `json:"max_retries,omitempty"`
 }
 
 // RebuildProgressResponse rebuild progress response
@@ -171,7 +172,6 @@ type RebuildSummaryResponse struct {
 	CancelledCount int     `json:"cancelled_count"`
 	RunningCount   int     `json:"running_count"`
 	PendingCount   int     `json:"pending_count"`
-	NotFoundCount  int     `json:"not_found_count"`
 	SuccessRatio   float64 `json:"success_ratio"` // (completed) / (completed + failed + cancelled + running + pending), 0 if no records
 }
 
@@ -252,4 +252,40 @@ func (r *SpaceRebuildRecord) CurrentTarget() string {
 // HasMoreTargets reports whether another target remains after this one.
 func (r *SpaceRebuildRecord) HasMoreTargets() bool {
 	return r.CurrentIndexIdx+1 < len(r.Indexes)
+}
+
+// MergeCancelledFrom merges task-level Cancelled markers from `current`
+func (r *SpaceRebuildRecord) MergeCancelledFrom(current *SpaceRebuildRecord) int {
+	if current == nil || len(current.Tasks) == 0 || len(r.Tasks) == 0 {
+		return 0
+	}
+	type taskKey struct {
+		pid PartitionID
+		nid NodeID
+	}
+	byKey := make(map[taskKey]*RebuildTask, len(r.Tasks))
+	for _, t := range r.Tasks {
+		if t == nil {
+			continue
+		}
+		byKey[taskKey{t.PartitionID, t.NodeID}] = t
+	}
+	merged := 0
+	for _, ct := range current.Tasks {
+		if ct == nil || ct.Status != RebuildStatusCancelled {
+			continue
+		}
+		rt, ok := byKey[taskKey{ct.PartitionID, ct.NodeID}]
+		if !ok {
+			continue
+		}
+		if rt.Dispatched || rt.Status.IsTerminal() {
+			continue
+		}
+		rt.Status = RebuildStatusCancelled
+		rt.ErrorMessage = ct.ErrorMessage
+		rt.CompleteTime = ct.CompleteTime
+		merged++
+	}
+	return merged
 }

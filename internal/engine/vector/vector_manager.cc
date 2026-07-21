@@ -214,6 +214,8 @@ void VectorManager::DestroyVectorIndexes() {
     }
   }
   vector_indexes_.clear();
+  // Keep the per-index status table lifecycle-locked to the main map.
+  vector_index_status_.clear();
   pthread_rwlock_unlock(&index_rwmutex_);
 
   LOG(INFO) << desc_ << "vector indexes cleared.";
@@ -238,6 +240,8 @@ Status VectorManager::RemoveVectorIndex(const std::string &field_name) {
       delete it->second;
     }
     vector_indexes_.erase(it);
+    // Keep per-index status in lockstep with the main map.
+    vector_index_status_.erase(index_name);
     LOG(INFO) << desc_ << "removed vector index: " << index_name;
   }
   // Also drop the realtime buffer index (same key) if present.
@@ -319,10 +323,12 @@ void VectorManager::ResetVectorIndexes(
     }
   }
   vector_indexes_.clear();
+  vector_index_status_.clear();
 
   for (const auto &[name, index] : rebuild_vector_indexes) {
     if (index != nullptr) {
       vector_indexes_[name] = index;
+      vector_index_status_[name] = VectorIndexStatus::UNINDEXED;
       LOG(INFO) << desc_ << "set " << name << " index";
     }
   }
@@ -337,6 +343,7 @@ Status VectorManager::ReCreateVectorIndexes(int training_threshold) {
     }
   }
   vector_indexes_.clear();
+  vector_index_status_.clear();
 
   Status status = CreateVectorIndexes(training_threshold, vector_indexes_);
   if (!status.ok()) {
@@ -348,6 +355,14 @@ Status VectorManager::ReCreateVectorIndexes(int training_threshold) {
       }
     }
     vector_indexes_.clear();
+    // status table is already clear above; nothing to purge here.
+  } else {
+    // Populate status for freshly-created indexes. Engine::Indexing() will
+    // flip them to INDEXING/INDEXED via SetAllStatuses when the background
+    // thread comes back up (whole-partition rebuild path).
+    for (const auto &[name, index] : vector_indexes_) {
+      vector_index_status_[name] = VectorIndexStatus::UNINDEXED;
+    }
   }
   pthread_rwlock_unlock(&index_rwmutex_);
   return status;
@@ -357,10 +372,6 @@ Status VectorManager::ResolveRebuildTarget(const std::string &field_name,
                                            const std::string &index_type,
                                            RawVector *&vec,
                                            std::string &index_param) {
-  // NOTE: index_types_ / index_params_ / raw_vectors_ are populated at
-  // table creation and are not mutated at runtime, so this lookup does
-  // not need to hold vector_index_rwmutex_. If that invariant ever
-  // changes, add a shared lock here.
 
   // Look up the RawVector for this field.
   auto vec_it = raw_vectors_.find(field_name);
@@ -371,21 +382,42 @@ Status VectorManager::ResolveRebuildTarget(const std::string &field_name,
   }
   vec = vec_it->second;
 
-  // Find the index_params_ entry matching the requested index_type.
-  // A miss returns an error rather than silently falling back to the
-  // first entry — with multi-index fields (e.g. IVFFLAT + HNSW on the
-  // same vector) fallback would install the index under the requested
-  // name but with the wrong parameters.
+  // Route field → unique index_name, then find its position in the parallel
+  // arrays. The earlier "match by index_type only" scan was ambiguous when
+  // two vector columns share the same index_type (e.g. both HNSW but with
+  // different metric_type/dim/nlist): it returned the first column's
+  // parameters for a rebuild targeting the other column, silently
+  // installing an index with the wrong params.
+  auto route_it = field_to_index_name_.find(field_name);
+  if (route_it == field_to_index_name_.end()) {
+    std::string msg = "no index registered for field: " + field_name;
+    LOG(ERROR) << desc_ << msg;
+    return Status::ParamError(msg);
+  }
+  const std::string &target_name = route_it->second;
+
   index_param.clear();
-  for (size_t i = 0; i < index_types_.size(); ++i) {
-    if (index_types_[i] == index_type) {
-      index_param = index_params_[i];
-      break;
+  for (size_t i = 0; i < index_names_.size(); ++i) {
+    if (index_names_[i] != target_name) {
+      continue;
     }
+    // Defensive: caller-requested index_type must match what was registered
+    // for this field. A mismatch means the caller has stale schema info;
+    // proceeding would train a new index with wrong params.
+    if (index_types_[i] != index_type) {
+      std::string msg = "index_type mismatch for field '" + field_name +
+                        "': registered=" + index_types_[i] +
+                        " requested=" + index_type;
+      LOG(ERROR) << desc_ << msg;
+      return Status::ParamError(msg);
+    }
+    index_param = index_params_[i];
+    break;
   }
   if (index_param.empty()) {
-    std::string msg = "index_type '" + index_type +
-                      "' not found for field '" + field_name + "'";
+    std::string msg = "index '" + target_name +
+                      "' not found in parallel arrays for field '" +
+                      field_name + "'";
     LOG(ERROR) << desc_ << msg;
     return Status::ParamError(msg);
   }
@@ -408,6 +440,8 @@ Status VectorManager::ReCreateVectorIndex(const std::string &index_name,
       delete it->second;
     }
     vector_indexes_.erase(it);
+    // Keep per-index status in lockstep with the main map.
+    vector_index_status_.erase(target_index_name);
     LOG(INFO) << desc_ << "removed vector index: " << target_index_name;
   } else {
     LOG(INFO) << desc_ << "no existing vector index found for "
@@ -437,11 +471,22 @@ Status VectorManager::ReCreateVectorIndex(const std::string &index_name,
     return status;
   }
 
-  // Install the newly created index into vector_indexes_.
+  // Install the newly created index into vector_indexes_
   for (auto &[name, idx] : new_indexes) {
     vector_indexes_[name] = idx;
+    vector_index_status_[name] = VectorIndexStatus::UNINDEXED;
     LOG(INFO) << desc_ << "set " << name << " index";
   }
+
+  int train_ret = TrainIndex(new_indexes);
+  if (train_ret != 0) {
+    LOG(ERROR) << desc_ << "TrainIndex for " << target_index_name
+               << " failed after ReCreateVectorIndex, ret=" << train_ret;
+    vector_index_status_[target_index_name] = VectorIndexStatus::FAILED;
+    pthread_rwlock_unlock(&index_rwmutex_);
+    return Status::IOError("ReCreateVectorIndex: TrainIndex failed");
+  }
+  vector_index_status_[target_index_name] = VectorIndexStatus::INDEXED;
 
   pthread_rwlock_unlock(&index_rwmutex_);
   LOG(INFO) << desc_ << "ReCreateVectorIndex for " << target_index_name
@@ -457,11 +502,13 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
   // std::string target_index_name = IndexName(field_name, index_type);
   std::string target_index_name = index_name;
 
+  SetIndexStatus(target_index_name, VectorIndexStatus::INDEXING);
 
   RawVector *vec = nullptr;
   std::string index_param;
   Status status = ResolveRebuildTarget(field_name, index_type, vec, index_param);
   if (!status.ok()) {
+    SetIndexStatus(target_index_name, VectorIndexStatus::FAILED);
     return status;
   }
 
@@ -475,10 +522,13 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
     for (auto &[name, idx] : new_indexes) {
       if (idx != nullptr) delete idx;
     }
+    SetIndexStatus(target_index_name, VectorIndexStatus::FAILED);
     return status;
   }
 
-  // Step 2: Train the new index if requested.
+  // Step 2: Train the new index if requested. TrainIndex itself is
+  // status-agnostic (see comment on TrainIndex); the rebuild path is the
+  // one that publishes lifecycle to per-index status.
   if (do_train) {
     int ret = TrainIndex(new_indexes);
     if (ret != 0) {
@@ -487,6 +537,7 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
       for (auto &[name, idx] : new_indexes) {
         if (idx != nullptr) delete idx;
       }
+      SetIndexStatus(target_index_name, VectorIndexStatus::FAILED);
       return Status::IOError("TrainIndex failed");
     }
   }
@@ -502,6 +553,7 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
   }
   for (auto &[name, idx] : new_indexes) {
     vector_indexes_[name] = idx;
+    vector_index_status_[name] = VectorIndexStatus::INDEXED;
     LOG(INFO) << desc_ << "set " << name << " index";
   }
   pthread_rwlock_unlock(&index_rwmutex_);
@@ -595,7 +647,7 @@ Status VectorManager::CreateVectorTable(TableInfo &table,
 
       status =
           CreateVectorIndex(index_name,
-                            flat_index_type, index_params_[i], vec_buffer,
+                            flat_index_type, index_param, vec_buffer,
                             table.TrainingThreshold(), true,
                             vector_memory_buffer_indexes_);
       if (!status.ok()) {
@@ -612,27 +664,35 @@ Status VectorManager::CreateVectorTable(TableInfo &table,
       continue;
     }
 
-    for (size_t i = 0; i < index_types_.size(); ++i) {
-      status =
-          CreateVectorIndex(index_name,
-                            index_types_[i], index_params_[i], vec,
-                            table.TrainingThreshold(), true, vector_indexes_);
-      if (!status.ok()) {
-        LOG(ERROR) << desc_ << vec_name
-                   << " create index failed: " << status.ToString();
-        return status;
-      }
-      // update TrainingThreshold when TrainingThreshold = 0
-      if (!table.TrainingThreshold()) {
-        IndexModel *index =
-            vector_indexes_[index_name];
-        if (index) {
-          table.SetTrainingThreshold(index->training_threshold_);
-        }
+    // One index per vector column: install exactly this field's index at
+    // its unique index_name using the outer-scope (index_type, index_param).
+    // The earlier "for (i < index_types_.size())" loop iterated the whole
+    // parallel array, so a multi-column schema would create N-1 wrong-typed
+    // IndexModels for later columns (all installed under the current field's
+    // index_name and each overwritten by the next iteration — memory leak
+    // plus a window where the map held an index built with the wrong
+    // (type, params) for this vector).
+    status = CreateVectorIndex(index_name, index_type, index_param, vec,
+                               table.TrainingThreshold(), true,
+                               vector_indexes_);
+    if (!status.ok()) {
+      LOG(ERROR) << desc_ << vec_name
+                 << " create index failed: " << status.ToString();
+      return status;
+    }
+    // update TrainingThreshold when TrainingThreshold = 0
+    if (!table.TrainingThreshold()) {
+      IndexModel *index = vector_indexes_[index_name];
+      if (index) {
+        table.SetTrainingThreshold(index->training_threshold_);
       }
     }
   }
   table_created_ = true;
+  // Initialize per-index status for every index created above
+  for (const auto &[name, idx] : vector_indexes_) {
+    vector_index_status_[name] = VectorIndexStatus::UNINDEXED;
+  }
   LOG(INFO) << desc_ << "create vectors and indexes success! models="
             << utils::join(index_types_, ',');
   return Status::OK();
@@ -1643,6 +1703,37 @@ int VectorManager::MinIndexedNum() {
   }
   pthread_rwlock_unlock(&index_rwmutex_);
   return min;
+}
+
+std::vector<IndexStatusSnapshot> VectorManager::IndexStatuses() {
+  std::vector<IndexStatusSnapshot> out;
+  pthread_rwlock_rdlock(&index_rwmutex_);
+  out.reserve(vector_index_status_.size());
+  for (const auto &[name, st] : vector_index_status_) {
+    out.push_back({name, st});
+  }
+  pthread_rwlock_unlock(&index_rwmutex_);
+  return out;
+}
+
+void VectorManager::SetIndexStatus(const std::string &index_name,
+                                   VectorIndexStatus st) {
+  pthread_rwlock_wrlock(&index_rwmutex_);
+  if (vector_indexes_.count(index_name)) {
+    vector_index_status_[index_name] = st;
+  }
+  pthread_rwlock_unlock(&index_rwmutex_);
+}
+
+void VectorManager::SetAllStatuses(
+    const std::map<std::string, IndexModel *> &m, VectorIndexStatus st) {
+  pthread_rwlock_wrlock(&index_rwmutex_);
+  for (const auto &[name, idx] : m) {
+    if (vector_indexes_.count(name)) {
+      vector_index_status_[name] = st;
+    }
+  }
+  pthread_rwlock_unlock(&index_rwmutex_);
 }
 
 }  // namespace vearch

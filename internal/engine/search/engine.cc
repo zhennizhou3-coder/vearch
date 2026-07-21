@@ -1128,20 +1128,11 @@ int Engine::RebuildFieldIndex(const std::string &index_name,
                               const std::string &index_type,
                               int drop_before_rebuild, int limit_cpu,
                               int describe) {
-  // Empty field_name => fallback to whole-partition rebuild.
-  if (field_name.empty()) {
-    LOG(INFO) << space_name_
-              << " RebuildFieldIndex: field_name empty, fallback to "
-                 "whole-partition RebuildIndex";
-    return RebuildIndex(drop_before_rebuild, limit_cpu, describe);
-  }
 
   LOG(INFO) << space_name_ << " RebuildFieldIndex name=" << index_name
             << " field=" << field_name << " index_type=" << index_type
             << " drop_before_rebuild=" << drop_before_rebuild
             << " limit_cpu=" << limit_cpu << " describe=" << describe;
-
-  if (!PrepareRebuild("RebuildFieldIndex")) return -1;
 
   if (describe) {
     vec_manager_->DescribeVectorIndexes();
@@ -1157,7 +1148,6 @@ int Engine::RebuildFieldIndex(const std::string &index_name,
   }
 
   if (drop_before_rebuild) {
-    // Drop and re-create index by index_name.
     Status status = vec_manager_->ReCreateVectorIndex(
         index_name, field_name, index_type, training_threshold_);
     if (!status.ok()) {
@@ -1167,11 +1157,8 @@ int Engine::RebuildFieldIndex(const std::string &index_name,
                  << ") : " << status.ToString();
       return -1;
     }
-    index_status_ = IndexStatus::UNINDEXED;
   } else {
-    // In-place rebuild: create a new index model, train it, then swap in.
-    bool do_train = (indexing_state_.load() == IndexingState::IDLE &&
-                     max_docid_ - delete_num_ > training_threshold_);
+    bool do_train = (max_docid_ - delete_num_ > training_threshold_);
     Status status = vec_manager_->RebuildVectorIndex(
         index_name, field_name, index_type, training_threshold_, do_train);
     if (!status.ok()) {
@@ -1183,7 +1170,14 @@ int Engine::RebuildFieldIndex(const std::string &index_name,
     }
   }
 
-  if (int ret = FinishRebuild("RebuildFieldIndex")) return ret;
+  Status compact_status = vec_manager_->CompactVector();
+  if (!compact_status.ok()) {
+    LOG(ERROR) << space_name_
+               << " RebuildFieldIndex compact vector error: "
+               << compact_status.ToString();
+    return -1;
+  }
+
   LOG(INFO) << space_name_ << " RebuildFieldIndex for " << index_name
             << " (" << field_name << ":" << index_type << ") success!";
   return 0;
@@ -1201,14 +1195,22 @@ int Engine::Indexing() {
     return -1;
   }
 
+  vec_manager_->SetAllStatuses(vec_manager_->VectorIndexes(),
+                               VectorIndexStatus::INDEXING);
+
   if (vec_manager_->TrainIndex(vec_manager_->VectorIndexes()) != 0) {
     LOG(ERROR) << space_name_ << " create index failed!";
+    vec_manager_->SetAllStatuses(vec_manager_->VectorIndexes(),
+                                 VectorIndexStatus::FAILED);
     indexing_state_.store(IndexingState::IDLE);
     indexing_cv_.notify_all();
     return -1;
   }
 
   LOG(INFO) << space_name_ << " vector manager TrainIndex success!";
+  // Flip to INDEXED once training completes for every index in the batch.
+  vec_manager_->SetAllStatuses(vec_manager_->VectorIndexes(),
+                               VectorIndexStatus::INDEXED);
   int ret = 0;
   bool has_error = false;
 
@@ -1268,11 +1270,23 @@ std::string Engine::EngineStatus() {
   j["backup_status"] = backup_status_.load();
   j["doc_num"] = GetDocsNum();
   j["max_docid"] = max_docid_ - 1;
+  nlohmann::json arr = nlohmann::json::array();
   if (created_table_ && vec_manager_ != nullptr) {
     j["min_indexed_num"] = vec_manager_->MinIndexedNum();
+    // per_index_status lets the rebuild monitor watch the specific index it
+    // triggered instead of the coarse engine-wide index_status_ (which does
+    // not flip on field-level rebuild). One entry per vector index in
+    // vector_indexes_; keyed by index_name.
+    for (const auto &s : vec_manager_->IndexStatuses()) {
+      arr.push_back({
+          {"index_name", s.name},
+          {"status", static_cast<int>(s.status)},
+      });
+    }
   } else {
     j["min_indexed_num"] = 0;
   }
+  j["per_index_status"] = arr;
   return j.dump();
 }
 

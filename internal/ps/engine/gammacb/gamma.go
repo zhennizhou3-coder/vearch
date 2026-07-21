@@ -37,6 +37,8 @@ import (
 
 var _ engine.Engine = &gammaEngine{}
 
+var indexLocker sync.Mutex
+
 type EngineConfig struct {
 	// Path is the data directory.
 	Path string
@@ -141,7 +143,6 @@ type gammaEngine struct {
 
 	counter   *atomic.AtomicInt64
 	lock      sync.RWMutex
-	indexMu   sync.Mutex // Experiment C: per-engine index lock (was global indexLocker)
 	hasClosed bool
 }
 
@@ -349,6 +350,20 @@ func (ge *gammaEngine) GetEngineStatus(status *entity.EngineStatus) error {
 	return nil
 }
 
+// IndexStatusOf reads EngineStatus and returns the per-index entry matching indexName
+func (ge *gammaEngine) IndexStatusOf(indexName string) (int, error) {
+	status := &entity.EngineStatus{}
+	if err := ge.GetEngineStatus(status); err != nil {
+		return 0, err
+	}
+	for _, p := range status.PerIndexStatus {
+		if p.IndexName == indexName {
+			return int(p.Status), nil
+		}
+	}
+	return 0, fmt.Errorf("index %q not found in per_index_status", indexName)
+}
+
 func (ge *gammaEngine) BuildIndex() error {
 	ge.counter.Incr()
 	defer ge.counter.Decr()
@@ -358,8 +373,9 @@ func (ge *gammaEngine) BuildIndex() error {
 		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED, nil)
 	}
 
-	ge.indexMu.Lock()
-	defer ge.indexMu.Unlock()
+	// Global lock — see indexLocker comment for rationale.
+	indexLocker.Lock()
+	defer indexLocker.Unlock()
 
 	// UNINDEXED = 0, INDEXING, INDEXED
 	go func() {
@@ -379,46 +395,43 @@ func (ge *gammaEngine) BuildIndex() error {
 // indexType are still passed for the engine to resolve the RawVector and
 // index parameters.
 func (ge *gammaEngine) RebuildFieldIndex(indexName, field, indexType string, drop, cpu, des int) error {
-	ge.counter.Incr()
-	defer ge.counter.Decr()
-
-	if ge.gamma == nil {
-		log.Error("gammaEngine is nil, partition:[%d]", ge.partitionID)
+	if ge.gamma == nil || ge.hasClosed {
+		log.Error("gammaEngine is nil or closed, partition:[%d]", ge.partitionID)
 		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED, nil)
 	}
 
-	ge.indexMu.Lock()
-	defer ge.indexMu.Unlock()
-
-	if ge.hasClosed {
-		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED, nil)
-	}
-
-	// Empty field means whole-partition rebuild in the C++ layer.
 	if field == "" {
 		log.Info("RebuildFieldIndex partition:[%d] field empty, delegating to C++ whole-partition rebuild", ge.partitionID)
 	}
-
 	log.Info("RebuildFieldIndex partition:[%d] name=%s field=%s indexType=%s drop=%d cpu=%d describe=%d",
 		ge.partitionID, indexName, field, indexType, drop, cpu, des)
 
-	startTime := time.Now()
-	rc := gamma.RebuildFieldIndex(ge.gamma, indexName, field, indexType, drop, cpu, des)
-	cost := time.Since(startTime).Seconds() * 1000
-	if rc != 0 {
-		log.Error("RebuildFieldIndex partition:[%d] field=%s indexType=%s cost:[%.2f]ms err rc:[%d]",
-			ge.partitionID, field, indexType, cost, rc)
-		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR,
-			fmt.Errorf("gamma.RebuildFieldIndex field=%s indexType=%s rc=%d", field, indexType, rc))
-	}
-	log.Info("RebuildFieldIndex partition:[%d] field=%s indexType=%s cost:[%.2f]ms rc:[0]",
-		ge.partitionID, field, indexType, cost)
+	ge.counter.Incr()
+	go func() {
+		defer ge.counter.Decr()
+		indexLocker.Lock()
+		defer indexLocker.Unlock()
+		if ge.hasClosed {
+			return
+		}
+		startTime := time.Now()
+		rc := gamma.RebuildFieldIndex(ge.gamma, indexName, field, indexType, drop, cpu, des)
+		cost := time.Since(startTime).Seconds() * 1000
+		if rc != 0 {
+			log.Error("RebuildFieldIndex partition:[%d] name=%s field=%s indexType=%s cost:[%.2f]ms err rc:[%d]",
+				ge.partitionID, indexName, field, indexType, cost, rc)
+			return
+		}
+		log.Info("RebuildFieldIndex partition:[%d] name=%s field=%s indexType=%s cost:[%.2f]ms rc:[0]",
+			ge.partitionID, indexName, field, indexType, cost)
+	}()
 	return nil
 }
 
 func (ge *gammaEngine) Load() error {
-	ge.indexMu.Lock()
-	defer ge.indexMu.Unlock()
+	// Global lock — see indexLocker comment for rationale.
+	indexLocker.Lock()
+	defer indexLocker.Unlock()
 	ge.counter.Incr()
 	defer ge.counter.Decr()
 	cfg := EngineConfig{

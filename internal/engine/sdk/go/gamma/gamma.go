@@ -8,11 +8,11 @@
 package gamma
 
 /*
- #cgo CFLAGS : -I../../../c_api
- #cgo LDFLAGS: -L../../../../../build/gamma_build -lgamma
+#cgo CFLAGS : -I../../../c_api
+#cgo LDFLAGS: -L../../../../../build/gamma_build -lgamma
 
- #include "gamma_api.h"
- #include <stdlib.h>
+#include "gamma_api.h"
+#include <stdlib.h>
 */
 import "C"
 import (

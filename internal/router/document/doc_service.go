@@ -243,28 +243,6 @@ func (docService *docService) forceMerge(ctx context.Context, args *vearchpb.For
 	return forceMergeResponse
 }
 
-func (docService *docService) rebuildIndex(ctx context.Context, args *vearchpb.IndexRequest) *vearchpb.IndexResponse {
-	request := client.NewRouterRequest(ctx, docService.client)
-	request.SetMsgID(args.Head.Params["request_id"]).SetMethod(client.RebuildIndexHandler).SetHead(args.Head).SetSpace().CommonSetByPartitions(args)
-	if request.Err != nil {
-		return &vearchpb.IndexResponse{Head: setErrHead(request.Err)}
-	}
-
-	indexResponse := request.RebuildIndexExecute()
-
-	if indexResponse == nil {
-		return &vearchpb.IndexResponse{Head: setErrHead(request.Err)}
-	}
-	if indexResponse.Head == nil {
-		indexResponse.Head = newOkHead()
-	}
-	if indexResponse.Head.Err == nil {
-		indexResponse.Head.Err = newOkHead().Err
-	}
-
-	return indexResponse
-}
-
 func (docService *docService) deleteByQuery(ctx context.Context, args *vearchpb.QueryRequest) *vearchpb.DelByQueryeResponse {
 	request := client.NewRouterRequest(ctx, docService.client)
 	request.SetMsgID(args.Head.Params["request_id"]).SetMethod(client.DeleteByQueryHandler).SetHead(args.Head).SetSpace().QueryByPartitions(args)

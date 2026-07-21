@@ -20,6 +20,7 @@ enum ErrorEnum {
   // cluster 100-199
   // master 100-119
   MASTER_PS_NOT_ENOUGH_SELECT = 100;
+  REBUILD_RECORD_NOT_EXIST = 101;
 
   // router 120-139
   ROUTER_NO_PS_CLIENT = 120;

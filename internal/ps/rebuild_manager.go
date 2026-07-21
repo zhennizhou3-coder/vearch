@@ -22,6 +22,7 @@ import (
 
 	"github.com/vearch/vearch/v3/internal/entity"
 	"github.com/vearch/vearch/v3/internal/pkg/log"
+	"github.com/vearch/vearch/v3/internal/ps/engine"
 )
 
 // Gamma engine IndexStatus values from internal/engine/search/engine.h.
@@ -29,6 +30,9 @@ const (
 	engineIndexStatusUnindexed = 0
 	engineIndexStatusIndexing  = 1
 	engineIndexStatusIndexed   = 2
+	// Per-index-only terminal state introduced with per_index_status; the
+	// engine-wide IndexStatus never reports this value.
+	engineIndexStatusFailed = 3
 )
 
 // Rebuild monitor knobs.
@@ -128,21 +132,37 @@ func (r *PSRebuildManager) executeRebuild(task *RebuildTask, dropBefore int, lim
 		return
 	}
 
-	// Snapshot status before rebuild to detect real progress later.
-	preStatus, preIndexed, preMaxDocid, preErr := engine.IndexInfoWithErr()
-	if preErr != nil {
-		// Fail fast if the baseline status is unavailable.
-		r.markFailed(task, fmt.Sprintf("pre-rebuild engine.IndexInfo: %v", preErr))
-		return
+	// Pre-flight: refuse to rebuild an index that does not exist. For field-
+	// level rebuild the authoritative check is per-index status; for whole-
+	// partition rebuild (FieldName == "") the engine-wide IndexStatus is
+	// what matters.
+	if task.FieldName == "" {
+		preStatus, _, _, err := engine.IndexInfoWithErr()
+		if err != nil {
+			r.markFailed(task, fmt.Sprintf("pre-rebuild engine.IndexInfo: %v", err))
+			return
+		}
+		if preStatus == engineIndexStatusUnindexed {
+			r.markFailed(task, "cannot rebuild: index does not exist (status=UNINDEXED)")
+			return
+		}
+	} else {
+		preStatus, err := engine.IndexStatusOf(task.IndexName)
+		if err != nil {
+			r.markFailed(task, fmt.Sprintf("pre-rebuild engine.IndexStatusOf(%q): %v", task.IndexName, err))
+			return
+		}
+		if preStatus == engineIndexStatusUnindexed {
+			r.markFailed(task, fmt.Sprintf("cannot rebuild: index %q does not exist (status=UNINDEXED)", task.IndexName))
+			return
+		}
 	}
 
-	// Rebuild requires an existing index.
-	if preStatus == engineIndexStatusUnindexed {
-		r.markFailed(task, "cannot rebuild: index does not exist (status=UNINDEXED)")
-		return
-	}
-
-	// Run rebuild in a goroutine so monitorRebuild can observe its result.
+	// engine.RebuildFieldIndex is async at the gammacb layer for field-level
+	// rebuild — it kicks off a goroutine under indexLocker and returns
+	// immediately. doneCh therefore reports pre-flight errors (partition
+	// closed) and closes almost right away; the authoritative completion /
+	// failure signal is per-index status, polled in monitorRebuild.
 	doneCh := make(chan error, 1)
 	go func() {
 		defer func() {
@@ -154,18 +174,17 @@ func (r *PSRebuildManager) executeRebuild(task *RebuildTask, dropBefore int, lim
 		doneCh <- engine.RebuildFieldIndex(task.IndexName, task.FieldName, task.IndexType,
 			dropBefore, limitCPU, describe)
 	}()
-	log.Info("rebuild engine.RebuildFieldIndex dispatched: pid=%d indexName=%s field=%s indexType=%s preStatus=%d preIndexed=%d preMaxDocid=%d dropBefore=%d limitCPU=%d describe=%d",
+	log.Info("rebuild engine.RebuildFieldIndex dispatched: pid=%d indexName=%s field=%s indexType=%s dropBefore=%d limitCPU=%d describe=%d",
 		task.PartitionID, task.IndexName, task.FieldName, task.IndexType,
-		preStatus, preIndexed, preMaxDocid, dropBefore, limitCPU, describe)
+		dropBefore, limitCPU, describe)
 
 	// Monitor until the rebuild reaches a terminal state.
-	r.monitorRebuild(task, store, doneCh, preStatus, preIndexed, preMaxDocid)
+	r.monitorRebuild(task, store, doneCh)
 }
 
-// monitorRebuild polls engine status until the rebuild is terminal.
+// monitorRebuild polls engine per-index status until the rebuild is terminal.
 func (r *PSRebuildManager) monitorRebuild(task *RebuildTask, store PartitionStore,
-	doneCh <-chan error, preStatus, preIndexed, preMaxDocid int) {
-	// serverCtx lets shutdown interrupt the poll loop.
+	doneCh <-chan error) {
 	var serverCtx context.Context
 	if r.server != nil {
 		serverCtx = r.server.ctx
@@ -173,47 +192,23 @@ func (r *PSRebuildManager) monitorRebuild(task *RebuildTask, store PartitionStor
 	deadline := time.Now().Add(rebuildMaxDuration)
 	ticker := time.NewTicker(rebuildPollInterval)
 	defer ticker.Stop()
-	// shutdownGrace bounds how long we wait for in-flight CGO to exit.
-	const shutdownGrace = 5 * time.Second
-	// drain waits briefly for the CGO goroutine to publish its result.
-	drain := func(reason string) string {
-		timer := time.NewTimer(shutdownGrace)
-		defer timer.Stop()
-		select {
-		case err := <-doneCh:
-			if err != nil {
-				return fmt.Sprintf("%s; engine.RebuildIndex: %v", reason, err)
-			}
-			return reason
-		case <-timer.C:
-			return fmt.Sprintf("%s; CGO rebuild did not exit within %s",
-				reason, shutdownGrace)
-		}
-	}
-
-	// observedNonIndexed proves the engine entered rebuild work.
-	observedNonIndexed := preStatus != engineIndexStatusIndexed
-
-	// rebuildReturned makes an INDEXED reading authoritative.
-	rebuildReturned := false
 
 	failureStreak := 0
 
 	for {
 		select {
 		case err := <-doneCh:
-			// CGO returned; confirm final status through IndexInfo.
+			// gammacb dispatch reported a synchronous error (partition
+			// closed, panic during dispatch). Failure is terminal.
 			if err != nil {
 				r.markFailed(task, fmt.Sprintf("engine.RebuildIndex: %v", err))
 				return
 			}
-			rebuildReturned = true
-			log.Info("engine.RebuildIndex returned success for pid=%d, awaiting IndexInfo confirmation",
-				task.PartitionID)
+			// nil means dispatch succeeded — NOT that the rebuild is
+			// finished. Keep polling per-index status.
 		case <-ticker.C:
 		case <-ctxDone(serverCtx):
-			// Give in-flight CGO a short shutdown grace window.
-			r.markFailed(task, drain("PS server shutting down"))
+			r.markFailed(task, "PS server shutting down")
 			return
 		}
 
@@ -224,127 +219,63 @@ func (r *PSRebuildManager) monitorRebuild(task *RebuildTask, store PartitionStor
 
 		engine := store.GetEngine()
 		if engine == nil || engine.HasClosed() {
-			// Avoid racing partition close with in-flight CGO.
-			r.markFailed(task, drain("engine closed during rebuild"))
+			r.markFailed(task, "engine closed during rebuild")
 			return
 		}
 
-		status, indexedNum, maxDocid, infoErr := engine.IndexInfoWithErr()
-
+		// Field-level rebuild reads per-index status; whole-partition
+		// rebuild (FieldName == "") still reads the engine-wide status
+		// because the target is the whole engine, not one index.
+		status, indexedNum, maxDocid, infoErr := r.pollStatus(task, engine)
 		if infoErr != nil {
 			failureStreak++
-			log.Warn("engine.IndexInfo failed for pid=%d (streak=%d/%d): %v",
+			log.Warn("rebuild status poll failed for pid=%d (streak=%d/%d): %v",
 				task.PartitionID, failureStreak, indexInfoFailureBudget, infoErr)
 			if failureStreak >= indexInfoFailureBudget {
-				timer := time.NewTimer(shutdownGrace)
-				select {
-				case err := <-doneCh:
-					timer.Stop()
-					if err == nil {
-						log.Info("engine.RebuildIndex returned success for pid=%d despite IndexInfo failures, marking completed",
-							task.PartitionID)
-						r.markCompleted(task)
-						return
-					}
-					r.markFailed(task,
-						fmt.Sprintf("engine.IndexInfo failed %d consecutive times: %v; engine.RebuildIndex: %v",
-							failureStreak, infoErr, err))
-					return
-				case <-timer.C:
-				}
 				r.markFailed(task,
-					fmt.Sprintf("engine.IndexInfo failed %d consecutive times: %v; CGO rebuild did not exit within %s",
-						failureStreak, infoErr, shutdownGrace))
+					fmt.Sprintf("status poll failed %d consecutive times: %v",
+						failureStreak, infoErr))
 				return
 			}
 			continue
 		}
 		failureStreak = 0
 
-		// Track progress monotonically.
-		progress := computeProgress(indexedNum, maxDocid)
-		r.updateProgress(task, progress)
+		r.updateProgress(task, computeProgress(indexedNum, maxDocid))
 
 		switch status {
-		case engineIndexStatusUnindexed, engineIndexStatusIndexing:
-			// If CGO already returned success but the field-level
-			// rebuild left the whole-engine IndexStatus at UNINDEXED /
-			// INDEXING (e.g. per-field rebuild does not flip the
-			// engine-wide flag), trust the CGO return value: the C++
-			// engine has replaced the index and the async backfill is
-			// out of scope here. Otherwise we would spin until
-			// rebuildMaxDuration (24h) and mark the task failed.
-			if rebuildReturned {
-				r.markCompleted(task)
-				log.Info("rebuild task completed for partition %d (cgo returned, engine status=%d, indexed=%d, maxDocid=%d)",
-					task.PartitionID, status, indexedNum, maxDocid)
-				return
-			}
-			observedNonIndexed = true
-			log.Debug("rebuild in progress pid=%d status=%d indexed=%d/%d (%d%%)",
-				task.PartitionID, status, indexedNum, maxDocid, progress)
+		case engineIndexStatusFailed:
+			r.markFailed(task, "engine reported per-index status=FAILED")
+			return
 		case engineIndexStatusIndexed:
-			// Rebuild returned; INDEXED is authoritative.
-			if rebuildReturned {
-				r.markCompleted(task)
-				log.Info("rebuild task completed for partition %d (rebuild returned, indexed=%d, maxDocid=%d)",
-					task.PartitionID, indexedNum, maxDocid)
-				return
-			}
-			if observedNonIndexed {
-				// Wait briefly for CGO before marking completed.
-				switch r.waitDoneShort(doneCh, &rebuildReturned, task) {
-				case settleSuccess:
-					r.markCompleted(task)
-					log.Info("rebuild task completed for partition %d (indexed=%d, maxDocid=%d, 100%%)",
-						task.PartitionID, indexedNum, maxDocid)
-					return
-				case settleFailed:
-					// markFailed already happened inside waitDoneShort.
-					return
-				case settlePending:
-					// CGO is still running; keep polling.
-					continue
-				}
-			}
-			// Rebuild has not visibly started or returned yet; keep polling.
+			r.markCompleted(task)
+			log.Info("rebuild task completed for partition %d (indexed=%d, maxDocid=%d)",
+				task.PartitionID, indexedNum, maxDocid)
+			return
+		case engineIndexStatusUnindexed, engineIndexStatusIndexing:
+			log.Debug("rebuild in progress pid=%d status=%d indexed=%d/%d",
+				task.PartitionID, status, indexedNum, maxDocid)
 		default:
-			log.Warn("unknown engine IndexStatus %d for pid=%d, continuing", status, task.PartitionID)
+			log.Warn("unknown engine status %d for pid=%d, continuing", status, task.PartitionID)
 		}
 	}
 }
 
-// waitDoneShort waits briefly for in-flight CGO before completion.
-const cgoSettleWindow = 1 * time.Second
-
-type settleResult int
-
-const (
-	settleSuccess settleResult = iota
-	settleFailed
-	settlePending
-)
-
-func (r *PSRebuildManager) waitDoneShort(doneCh <-chan error, rebuildReturned *bool, task *RebuildTask) settleResult {
-	if *rebuildReturned {
-		return settleSuccess
+func (r *PSRebuildManager) pollStatus(task *RebuildTask, engine engine.Engine) (int, int, int, error) {
+	if task.FieldName == "" {
+		return engine.IndexInfoWithErr()
 	}
-	timer := time.NewTimer(cgoSettleWindow)
-	defer timer.Stop()
-	select {
-	case err, ok := <-doneCh:
-		if !ok || err == nil {
-			*rebuildReturned = true
-			return settleSuccess
-		}
-		// The channel is consumed here, so fail the task inline.
-		log.Error("CGO rebuild failed during IndexInfo confirmation pid=%d: %v",
-			task.PartitionID, err)
-		r.markFailed(task, fmt.Sprintf("engine.RebuildIndex: %v", err))
-		return settleFailed
-	case <-timer.C:
-		return settlePending
+	status, err := engine.IndexStatusOf(task.IndexName)
+	if err != nil {
+		return 0, 0, 0, err
 	}
+	_, indexed, maxDocid, mdErr := engine.IndexInfoWithErr()
+	if mdErr != nil {
+		// Not fatal — treat as unknown counters; caller sees 0% progress.
+		indexed = 0
+		maxDocid = 0
+	}
+	return status, indexed, maxDocid, nil
 }
 
 // computeProgress returns 0..100. Returns 0 when totals are unknown.

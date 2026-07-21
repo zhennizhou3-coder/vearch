@@ -71,6 +71,9 @@ type Engine interface {
 
 	// IndexInfoWithErr returns index status, indexed count, max docid, and error.
 	IndexInfoWithErr() (int, int, int, error)
+	// IndexStatusOf returns the status of the specific vector index
+	// (matched by indexName in per_index_status)
+	IndexStatusOf(indexName string) (status int, err error)
 	GetEngineStatus(status *entity.EngineStatus) error
 	Close()
 	HasClosed() bool

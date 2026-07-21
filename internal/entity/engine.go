@@ -14,10 +14,17 @@
 
 package entity
 
+// PerIndexStatus is one entry of EngineStatus.PerIndexStatus
+type PerIndexStatus struct {
+	IndexName string `json:"index_name"`
+	Status    int32  `json:"status"` // 0=UN, 1=ING, 2=ED, 3=FAILED
+}
+
 type EngineStatus struct {
-	IndexStatus   int32 `json:"index_status,omitempty"`
-	BackupStatus  int32 `json:"backup_status,omitempty"`
-	DocNum        int32 `json:"doc_num,omitempty"`
-	MinIndexedNum int32 `json:"min_indexed_num,omitempty"`
-	MaxDocid      int32 `json:"max_docid,omitempty"`
+	IndexStatus    int32            `json:"index_status,omitempty"`
+	BackupStatus   int32            `json:"backup_status,omitempty"`
+	DocNum         int32            `json:"doc_num,omitempty"`
+	MinIndexedNum  int32            `json:"min_indexed_num,omitempty"`
+	MaxDocid       int32            `json:"max_docid,omitempty"`
+	PerIndexStatus []PerIndexStatus `json:"per_index_status,omitempty"`
 }
