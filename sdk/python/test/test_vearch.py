@@ -126,7 +126,11 @@ class TestVearchBadcase(object):
                             "book_character",
                             DataType.VECTOR,
                             IvfPQIndex(
-                                "book_vec_idx", MetricType.Inner_product, 2048, 8, 10000
+                                "book_vec_idx",
+                                MetricType.Inner_product,
+                                2048,
+                                8,
+                                training_threshold=2048 * 39,
                             ),
                             dimension=512,
                         ),
