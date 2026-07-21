@@ -2689,7 +2689,7 @@ def _idx_ivfflat_space_config(name: str, partition_num: int = 1) -> dict:
             {"name": "field_int", "type": "integer"},
             {"name": "field_vector", "type": "vector",
              "index": {"name": "gamma", "type": "IVFFLAT",
-                       "params": {"metric_type": "L2", "ncentroids": 128, "training_threshold": 3999}},
+                       "params": {"metric_type": "L2", "ncentroids": 128, "training_threshold": 4992}},
              "dimension": embedding_size},
         ],
     }
@@ -2702,7 +2702,7 @@ def _idx_ivfpq_space_config(name: str, partition_num: int = 1) -> dict:
             {"name": "field_int", "type": "integer"},
             {"name": "field_vector", "type": "vector",
              "index": {"name": "gamma", "type": "IVFPQ",
-                       "params": {"metric_type": "InnerProduct", "ncentroids": 128, "nsubvector": 32, "training_threshold": 3999}},
+                       "params": {"metric_type": "InnerProduct", "ncentroids": 128, "nsubvector": 32, "training_threshold": 4992}},
              "dimension": embedding_size},
         ],
     }
@@ -3116,7 +3116,7 @@ def _comp_ivfflat_cfg(name, pn=1, rn=1):
             "fields": [{"name": "field_int", "type": "integer"},
                        {"name": "field_vector", "type": "vector",
                         "index": {"name": "gamma", "type": "IVFFLAT",
-                                  "params": {"metric_type": "L2", "ncentroids": 128, "training_threshold": 3999}},
+                                  "params": {"metric_type": "L2", "ncentroids": 128, "training_threshold": 4992}},
                         "dimension": dim}]}
 
 def _comp_ivfpq_cfg(name, pn=1, rn=1):
@@ -3125,7 +3125,7 @@ def _comp_ivfpq_cfg(name, pn=1, rn=1):
             "fields": [{"name": "field_int", "type": "integer"},
                        {"name": "field_vector", "type": "vector",
                         "index": {"name": "gamma", "type": "IVFPQ",
-                                  "params": {"metric_type": "InnerProduct", "ncentroids": 128, "nsubvector": 32, "training_threshold": 3999}},
+                                  "params": {"metric_type": "InnerProduct", "ncentroids": 128, "nsubvector": 32, "training_threshold": 4992}},
                         "dimension": dim}]}
 
 def _comp_ivfrabitq_cfg(name, pn=1, rn=1):
@@ -3134,7 +3134,7 @@ def _comp_ivfrabitq_cfg(name, pn=1, rn=1):
             "fields": [{"name": "field_int", "type": "integer"},
                        {"name": "field_vector", "type": "vector",
                         "index": {"name": "gamma", "type": "IVFRABITQ",
-                                  "params": {"metric_type": "InnerProduct", "ncentroids": 128, "training_threshold": 3999}},
+                                  "params": {"metric_type": "InnerProduct", "ncentroids": 128, "training_threshold": 4992}},
                         "dimension": dim}]}
 
 def _comp_multi3_cfg(name, pn=1, rn=1):
