@@ -203,6 +203,8 @@ def _wait_rebuild_completed(
             pytest.fail(
                 f"rebuild failed for {db}/{space}: {json.dumps(progress, indent=2)}"
             )
+        if status == "cancelled":
+            return snapshots
         time.sleep(poll_interval)
     pytest.fail(
         f"rebuild did not complete within {timeout}s for {db}/{space}; "
@@ -1928,6 +1930,157 @@ class TestCancelRebuild:
             drop_space(router_url, db_name, sp)
 
         drop_space(router_url, db_name, case_space)
+
+    def test_cancel_running_stops_subsequent_index_targets(self):
+        """Cancelling a Running multi-index rebuild must abandon the
+        whole record, not just the current target.
+
+        A rebuild without an explicit index_name resolves to every vector
+        index in the space; the scheduler processes them serially,
+        replacing rec.Tasks target-by-target inside finalize.
+        prepareNextTarget. Before this fix, a user cancel only marked the
+        current target's not-yet-dispatched tasks as Cancelled; when
+        finalize replanned the next target it lost that intent and kept
+        going. The fix persists a record-level CancelRequested flag that
+        finalize honors, so the record converges to 'cancelled' instead
+        of advancing.
+
+        This test relies on _multi_vector_space_config producing two
+        indexes (gamma_a / gamma_b), so the rebuild's `indexes` list has
+        length 2 and HasMoreTargets triggers at least once.
+        """
+        case_space = space_name + "_mri_cancel_multitarget"
+        assert create_space(
+            router_url, db_name, _multi_vector_space_config(case_space)
+        ).json()["code"] == 0
+        _add_multi_vector_docs(case_space)
+
+        # Trigger a rebuild over ALL indexes. progress.indexes should
+        # report both targets — sanity check the precondition, otherwise
+        # the test wouldn't exercise the multi-target code path.
+        resp = _trigger_rebuild(db_name, case_space)
+        assert resp.json().get("code") == 0, resp.text
+
+        progress_before = _get_rebuild_progress(db_name, case_space)
+        indexes = progress_before.get("indexes") or []
+        assert len(indexes) >= 2, (
+            f"multi-target precondition failed: expected >=2 indexes, "
+            f"got {indexes} (progress={progress_before})"
+        )
+
+        # Cancel while the record is still active. Because the record is
+        # Running (or Pending on very slow admission), we accept either
+        # response shape — the important assertion is post-finalize state.
+        cancel_resp = _cancel_rebuild(db_name, case_space)
+        cancel_body = cancel_resp.json()
+        logger.info("cancel multi-target rebuild: %s", cancel_body)
+        assert cancel_body.get("code") == 0, cancel_body
+
+        results = cancel_body.get("data", {}).get("results", [])
+        assert results, cancel_body
+        entry = results[0]
+        self._assert_cancel_entry_reason(entry, sp_label=case_space)
+        # When the record was still Running at cancel time, the reason
+        # must advertise the new semantics (no further targets started).
+        # When it was Pending, the record itself is Cancelled and the
+        # subsequent-target semantics apply implicitly.
+        if entry.get("status") == "running":
+            assert "further index target" in entry.get("reason", "").lower(), (
+                f"running cancel must mention subsequent targets are skipped, got {entry}"
+            )
+
+        # Wait for finalize to converge — the waiter now recognises
+        # 'cancelled' as terminal.
+        _wait_rebuild_completed(db_name, case_space, timeout=600)
+
+        final = _get_rebuild_progress(db_name, case_space)
+        logger.info("final progress after multi-target cancel: %s", final)
+        assert final["status"] == "cancelled", (
+            f"multi-target rebuild must converge to 'cancelled' after user "
+            f"cancel, got status={final['status']}, progress={final}"
+        )
+        # current_index/current_target must NOT have advanced past the
+        # first target — that's the whole point of the fix. current_index
+        # is 1-based in the response; it stays at 1 (the target where
+        # cancel landed) even if some replicas of that target completed.
+        assert final.get("current_index", 0) <= 1, (
+            f"cancel must not advance past target #1, got current_index="
+            f"{final.get('current_index')} target={final.get('current_target')}"
+        )
+        # error_msg surfaces the "N subsequent index target(s) skipped"
+        # phrase produced by finalize.
+        err_msg = (final.get("error_msg") or "").lower()
+        assert "skipped" in err_msg or "subsequent" in err_msg, (
+            f"error_msg should describe skipped subsequent targets, got {err_msg!r}"
+        )
+
+        _wait_index_status_indexed(db_name, case_space)
+        drop_space(router_url, db_name, case_space)
+
+    def test_db_level_cancel_only_targets_recorded_spaces(self):
+        """DB-level cancel must only touch spaces that actually have a
+        rebuild record — not every space under the DB.
+
+        Before this fix, cancelRebuildIndex enumerated every space via
+        QuerySpaces and called CancelRebuild on each; spaces with no
+        rebuild record returned "no rebuild record found" and cluttered
+        failures[]. After the fix the handler does a PrefixScan over
+        etcd rebuild records and only calls CancelRebuild on those,
+        keeping the response clean.
+        """
+        case_space_with = space_name + "_mri_dbcancel_with"
+        case_space_without = space_name + "_mri_dbcancel_without"
+
+        # Two spaces exist under the DB. Only one gets a rebuild record.
+        for sp in (case_space_with, case_space_without):
+            cs_resp = create_space(
+                router_url, db_name, _hnsw_space_config(sp)
+            )
+            assert cs_resp.json().get("code") == 0, cs_resp.text
+            add(
+                int(xb.shape[0] / 100), 100, xb, True, False, space_name=sp
+            )
+            waiting_index_finish(xb.shape[0], space_name=sp)
+
+        # Trigger rebuild ONLY on case_space_with.
+        resp = _trigger_rebuild(db_name, case_space_with)
+        assert resp.json().get("code") == 0, resp.text
+
+        # Cancel at the DB level.
+        cancel_resp = _cancel_rebuild_db(db_name)
+        cancel_body = cancel_resp.json()
+        logger.info("db-level cancel body: %s", cancel_body)
+        assert cancel_body.get("code") == 0, cancel_body
+
+        data = cancel_body.get("data", {})
+        results = data.get("results", [])
+        failures = data.get("failures", [])
+
+        # The space with a rebuild record must appear.
+        with_names = {r.get("space_name") for r in results}
+        assert case_space_with in with_names, (
+            f"space with rebuild record missing from results: {results}"
+        )
+
+        # The space WITHOUT a rebuild record must NOT appear in results
+        # OR in failures — the handler must have skipped it entirely.
+        assert case_space_without not in with_names, (
+            f"space without rebuild record leaked into results: {results}"
+        )
+        failure_names = {f.get("space_name") for f in failures}
+        assert case_space_without not in failure_names, (
+            f"space without rebuild record must not be reported as a failure, "
+            f"got failures={failures}"
+        )
+        # succeeded/failed counts must reflect the recorded-only scope.
+        assert data.get("total") == len(results) + len(failures), data
+
+        # Wait for the actually-cancelled rebuild to finalize.
+        _wait_rebuild_completed(db_name, case_space_with, timeout=600)
+
+        for sp in (case_space_with, case_space_without):
+            _wait_index_status_indexed(db_name, sp)
+            drop_space(router_url, db_name, sp)
 
     def test_destroy_db(self):
         drop_db(router_url, db_name)

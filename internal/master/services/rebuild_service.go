@@ -356,20 +356,23 @@ func (s *RebuildService) CancelRebuild(ctx context.Context, dbName, spaceName st
 		if err != nil {
 			return nil, err
 		}
+		// The record was flagged CancelRequested inside the same STM; finalize
+		// will refuse to advance to any remaining Indexes[] target.
+		const suffix = " no further index targets will be started"
 		reason := ""
 		switch {
 		case n == 0:
-			reason = "rebuild is running and every task is already dispatched or terminal; nothing to cancel"
+			reason = "rebuild is running and every task is already dispatched or terminal; already-dispatched tasks will run to completion;" + suffix
 		case n == 1:
-			reason = "cancelled 1 not-yet-dispatched task; already-dispatched tasks will run to completion"
+			reason = "cancelled 1 not-yet-dispatched task; already-dispatched tasks will run to completion;" + suffix
 		default:
-			reason = fmt.Sprintf("cancelled %d not-yet-dispatched tasks; already-dispatched tasks will run to completion", n)
+			reason = fmt.Sprintf("cancelled %d not-yet-dispatched tasks; already-dispatched tasks will run to completion;%s", n, suffix)
 		}
-		log.Info("cancel running rebuild for %s/%s: cancelled %d pending task(s)", dbName, spaceName, n)
+		log.Info("cancel running rebuild for %s/%s: cancelled %d pending task(s), CancelRequested=true", dbName, spaceName, n)
 		return &entity.CancelRebuildResponse{
 			DBName:         dbName,
 			SpaceName:      spaceName,
-			Cancelled:      false, // record itself stays Running
+			Cancelled:      false, // record itself stays Running until finalize converges it
 			CancelledTasks: n,
 			Reason:         reason,
 			Status:         entity.RebuildStatusRunning,
@@ -413,14 +416,13 @@ func (s *RebuildService) casCancelPending(ctx context.Context, key string) (bool
 	return !conflict, nil
 }
 
-// casCancelRunningTasks marks every not-yet-dispatched, non-terminal task
-// of a Running record as Cancelled. The record itself stays Running; the
-// scheduler will observe the Cancelled tasks on the next tick, skip them
-// during dispatchPending, and finalize will converge the record once every
-// remaining (already-dispatched) task reaches a terminal state.
-//
-// Returns the number of tasks transitioned. Non-Running records and empty
-// task lists yield (0, nil) — best-effort semantics.
+// casCancelRunningTasks marks the record's CancelRequested flag and every
+// not-yet-dispatched, non-terminal task of a Running record as Cancelled.
+// The record itself stays Running; the scheduler will observe the flag +
+// Cancelled tasks on the next tick, skip cancelled entries during
+// dispatchPending, refuse to advance to the next Indexes[] target in
+// finalize, and converge the record once every remaining (already-dispatched)
+// task reaches a terminal state.
 func (s *RebuildService) casCancelRunningTasks(ctx context.Context, key string) (int, error) {
 	cancelled := 0
 	err := s.client.Master().STM(ctx, func(stm concurrency.STM) error {
@@ -446,9 +448,12 @@ func (s *RebuildService) casCancelRunningTasks(ctx context.Context, key string) 
 			t.CompleteTime = now
 			cancelled++
 		}
-		if cancelled == 0 {
+		// Short-circuit only when the flag is already set AND no new task-
+		// level cancels were applied — otherwise we still need to persist.
+		if rec.CancelRequested && cancelled == 0 {
 			return nil
 		}
+		rec.CancelRequested = true
 		value, err := vjson.Marshal(rec)
 		if err != nil {
 			return err
@@ -1202,7 +1207,11 @@ func (sc *RebuildScheduler) finalize(ctx context.Context, rec *SpaceRebuildRecor
 	// in place: keep Status=Running, build the next target's tasks now, so
 	// the same space keeps its scheduler slot across the whole Indexes list
 	// without yielding to other pending records.
-	if failed == 0 && rec.HasMoreTargets() {
+	//
+	// CancelRequested short-circuits this advance: a user cancel means the
+	// whole rebuild is abandoned, so no new target is planned even if the
+	// current one had zero failures.
+	if failed == 0 && rec.HasMoreTargets() && !rec.CancelRequested {
 		previousTarget := rec.CurrentTarget()
 		if err := sc.prepareNextTarget(ctx, rec); err != nil {
 			// Cannot plan the next target: fall through to terminal path.
@@ -1226,12 +1235,13 @@ func (sc *RebuildScheduler) finalize(ctx context.Context, rec *SpaceRebuildRecor
 	}
 
 	// Terminal state.
-	//   FailedTasks > 0                       → Failed
-	//   FailedTasks == 0 && completed > 0     → Completed (Cancelled tasks
-	//                                            are treated as "user asked
-	//                                            to stop that piece"; the
-	//                                            rebuild as a whole succeeded
-	//                                            for what actually ran)
+	//   FailedTasks > 0                       → Failed (hard fact wins even
+	//                                            when the user also cancelled)
+	//   CancelRequested                       → Cancelled (user abandoned the
+	//                                            rebuild; any completed tasks
+	//                                            already ran to completion for
+	//                                            what actually started)
+	//   FailedTasks == 0 && completed > 0     → Completed
 	//   FailedTasks == 0 && completed == 0    → Cancelled (nothing ran)
 	finalStatus := entity.RebuildStatusCompleted
 	finalErr := ""
@@ -1241,6 +1251,11 @@ func (sc *RebuildScheduler) finalize(ctx context.Context, rec *SpaceRebuildRecor
 		finalErr = fmt.Sprintf("%d/%d replicas failed on target %s (max partition retry %d/%d)",
 			failed, total, rec.CurrentTarget(),
 			maxPartitionRetry(rec.PartitionRetries), rec.MaxRetries)
+	case rec.CancelRequested:
+		finalStatus = entity.RebuildStatusCancelled
+		remaining := len(rec.Indexes) - (rec.CurrentIndexIdx + 1)
+		finalErr = fmt.Sprintf("cancelled by user on target %s: %d completed, %d cancelled before dispatch; %d subsequent index target(s) skipped",
+			rec.CurrentTarget(), completed, cancelled, remaining)
 	case completed == 0 && cancelled > 0:
 		finalStatus = entity.RebuildStatusCancelled
 		finalErr = fmt.Sprintf("all %d tasks cancelled before completion on target %s",

@@ -1415,38 +1415,44 @@ func (ca *clusterAPI) cancelRebuildIndex(c *gin.Context) {
 	case dbName != "" && spaceName != "":
 		targets = append(targets, target{db: dbName, space: spaceName})
 	case dbName != "":
-		dbID, err := mc.QueryDBName2ID(ctx, dbName)
+		// Only cancel spaces that actually have a rebuild record
+		prefix := entity.PrefixRebuild + dbName + "/"
+		_, bytesList, err := mc.Store.PrefixScan(ctx, prefix)
 		if err != nil {
-			log.Error("cancelRebuildIndex: query db %s failed: %v", dbName, err)
-			httpCode = response.New(c).JsonError(errors.NewErrInternal(fmt.Errorf("query db %s failed: %v", dbName, err)))
-			return
-		}
-		spaces, err := mc.QuerySpaces(ctx, dbID)
-		if err != nil {
-			log.Error("cancelRebuildIndex: query spaces of db %s failed: %v", dbName, err)
+			log.Error("cancelRebuildIndex: scan rebuild records for db %s failed: %v", dbName, err)
 			httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
 			return
 		}
-		for _, sp := range spaces {
-			targets = append(targets, target{db: dbName, space: sp.Name})
-		}
-	default:
-		// Cancel all rebuilds across all dbs.
-		dbs, err := mc.QueryDBs(ctx)
-		if err != nil {
-			log.Error("cancelRebuildIndex: query dbs failed: %v", err)
-			httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
-			return
-		}
-		for _, db := range dbs {
-			spaces, err := mc.QuerySpaces(ctx, int64(db.Id))
-			if err != nil {
-				log.Error("cancelRebuildIndex: query spaces of db %s failed: %v", db.Name, err)
+		for _, bs := range bytesList {
+			rec := &entity.SpaceRebuildRecord{}
+			if err := json.Unmarshal(bs, rec); err != nil {
+				log.Warn("cancelRebuildIndex: unmarshal rebuild record under %s: %v", prefix, err)
 				continue
 			}
-			for _, sp := range spaces {
-				targets = append(targets, target{db: db.Name, space: sp.Name})
+			if rec.DBName == "" || rec.SpaceName == "" {
+				continue
 			}
+			targets = append(targets, target{db: rec.DBName, space: rec.SpaceName})
+		}
+	default:
+		// Cancel every rebuild record cluster-wide, again scoped to
+		// spaces that actually have a record.
+		_, bytesList, err := mc.Store.PrefixScan(ctx, entity.PrefixRebuild)
+		if err != nil {
+			log.Error("cancelRebuildIndex: scan all rebuild records failed: %v", err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
+			return
+		}
+		for _, bs := range bytesList {
+			rec := &entity.SpaceRebuildRecord{}
+			if err := json.Unmarshal(bs, rec); err != nil {
+				log.Warn("cancelRebuildIndex: unmarshal rebuild record under %s: %v", entity.PrefixRebuild, err)
+				continue
+			}
+			if rec.DBName == "" || rec.SpaceName == "" {
+				continue
+			}
+			targets = append(targets, target{db: rec.DBName, space: rec.SpaceName})
 		}
 	}
 

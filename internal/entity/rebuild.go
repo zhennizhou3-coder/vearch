@@ -234,6 +234,9 @@ type SpaceRebuildRecord struct {
 
 	// Tasks is the per-replica plan for the current target.
 	Tasks []*RebuildTask `json:"tasks,omitempty"`
+
+	// CancelRequested indicates the user has asked to cancel the whole rebuild
+	CancelRequested bool `json:"cancel_requested,omitempty"`
 }
 
 // SpaceKey returns the dbName-spaceName composite identifier.
@@ -255,8 +258,20 @@ func (r *SpaceRebuildRecord) HasMoreTargets() bool {
 }
 
 // MergeCancelledFrom merges task-level Cancelled markers from `current`
+// into r, and propagates a CancelRequested=true flag from `current`. Called
+// by persistRecord to preserve a concurrent CancelRebuild's writes across
+// the scheduler tick's read-modify-write cycle.
+//
+// Returns the number of task-level cancels merged (the flag propagation is
+// not counted; it is a boolean).
 func (r *SpaceRebuildRecord) MergeCancelledFrom(current *SpaceRebuildRecord) int {
-	if current == nil || len(current.Tasks) == 0 || len(r.Tasks) == 0 {
+	if current == nil {
+		return 0
+	}
+	if current.CancelRequested {
+		r.CancelRequested = true
+	}
+	if len(current.Tasks) == 0 || len(r.Tasks) == 0 {
 		return 0
 	}
 	type taskKey struct {
