@@ -37,6 +37,10 @@ import (
 
 var _ engine.Engine = &gammaEngine{}
 
+// indexLocker serializes BuildIndex, RebuildFieldIndex, and Load across the
+// entire PS process. Rebuild scheduling already limits concurrent rebuild work
+// on a PS; the package-level lock also covers write-triggered BuildIndex and
+// partition Load calls that are not coordinated by the rebuild scheduler.
 var indexLocker sync.Mutex
 
 type EngineConfig struct {
@@ -395,9 +399,9 @@ func (ge *gammaEngine) BuildIndex() error {
 // indexType are still passed for the engine to resolve the RawVector and
 // index parameters.
 func (ge *gammaEngine) RebuildFieldIndex(indexName, field, indexType string, drop, cpu, des int) error {
-	if ge.gamma == nil || ge.hasClosed {
+	if _, err := ge.getEnginePtr(); err != nil {
 		log.Error("gammaEngine is nil or closed, partition:[%d]", ge.partitionID)
-		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_IS_CLOSED, nil)
+		return err
 	}
 
 	if field == "" {
@@ -411,11 +415,13 @@ func (ge *gammaEngine) RebuildFieldIndex(indexName, field, indexType string, dro
 		defer ge.counter.Decr()
 		indexLocker.Lock()
 		defer indexLocker.Unlock()
-		if ge.hasClosed {
+		enginePtr, err := ge.getEnginePtr()
+		if err != nil {
+			log.Info("RebuildFieldIndex partition:[%d] skipped: %v", ge.partitionID, err)
 			return
 		}
 		startTime := time.Now()
-		rc := gamma.RebuildFieldIndex(ge.gamma, indexName, field, indexType, drop, cpu, des)
+		rc := gamma.RebuildFieldIndex(enginePtr, indexName, field, indexType, drop, cpu, des)
 		cost := time.Since(startTime).Seconds() * 1000
 		if rc != 0 {
 			log.Error("RebuildFieldIndex partition:[%d] name=%s field=%s indexType=%s cost:[%.2f]ms err rc:[%d]",
@@ -461,8 +467,10 @@ func (ge *gammaEngine) Load() error {
 		ge.Close()
 		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, fmt.Errorf("load data err code:[%d]", code))
 	}
+	ge.lock.Lock()
 	ge.gamma = engineInstance
 	ge.hasClosed = false
+	ge.lock.Unlock()
 	return nil
 }
 
@@ -476,8 +484,10 @@ func (ge *gammaEngine) Close() {
 	n := runtime.Stack(buf, false)
 	log.Info("Close called for partition:[%d], stack trace:\n%s", ge.partitionID, string(buf[:n]))
 
+	ge.lock.Lock()
 	enginePtr := ge.gamma
 	ge.gamma = nil
+	ge.lock.Unlock()
 	ge.cancel()
 	go func(enginePtr unsafe.Pointer) {
 		if enginePtr == nil {
@@ -504,7 +514,9 @@ func (ge *gammaEngine) Close() {
 			log.Info("close gamma engine partition:[%d] success", ge.partitionID)
 		}
 
+		ge.lock.Lock()
 		ge.hasClosed = true
+		ge.lock.Unlock()
 		log.Info("close gamma engine partition:[%d] end cost:[%v]", ge.partitionID, time.Since(start))
 	}(enginePtr)
 }
