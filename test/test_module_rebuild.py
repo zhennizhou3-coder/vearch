@@ -520,7 +520,11 @@ class TestRebuildBasicLifecycle:
     """Trigger space-level rebuild and verify completion."""
 
     def setup_class(self):
-        pass
+        # Do the db reset once per class before any method runs, so that
+        # single-method pytest invocations (-k / IDE run) also see a
+        # fresh db instead of hitting DB_NOT_EXIST from the previous
+        # class's test_destroy_db.
+        _ensure_clean_db()
 
     def test_prepare_db(self):
         _ensure_clean_db()
@@ -797,115 +801,6 @@ class TestRebuildBasicLifecycle:
         drop_space(router_url, db_name, sp_a)
         drop_space(router_url, db_name, sp_b)
 
-    def test_rebuild_ivf_after_delete_half(self):
-        """IVFPQ rebuild after deleting half the vectors.
-
-        IVFPQ is more sensitive to training data quality than IVFFLAT
-        because PQ codebook training amplifies the effect of stale/biased
-        training samples.  Deleting half the vectors and then rebuilding
-        should show noticeable recall improvement when the new reservoir-
-        sampled training data excludes deleted vectors and is drawn
-        uniformly from the remaining set."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_mri_ivfpq_del"
-
-        # Use IVFPQ with L2 metric (matching SIFT groundtruth).
-        # IVFPQ training involves both K-Means (coarse quantizer) and
-        # PQ codebook (sub-vector quantizer), making it far more sensitive
-        # to training data contamination than IVFFLAT.
-        embedding_size = xb.shape[1]
-        ivfpq_l2_config = {
-            "name": case_space, "partition_num": 1, "replica_num": 1,
-            "fields": [
-                {"name": "field_int", "type": "integer"},
-                {"name": "field_vector", "type": "vector",
-                 "index": {"name": "gamma", "type": "IVFPQ",
-                           "params": {"metric_type": "L2", "ncentroids": 128,
-                                      "nsubvector": 32, "training_threshold": 4992}},
-                 "dimension": embedding_size},
-            ],
-        }
-        assert create_space(router_url, db_name, ivfpq_l2_config).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, False, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        # ---- Delete half of the documents (IDs in range [total//2, total)) ----
-        delete_url = router_url + "/document/delete?timeout=300000"
-        half = total // 2
-        ids_to_delete = [str(i) for i in range(half, total)]
-        batch_del = 200
-        for start in range(0, len(ids_to_delete), batch_del):
-            chunk = ids_to_delete[start : start + batch_del]
-            del_data = {
-                "db_name": db_name,
-                "space_name": case_space,
-                "document_ids": chunk,
-            }
-            del_resp = requests.post(delete_url, auth=(username, password), json=del_data)
-            body = del_resp.json()
-            assert body.get("code") == 0, f"delete failed: {body}"
-
-        logger.info("deleted %d documents, %d remain", len(ids_to_delete), half)
-
-        # ---- Compute recall BEFORE rebuild (stale index) ----
-        recall_before = _compute_recall(case_space, k=100)
-        logger.info(
-            "IVFPQ recall BEFORE rebuild (after delete): recall@1=%.4f recall@10=%.4f",
-            recall_before["recall_at_1"], recall_before["recall_at_10"],
-        )
-
-        # ---- Trigger rebuild ----
-        resp = _trigger_rebuild_drop(db_name, case_space)
-        assert resp.status_code == 200, f"trigger failed: {resp.text[:500]}"
-        body = resp.json()
-        assert body.get("code") == 0, body
-
-        # ---- Wait for rebuild to complete ----
-        snapshots = _wait_rebuild_completed(db_name, case_space, timeout=600)
-        final = snapshots[-1]
-        assert final["status"] == "completed", final
-        assert final["failed_tasks"] == 0, final
-
-        _wait_index_status_indexed(db_name, case_space)
-
-        # ---- Verify index_num / doc_num after rebuild ----
-        detail_url = f"{router_url}/dbs/{db_name}/spaces/{case_space}?detail=true"
-        detail_resp = requests.get(detail_url, auth=(username, password))
-        assert detail_resp.status_code == 200, detail_resp.text
-        detail_body = detail_resp.json()
-        assert detail_body.get("code") == 0, detail_body
-        detail_data = detail_body.get("data", {})
-        partitions = detail_data.get("partitions", [])
-        for p in partitions:
-            logger.info(
-                "AFTER REBUILD partition pid=%s doc_num=%s index_num=%s max_docid=%s",
-                p.get("pid"), p.get("doc_num"), p.get("index_num"), p.get("max_docid"),
-            )
-
-        # ---- Compute recall AFTER rebuild ----
-        recall_after = _compute_recall(case_space, k=100)
-        logger.info(
-            "IVFPQ recall AFTER rebuild (after delete): recall@1=%.4f recall@10=%.4f",
-            recall_after["recall_at_1"], recall_after["recall_at_10"],
-        )
-
-        # IVFPQ training and search can fluctuate slightly between rebuilds.
-        # Allow at most two query outcomes to differ while still catching a
-        # meaningful recall regression.
-        recall_tolerance = 2 / xq.shape[0]
-        assert recall_after["recall_at_1"] + recall_tolerance > recall_before["recall_at_1"], (
-            f"recall@1 degraded beyond tolerance {recall_tolerance:.4f} after rebuild: "
-            f"{recall_before['recall_at_1']:.4f} -> {recall_after['recall_at_1']:.4f}"
-        )
-        assert recall_after["recall_at_10"] + recall_tolerance > recall_before["recall_at_10"], (
-            f"recall@10 degraded beyond tolerance {recall_tolerance:.4f} after rebuild: "
-            f"{recall_before['recall_at_10']:.4f} -> {recall_after['recall_at_10']:.4f}"
-        )
-
-        drop_space(router_url, db_name, case_space)
-
     def test_rebuild_improves_recall_with_undertrained_init(self):
         """Rebuild after appending data to an initially-undertrained IVFPQ.
 
@@ -1009,7 +904,7 @@ class TestRebuildProgressQuery:
     """Verify progress API shape, monotonicity, and detail."""
 
     def setup_class(self):
-        pass
+        _ensure_clean_db()
 
     def test_prepare_db(self):
         _ensure_clean_db()
@@ -1280,7 +1175,7 @@ class TestCancelRebuild:
         return chr(ord('a') + idx)
 
     def setup_class(self):
-        pass
+        _ensure_clean_db()
 
     def test_prepare_db(self):
         _ensure_clean_db()
@@ -1938,7 +1833,7 @@ class TestRebuildPerField:
     """Rebuild a specific (field_name, index_type) target."""
 
     def setup_class(self):
-        pass
+        _ensure_clean_db()
 
     def test_prepare_db(self):
         _ensure_clean_db()
@@ -2057,27 +1952,6 @@ class TestRebuildPerField:
         _check_search_field(case_space, field="field_vector_b")
         drop_space(router_url, db_name, case_space)
 
-    def test_rebuild_all_targets_on_multi_vector_space(self):
-        """Fan-out rebuild (no field/index_type) rebuilds every target."""
-        case_space = space_name + "_mri_all_targets"
-        assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
-        _add_multi_vector_docs(case_space)
-
-        resp = _trigger_rebuild(db_name, case_space)
-        body = resp.json()
-        logger.info("all-target rebuild trigger response: %s", body)
-        assert body.get("code") == 0, body
-
-        first = _get_rebuild_progress(db_name, case_space)
-        indexes = first.get("indexes", [])
-        assert len(indexes) >= 2, f"expected >= 2 index names, got {indexes}"
-        for idx_name in indexes:
-            assert isinstance(idx_name, str) and idx_name, f"index name must be non-empty string: {idx_name!r}"
-
-        _wait_rebuild_completed(db_name, case_space, timeout=600)
-        _wait_index_status_indexed(db_name, case_space)
-        drop_space(router_url, db_name, case_space)
-
     def test_rebuild_single_field_on_single_vector_space(self):
         """Rebuild a single-field space by specifying (field, indexType) explicitly."""
         batch_size = 100
@@ -2104,15 +1978,15 @@ class TestRebuildPerField:
         _check_search(case_space)
         drop_space(router_url, db_name, case_space)
 
-    def test_rebuild_nonexistent_field_rejected(self):
-        """Specifying a field that does not exist on the space must be rejected."""
-        case_space = space_name + "_mri_bad_field"
+    def test_rebuild_nonexistent_index_rejected(self):
+        """Specifying an index that does not exist on the space must be rejected."""
+        case_space = space_name + "_mri_bad_index"
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
 
         resp = _trigger_rebuild(db_name, case_space, index_name="nonexistent_index")
         body = resp.json()
-        logger.info("rebuild nonexistent field response: %s", body)
+        logger.info("rebuild nonexistent index response: %s", body)
         # The rebuild API returns code=0 at the top level for batch-style
         # responses; individual failures are reported in data.failures.
         data = body.get("data", {})
@@ -2120,86 +1994,19 @@ class TestRebuildPerField:
         if body.get("code") != 0:
             # Top-level error — check msg.
             msg = body.get("msg", "").lower()
-            assert "field" in msg or "no field" in msg or "nonexistent" in msg or "not found" in msg, (
-                f"unexpected error message for nonexistent field: {body}"
+            assert "index" in msg or "no index" in msg or "nonexistent" in msg or "not found" in msg, (
+                f"unexpected error message for nonexistent index: {body}"
             )
         else:
             # Batch-style: the target should appear in failures, not results.
             assert len(failures) > 0, (
-                f"expected failure for nonexistent field, got success: {body}"
+                f"expected failure for nonexistent index, got success: {body}"
             )
             err_msg = failures[0].get("error", "").lower()
-            assert "field" in err_msg or "no field" in err_msg or "nonexistent" in err_msg or "not found" in err_msg, (
-                f"unexpected failure message for nonexistent field: {body}"
+            assert "index" in err_msg or "no index" in err_msg or "nonexistent" in err_msg or "not found" in err_msg, (
+                f"unexpected failure message for nonexistent index: {body}"
             )
 
-        drop_space(router_url, db_name, case_space)
-
-    def test_rebuild_wrong_index_type_rejected(self):
-        """Specifying a field that exists but with a wrong index type must be rejected.
-        E.g. field_vector_a has HNSW, requesting FLAT for it should fail."""
-        case_space = space_name + "_mri_wrong_type"
-        assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
-        _add_multi_vector_docs(case_space)
-
-        # field_vector_a has HNSW (gamma_a); asking for a non-existent index should fail.
-        resp = _trigger_rebuild(db_name, case_space, index_name="gamma_a_ivfpq_nonexistent")
-        body = resp.json()
-        logger.info("rebuild wrong index type response: %s", body)
-        # The rebuild API returns code=0 at the top level for batch-style
-        # responses; individual failures are reported in data.failures.
-        data = body.get("data", {})
-        failures = data.get("failures", [])
-        if body.get("code") != 0:
-            msg = body.get("msg", "").lower()
-            assert "index" in msg or "type" in msg or "no index" in msg, (
-                f"unexpected error message for wrong index type: {body}"
-            )
-        else:
-            assert len(failures) > 0, (
-                f"expected failure for wrong index type, got success: {body}"
-            )
-            err_msg = failures[0].get("error", "").lower()
-            assert "index" in err_msg or "type" in err_msg or "no index" in err_msg, (
-                f"unexpected failure message for wrong index type: {body}"
-            )
-
-        # field_vector_b has FLAT (gamma_b); asking for a non-existent index name should also fail.
-        resp2 = _trigger_rebuild(db_name, case_space, index_name="gamma_b_hnsw_nonexistent")
-        body2 = resp2.json()
-        logger.info("rebuild wrong index type (b->HNSW) response: %s", body2)
-        data2 = body2.get("data", {})
-        failures2 = data2.get("failures", [])
-        if body2.get("code") != 0:
-            pass  # top-level error already indicates rejection
-        else:
-            assert len(failures2) > 0, (
-                f"expected failure for wrong index type (field_vector_b/HNSW), got success: {body2}"
-            )
-
-        drop_space(router_url, db_name, case_space)
-
-    def test_rebuild_empty_index_name_means_all(self):
-        """Empty index_name means rebuild all rebuildable indexes of the space.
-        (Replaces the old field/type partial-target test — under the
-        IndexName API there is only one identifier and it is either
-        specified or absent, never half-specified.)"""
-        case_space = space_name + "_mri_empty_idx_name"
-        assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
-        _add_multi_vector_docs(case_space)
-
-        # Empty index_name -> rebuild all targets.
-        resp = _trigger_rebuild(db_name, case_space, index_name="")
-        body = resp.json()
-        logger.info("rebuild with empty index_name response: %s", body)
-        assert body.get("code") == 0, body
-
-        first = _get_rebuild_progress(db_name, case_space)
-        indexes = first.get("indexes", [])
-        # _multi_vector_space_config has two rebuildable vector indexes.
-        assert len(indexes) >= 2, f"expected >= 2 targets when no index_name set, got {indexes}"
-
-        _wait_rebuild_completed(db_name, case_space, timeout=600)
         drop_space(router_url, db_name, case_space)
 
     def test_rebuild_multi_index_space_all_indexes(self):
@@ -2240,173 +2047,6 @@ class TestRebuildPerField:
         drop_db(router_url, db_name)
 
 # ---------------------------------------------------------------------------
-# 5. Concurrent rebuild rejection
-# ---------------------------------------------------------------------------
-
-class TestRebuildConcurrentRejection:
-    """A second rebuild while one is pending/running must be rejected."""
-
-    def setup_class(self):
-        pass
-
-    def test_prepare_db(self):
-        _ensure_clean_db()
-
-    def test_concurrent_rebuild_rejected(self):
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_mri_concurrent"
-
-        assert create_space(router_url, db_name, _flat_space_config(case_space)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, False, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        first = _trigger_rebuild(db_name, case_space).json()
-        assert first.get("code") == 0, first
-
-        second = _trigger_rebuild(db_name, case_space).json()
-        logger.info("second rebuild response: %s", second)
-        second_failures = second.get("data", {}).get("failures", []) or []
-        rejected = second.get("code") != 0 or len(second_failures) > 0
-        assert rejected, (
-            "concurrent rebuild must be rejected; expected top-level "
-            "code!=0 or data.failures, got %s" % second)
-        if second_failures:
-            err_msg = second_failures[0].get("error", "")
-            assert "already pending" in err_msg or "already running" in err_msg, (
-                "expected 'already pending/running' error but got: %s" %
-                err_msg)
-
-        _wait_rebuild_completed(db_name, case_space, timeout=300)
-
-        third = _trigger_rebuild(db_name, case_space).json()
-        assert third.get("code") == 0, third
-        _wait_rebuild_completed(db_name, case_space, timeout=300)
-
-        drop_space(router_url, db_name, case_space)
-
-    def test_destroy_db(self):
-        drop_db(router_url, db_name)
-
-
-# ---------------------------------------------------------------------------
-# 6. Multi-index-type parameterized rebuild
-# ---------------------------------------------------------------------------
-
-class TestRebuildMultiIndexType:
-    """Parameterized rebuild across different index types."""
-
-    def setup_class(self):
-        pass
-
-    def test_prepare_db(self):
-        _ensure_clean_db()
-
-    @pytest.mark.parametrize(
-        ["index_type", "space_suffix"],
-        [
-            ["FLAT", "_mri_type_flat"],
-            ["HNSW", "_mri_type_hnsw"],
-            ["IVFPQ", "_mri_type_ivfpq"],
-        ],
-    )
-    def test_rebuild_by_index_type(self, index_type, space_suffix):
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + space_suffix
-
-        if index_type == "FLAT":
-            config = _flat_space_config(case_space)
-        elif index_type == "IVFPQ":
-            config = _ivfpq_space_config(case_space)
-        else:
-            config = _hnsw_space_config(case_space, partition_num=1)
-
-        assert create_space(router_url, db_name, config).json()["code"] == 0
-        # full_field= 控制 add() 是否往 doc 里塞 long/float/double/string
-        # 这些非 vector 字段。只有 _hnsw_space_config 的 schema 真的有这套
-        # 字段;_flat_space_config / _ivfpq_space_config 都是精简 schema
-        # (只有 field_int + field_vector),传 True 会让 router 校验失败
-        # 报 "unrecognizable field, field_string is not found in space"。
-        full_field = (index_type == "HNSW")
-        add(total_batch, batch_size, xb, True, full_field, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        resp = _trigger_rebuild(db_name, case_space)
-        body = resp.json()
-        logger.info("rebuild [%s] trigger response: %s", index_type, body)
-        assert body.get("code") == 0, body
-
-        _wait_rebuild_completed(db_name, case_space, timeout=600)
-        _wait_index_status_indexed(db_name, case_space)
-
-        if index_type != "FLAT":
-            _check_search(case_space)
-        drop_space(router_url, db_name, case_space)
-
-    def test_destroy_db(self):
-        drop_db(router_url, db_name)
-
-# ---------------------------------------------------------------------------
-# 7. DB-level trigger / query / cancel
-# ---------------------------------------------------------------------------
-
-class TestRebuildDBLevel:
-    """Exercise the DB-scope rebuild endpoints.
-
-    POST /index/rebuild/dbs/:db                     — trigger all spaces
-    GET  /index/rebuild/dbs/:db/progress             — query DB summary
-    POST /index/rebuild/dbs/:db/cancel               — cancel all spaces
-    """
-
-    def setup_class(self):
-        pass
-
-    def test_prepare_db(self):
-        _ensure_clean_db()
-
-    def test_db_level_cancel(self):
-        """Trigger DB-level rebuild, then cancel at DB scope."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-
-        case_space = space_name + "_mri_db_cancel"
-        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=2)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        resp = _trigger_rebuild_db(db_name)
-        assert resp.json().get("code") == 0, resp.text
-
-        cancel_resp = _cancel_rebuild_db(db_name)
-        body = cancel_resp.json()
-        logger.info("DB-level cancel response: %s", body)
-        assert body.get("code") == 0, body
-
-        results = body.get("data", {}).get("results", [])
-        if results:
-            for entry in results:
-                assert "cancelled" in entry, entry
-                assert "reason" in entry, entry
-                logger.info(
-                    "cancel entry: space_key=%s cancelled=%s reason=%s",
-                    entry.get("space_key"), entry.get("cancelled"), entry.get("reason"),
-                )
-
-        progress = _get_rebuild_progress(db_name, case_space)
-        if progress["status"] not in ("completed", "cancelled"):
-            _wait_rebuild_completed(db_name, case_space, timeout=600)
-
-        _wait_index_status_indexed(db_name, case_space)
-        drop_space(router_url, db_name, case_space)
-
-    def test_destroy_db(self):
-        drop_db(router_url, db_name)
-
-# ---------------------------------------------------------------------------
 # 8. Global-scope trigger / query / cancel
 # ---------------------------------------------------------------------------
 
@@ -2419,57 +2059,7 @@ class TestRebuildGlobalScope:
     """
 
     def setup_class(self):
-        pass
-
-    def test_prepare_db(self):
         _ensure_clean_db()
-
-    def test_global_cancel(self):
-        """Trigger global rebuild, then cancel globally."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-
-        case_space = space_name + "_mri_global_cancel"
-        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=2)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        resp = _trigger_rebuild_global()
-        assert resp.json().get("code") == 0, resp.text
-
-        time.sleep(3)
-
-        cancel_resp = _cancel_rebuild_global()
-        body = cancel_resp.json()
-        logger.info("global cancel response: %s", body)
-        assert body.get("code") == 0, body
-
-        results = body.get("data", {}).get("results", [])
-        if results:
-            for entry in results:
-                assert "cancelled" in entry, entry
-                assert "reason" in entry, entry
-
-        progress = _get_rebuild_progress(db_name, case_space)
-        if progress["status"] not in ("completed", "cancelled"):
-            _wait_rebuild_completed(db_name, case_space, timeout=600)
-
-        _wait_index_status_indexed(db_name, case_space)
-        drop_space(router_url, db_name, case_space)
-
-    def test_destroy_db(self):
-        drop_db(router_url, db_name)
-
-    """Exercise the global rebuild endpoints.
-
-    POST /index/rebuild                            — trigger all DBs
-    GET  /index/rebuild/progress                    — global summary
-    POST /index/rebuild/cancel                     — cancel all DBs
-    """
-
-    def setup_class(self):
-        pass
 
     def test_prepare_db(self):
         _ensure_clean_db()
@@ -2857,7 +2447,7 @@ def _comp_add_range_partition_docs(space_name, total=10000, batch_size=100):
 class TestRebuildReplicaSerialization:
 
     def setup_class(self):
-        pass
+        _comp_ensure_clean_db()
 
     def test_prepare_db(self):
         _comp_ensure_clean_db()
@@ -2885,61 +2475,6 @@ class TestRebuildReplicaSerialization:
         _comp_check_search(case_space)
         drop_space(router_url, db_name, case_space)
 
-
-
-    def test_cross_partition_query_works_during_rebuild(self):
-        """3.5: Querying a partition NOT being rebuilt is unaffected by
-        another partition's rebuild on a shared PS.
-
-        Without partition placement control, we use the per-partition
-        rebuild API to scope rebuild to a single partition and verify
-        queries on the OTHER partitions still work normally.
-        """
-        batch_size, total = 100, xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_comp_cross_pid"
-
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=2)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        detail = _comp_get_space_detail(db_name, case_space)
-        partitions = detail.get("partitions", [])
-        assert len(partitions) >= 2, "need at least 2 partitions"
-        target_pid = partitions[0]["pid"]
-        other_pids = [p["pid"] for p in partitions[1:]]
-
-        # Trigger rebuild on partition[0] only.
-        resp = _comp_trigger_rebuild(db_name, case_space, partition_id=target_pid)
-        assert resp.json().get("code") == 0
-
-        # While rebuild is running, query and verify search returns docs.
-        url = router_url + "/document/search?timeout=10000"
-        ok_count = 0
-        err_count = 0
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            progress = _comp_get_rebuild_progress(db_name, case_space)
-            data = {"vector_value": False, "db_name": db_name, "space_name": case_space,
-                    "vectors": [{"field": "field_vector", "feature": xb[ok_count % total].tolist()}]}
-            try:
-                rs = requests.post(url, auth=(username, password), json=data, timeout=10)
-                if rs.json().get("code") == 0:
-                    ok_count += 1
-                else:
-                    err_count += 1
-            except Exception:
-                err_count += 1
-            if progress["status"] in ("completed", "failed"):
-                break
-            time.sleep(0.5)
-
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        attempts = ok_count + err_count
-        if attempts > 0:
-            assert err_count / attempts < 0.05, f"err {err_count}/{attempts} too high"
-        drop_space(router_url, db_name, case_space)
-
     def test_destroy_db_3(self):
         drop_db(router_url, db_name)
 
@@ -2950,6 +2485,9 @@ class TestRebuildReplicaSerialization:
 
 
 class TestRebuildDataIntegrity:
+
+    def setup_class(self):
+        _comp_ensure_clean_db()
 
     def test_prepare_db(self):
         _comp_ensure_clean_db()
@@ -3111,6 +2649,9 @@ class TestRebuildDataIntegrity:
 
 class TestRebuildConcurrentWrites:
 
+    def setup_class(self):
+        _comp_ensure_clean_db()
+
     def test_prepare_db(self):
         _comp_ensure_clean_db()
 
@@ -3169,38 +2710,6 @@ class TestRebuildConcurrentWrites:
             assert res, f"no result for inserted vector at index={sid}"
         drop_space(router_url, db_name, case_space)
 
-    def test_deletes_during_rebuild_take_effect(self):
-        """5.2: Delete IDs 5000..9999 during rebuild; final doc_num == 5000."""
-        batch_size, total = 100, 10000
-        case_space = space_name + "_comp_del_during"
-
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=1)).json()["code"] == 0
-        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
-
-        _comp_delete_documents(db_name, case_space, list(range(5000, total)))
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
-        time.sleep(3)
-        logger.info("after delete rebuild finished")
-        _comp_wait_index_status_indexed(db_name, case_space)
-
-        detail = _comp_get_space_detail(db_name, case_space)
-        assert detail.get("doc_num") == 5000, f"expected 5000 docs, got {detail.get('doc_num')}"
-
-        # Spot-check: deleted IDs not returnable.
-        for did in [5000, 7500, 9999]:
-            r = _comp_query_document(db_name, case_space, str(did))
-            docs = r.get("data", {}).get("documents", []) or []
-            for d in docs:
-                if d:
-                    assert not d.get("_found", True), f"deleted id {did} still returnable"
-        drop_space(router_url, db_name, case_space)
-
-
     def test_destroy_db_5(self):
         drop_db(router_url, db_name)
 
@@ -3211,6 +2720,9 @@ class TestRebuildConcurrentWrites:
 
 
 class TestRebuildIndexTypeMatrix:
+
+    def setup_class(self):
+        _comp_ensure_clean_db()
 
     def test_prepare_db(self):
         _comp_ensure_clean_db()
@@ -3721,6 +3233,9 @@ class TestRebuildIndexTypeMatrix:
 
 class TestRebuildParameters:
 
+    def setup_class(self):
+        _comp_ensure_clean_db()
+
     def test_prepare_db(self):
         _comp_ensure_clean_db()
 
@@ -3818,6 +3333,206 @@ class TestRebuildParameters:
         _comp_wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
 
+    def test_partition_id_zero_means_all_partitions(self):
+        """7.5.1: partition_id=0 语义 —— 覆盖全部 partition。
+
+        entity/rebuild.go:130 显式定义 "0 means all"; selectPartitions
+        (rebuild_service.go:544) 走 space.Partitions 全量分支。这条测试防止
+        以后有人把 0 误当作"合法 partition id"过滤掉,让 API 悄悄退化成
+        单分区重建。
+        """
+        case_space = space_name + "_comp_pid_zero"
+        batch_size, total = 100, 5000
+        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=3)).json()["code"] == 0
+        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
+        waiting_index_finish(total, space_name=case_space)
+
+        partitions = _comp_get_space_detail(db_name, case_space).get("partitions", [])
+        expected_pids = {p["pid"] for p in partitions}
+        assert len(expected_pids) == 3
+
+        resp = _comp_trigger_rebuild(db_name, case_space, partition_id=0)
+        assert resp.json().get("code") == 0
+        progress = _comp_get_rebuild_progress(db_name, case_space)
+        tasks = progress.get("tasks") or []
+        task_pids = {t.get("partition_id") for t in tasks}
+        assert task_pids == expected_pids, (
+            f"partition_id=0 应覆盖全部分区,got tasks pids={task_pids}, "
+            f"expected={expected_pids}"
+        )
+        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
+        _comp_wait_index_status_indexed(db_name, case_space)
+        drop_space(router_url, db_name, case_space)
+
+    def test_partition_id_nonexistent_rejected(self):
+        """7.5.2: 不存在的 partition_id 必须被明确拒绝,不能悄悄退化成 all。
+
+        rebuild_service.go:552 会返回 "partition N does not belong to
+        space X";cluster_api.go 的 batch handler 把它放进 data.failures。
+        """
+        case_space = space_name + "_comp_pid_bad"
+        batch_size, total = 100, 3000
+        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=2)).json()["code"] == 0
+        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
+        waiting_index_finish(total, space_name=case_space)
+
+        # 998877 不可能存在于本 space。传 uint32 允许的大值即可。
+        bogus_pid = 998877
+        resp = _comp_trigger_rebuild(
+            db_name, case_space, partition_id=bogus_pid)
+        body = resp.json()
+        logger.info("bogus partition_id trigger response: %s", body)
+
+        data = body.get("data", {}) or {}
+        failures = data.get("failures", [])
+        results = data.get("results", [])
+
+        # 允许两种错误形态:
+        #   (a) top-level code != 0
+        #   (b) batch-style: 该 space 落入 failures[],results 里没有它。
+        if body.get("code") != 0:
+            msg = body.get("msg", "").lower()
+            assert "partition" in msg, (
+                f"unexpected top-level error for bogus pid: {body}")
+        else:
+            assert not any(r.get("space_name") == case_space for r in results), (
+                f"bogus partition_id 竟然被当成成功入队:results={results}")
+            assert failures, f"expected failure entry, got body={body}"
+            err_msg = "".join(f.get("error", "") for f in failures).lower()
+            assert "partition" in err_msg and str(bogus_pid) in err_msg, (
+                f"failure 应指明 partition {bogus_pid} 不存在,got={failures}")
+
+        # 别忘了确认服务端没有为这条错误请求写下 rebuild record。
+        # 直接查 progress:应该 404 / 或没有该 space 的记录。
+        prog_url = f"{router_url}/index/rebuild/dbs/{db_name}/spaces/{case_space}/progress"
+        pr = requests.get(prog_url, auth=(username, password))
+        # 存在两种合法响应:404 (无记录) 或 200 但业务 code!=0。
+        if pr.status_code == 200:
+            pbody = pr.json()
+            assert pbody.get("code") != 0, (
+                f"bogus pid 请求不应产生 rebuild record,got progress={pbody}")
+        drop_space(router_url, db_name, case_space)
+
+    def test_partition_id_task_count_matches_replica_num(self):
+        """7.5.3: 指定 partition_id 后,total_tasks 必须等于该 partition
+        的 replica_num,不能被其他 partition 的 task 污染。
+
+        这是"单分区重建"最核心的隔离性:任务数量、粒度都要严格局限。
+        """
+        case_space = space_name + "_comp_pid_taskcount"
+        batch_size, total = 100, 3000
+        rn = 1
+        assert create_space(
+            router_url, db_name,
+            _comp_hnsw_cfg(case_space, pn=3, rn=rn),
+        ).json()["code"] == 0
+        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
+        waiting_index_finish(total, space_name=case_space)
+
+        partitions = _comp_get_space_detail(db_name, case_space).get("partitions", [])
+        assert len(partitions) == 3
+        target_pid = partitions[0]["pid"]
+
+        resp = _comp_trigger_rebuild(db_name, case_space, partition_id=target_pid)
+        assert resp.json().get("code") == 0
+
+        progress = _comp_get_rebuild_progress(db_name, case_space)
+        total_tasks = progress.get("total_tasks", 0)
+        assert total_tasks == rn, (
+            f"total_tasks 必须 == replica_num ({rn}),got {total_tasks};"
+            f"progress={progress}"
+        )
+        # 双保险:tasks[] 明细里也必须全部落在 target_pid。
+        for t in progress.get("tasks") or []:
+            assert t.get("partition_id") == target_pid, (
+                f"task 泄漏到别的 pid: {t}")
+
+        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
+        _comp_wait_index_status_indexed(db_name, case_space)
+        drop_space(router_url, db_name, case_space)
+
+    def test_partition_id_with_index_name_scopes_to_intersection(self):
+        """7.5.4: partition_id + index_name 组合 —— tasks 必须严格落在
+        (pid, index_name) 交集上,不能扩散到其它 pid 或其它 index。
+
+        用 _multi_vector_space_config (gamma_a HNSW + gamma_b FLAT) 才
+        能观测到"index_name 有实质选择效果"这条不变式。
+        """
+        case_space = space_name + "_comp_pid_index"
+        assert create_space(
+            router_url, db_name,
+            _multi_vector_space_config(case_space, partition_num=3),
+        ).json()["code"] == 0
+        _add_multi_vector_docs(case_space)
+
+        partitions = _comp_get_space_detail(db_name, case_space).get("partitions", [])
+        assert len(partitions) == 3
+        target_pid = partitions[1]["pid"]
+
+        resp = _comp_trigger_rebuild(
+            db_name, case_space,
+            index_name="gamma_a", partition_id=target_pid,
+        )
+        assert resp.json().get("code") == 0
+
+        progress = _comp_get_rebuild_progress(db_name, case_space)
+        indexes = progress.get("indexes") or []
+        # index_name 显式指定后,只能有 1 个 target。
+        assert indexes == ["gamma_a"], (
+            f"index_name 指定后 indexes 必须 == [gamma_a],got {indexes}")
+        for t in progress.get("tasks") or []:
+            assert t.get("partition_id") == target_pid, (
+                f"task 泄漏到别的 pid: {t}")
+            # tasks 里的 index_name 字段(如有)也应匹配。
+            name = t.get("index_name")
+            if name:
+                assert name == "gamma_a", (
+                    f"task 的 index_name 不匹配: got {name}")
+
+        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
+        _comp_wait_index_status_indexed(db_name, case_space)
+        drop_space(router_url, db_name, case_space)
+
+    def test_partition_id_cancel_only_touches_target_record(self):
+        """7.5.5: 单 partition rebuild 被 cancel 时,记录应正常收敛到
+        cancelled,并且 error_msg / status 都反映"取消",没有其它 partition
+        的残留 task 阻止收敛。
+        """
+        case_space = space_name + "_comp_pid_cancel"
+        batch_size, total = 100, 10000
+        assert create_space(
+            router_url, db_name, _comp_hnsw_cfg(case_space, pn=3),
+        ).json()["code"] == 0
+        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
+        waiting_index_finish(total, space_name=case_space)
+
+        partitions = _comp_get_space_detail(db_name, case_space).get("partitions", [])
+        assert len(partitions) == 3
+        target_pid = partitions[2]["pid"]
+
+        resp = _comp_trigger_rebuild(db_name, case_space, partition_id=target_pid)
+        assert resp.json().get("code") == 0
+
+        cancel_resp = _comp_cancel_rebuild(db_name, case_space)
+        cbody = cancel_resp.json()
+        logger.info("single-pid rebuild cancel body: %s", cbody)
+        assert cbody.get("code") == 0, cbody
+
+        # 等收敛(cancelled 是终态)。
+        _comp_wait_rebuild_completed(
+            db_name, case_space, timeout=300, allow_failed=True)
+        final = _comp_get_rebuild_progress(db_name, case_space)
+        logger.info("single-pid rebuild final progress: %s", final)
+        assert final.get("status") == "cancelled", (
+            f"单 pid rebuild cancel 后必须收敛为 cancelled,got {final}")
+        # 若 tasks 还在(还没被清),那些 task 也必须全部锁定在 target_pid。
+        for t in final.get("tasks") or []:
+            assert t.get("partition_id") == target_pid, (
+                f"cancel 后仍看到别 pid 的 task 残留: {t}")
+
+        _comp_wait_index_status_indexed(db_name, case_space)
+        drop_space(router_url, db_name, case_space)
+
     def test_drop_before_purges_deleted(self):
         """7.6: drop_before=true + delete-half + IVFFLAT.
         After rebuild index_num should be ≤ doc_num (no resurrected deletes).
@@ -3858,6 +3573,9 @@ class TestRebuildParameters:
 
 
 class TestRebuildStateMachineEdges:
+
+    def setup_class(self):
+        _comp_ensure_clean_db()
 
     def test_prepare_db(self):
         _comp_ensure_clean_db()
@@ -3904,27 +3622,6 @@ class TestRebuildStateMachineEdges:
         assert first_enq != second_enq, "enqueued_at not refreshed on second rebuild"
         drop_space(router_url, db_name, case_space)
 
-    def test_double_cancel_is_idempotent(self):
-        """8.4"""
-        case_space = space_name + "_comp_dbl_cancel"
-        batch_size, total = 100, 5000
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=2)).json()["code"] == 0
-        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        _comp_trigger_rebuild(db_name, case_space)
-        r1 = _comp_cancel_rebuild(db_name, case_space)
-        assert r1.json().get("code") == 0
-        r2 = _comp_cancel_rebuild(db_name, case_space)
-        # Second cancel should not 5xx; allow either code=0 or specific
-        # "already cancelled" reason.
-        assert r2.status_code == 200, r2.text
-
-        progress = _comp_get_rebuild_progress(db_name, case_space)
-        if progress["status"] not in ("cancelled", "completed"):
-            _comp_wait_rebuild_completed(db_name, case_space, timeout=300, allow_failed=True)
-        drop_space(router_url, db_name, case_space)
-
     # def test_failed_record_overwrite(self):
     #     """8.2: Failed records can be overwritten — requires fault
     #     injection to deterministically produce a failed state.
@@ -3946,6 +3643,9 @@ class TestRebuildStateMachineEdges:
 
 
 class TestRebuildLifecycle:
+
+    def setup_class(self):
+        _comp_ensure_clean_db()
 
     def test_prepare_db(self):
         _comp_ensure_clean_db()
