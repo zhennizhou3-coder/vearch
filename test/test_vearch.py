@@ -1,624 +1,444 @@
-# -*- coding: UTF-8 -*-
-
 import logging
-import pytest
-import requests
+from typing import List
 import json
-from utils.vearch_utils import *
+import pytest
+import random
+import time
+from vearch.config import Config
+from vearch.core.vearch import Vearch
+from vearch.schema.field import Field
+from vearch.schema.space import SpaceSchema
+from vearch.utils import DataType, MetricType, VectorInfo, CodeType
+from vearch.schema.index import (
+    IvfPQIndex,
+    Index,
+    ScalarIndex,
+    HNSWIndex,
+    IvfFlatIndex,
+    BinaryIvfIndex,
+    FlatIndex,
+    GPUIvfPQIndex,
+    GPUIvfFlatIndex,
+)
+from vearch.filter import Filter, Condition, FieldValue
+from vearch.exception import (
+    DatabaseException,
+    VearchException,
+    SpaceException,
+    DocumentException,
+)
+from vearch.core.client import RestClient
+from config import test_host_url
 
-__description__ = """ test case for vearch """
+logger = logging.getLogger("vearch_test")
+
+database_name = "database_test_v"
+database_name1 = "database_test_not_exist"
+space_name = "book_info"
+space_name1 = "book_infonot_exist"
 
 
-fileData = "./data/test_data.json"
-total = 10000
-add_num = 1000
-search_num = 10
+vc = Vearch(Config(host=test_host_url, token="secret"))
+
+vi = VectorInfo("book_character", [random.uniform(0, 1) for _ in range(512)])
+conditons_search = [
+    Condition(operator=">", fv=FieldValue(field="book_num", value=0)),
+]
+search_filters = Filter(operator="AND", conditions=conditons_search)
 
 
-# @pytest.mark.author('')
-# @pytest.mark.level(2)
-# @pytest.mark.cover(["VEARCH"])
+class TestVearchBadcase(object):
+    @pytest.mark.parametrize(
+        "database_name",
+        [
+            ("database_test_v"),
+        ],
+    )
+    def test_is_database_exist_init(self, database_name):
+        ret = vc.is_database_exist(database_name)
+        assert ret == False
 
+    @pytest.mark.parametrize(
+        "database_name",
+        [
+            ("database_test_v"),
+        ],
+    )
+    def test_create_database(self, database_name):
+        logger.debug(vc.client.host)
+        ret = vc.create_database(database_name)
+        logger.debug(ret.dict_str())
+        assert ret.__dict__["code"] in [0, 1]
 
-class VearchCase:
-    logger.info("test class")
+    @pytest.mark.parametrize(
+        "database_name",
+        [
+            ("database_test_v"),
+        ],
+    )
+    def test_is_database_exist_again(self, database_name):
+        ret = vc.is_database_exist(database_name)
+        assert ret == True
 
-    def setup_class(self, training_threshold: int, index_type: str, store_type: str, enable_realtime: bool = False):
-        self.training_threshold = training_threshold
-        self.index_type = index_type
-        self.store_type = store_type
-        self.enable_realtime = enable_realtime
+    @pytest.mark.parametrize(
+        "database_name",
+        [
+            ("database_test_v"),
+        ],
+    )
+    def test_create_database_repeated(self, database_name):
+        try:
+            logger.debug(vc.client.host)
+            ret = vc.create_database(database_name)
+        except VearchException as e:
+            assert e.code in [0, 1]
 
-    logging.info("cluster_information")
+    def test_list_databases(self):
+        logger.debug(vc.client.host)
+        ret = vc.list_databases()
+        logger.debug(ret)
+        assert len(ret) >= 0
 
-    def test_router_info(self):
-        response = get_router_info(router_url)
-        logger.info("router_info:" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
+    book_name = Field(
+        "book_name",
+        DataType.STRING,
+        desc="the name of book",
+        index=ScalarIndex("book_name_idx"),
+    )
+    book_num = Field(
+        "book_num",
+        DataType.INTEGER,
+        desc="the num of book",
+        index=ScalarIndex("book_num_idx"),
+    )
 
-    def test_stats(self):
-        response = get_cluster_stats(router_url)
-        logger.debug("cluster_stats:" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_version(self):
-        response = get_cluster_version(router_url)
-        logger.debug("cluster_stats:" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_health(self):
-        response = get_cluster_health(router_url)
-        logger.debug("cluster_health---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_memeber_list(self):
-        response = get_cluster_member_list(router_url)
-        logger.debug("cluster_health---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_memeber_stats(self):
-        response = get_cluster_member_stats(router_url)
-        logger.debug("cluster_health---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_server(self):
-        response = get_servers_status(router_url)
-        logger.debug("list_server---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    logger.info("database")
-
-    def test_dblist(self):
-        response = list_dbs(router_url)
-        logger.debug("list_db---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_createDB(self):
-        response = create_db(router_url, db_name)
-        logger.info("db_create---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_getDB(self):
-        response = get_db(router_url, db_name)
-        logger.debug("db_search---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_listspace(self):
-        response = list_spaces(router_url, db_name)
-        logger.debug("list_space---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_createspace(self, supported=True):
-        data = {
-            "name": space_name,
-            "partition_num": 1,
-            "replica_num": 1,
-            "fields": [
-                {
-                    "name": "string",
-                    "type": "keyword",
-                    "index": {
-                        "name": "string",
-                        "type": "SCALAR",
-                    },
-                },
-                {
-                    "name": "int",
-                    "type": "integer",
-                    "index": {
-                        "name": "int",
-                        "type": "SCALAR",
-                    },
-                },
-                {
-                    "name": "float",
-                    "type": "float",
-                    "index": {
-                        "name": "float",
-                        "type": "SCALAR",
-                    },
-                },
-                {
-                    "name": "vector",
-                    "type": "vector",
-                    "dimension": 128,
-                    "format": "normalization",
-                    "store_type": self.store_type,
-                    "store_param": {"cache_size": 1024},
-                    "index": {
-                        "name": "gamma",
-                        "type": self.index_type,
-                        "params": {
-                            "metric_type": "InnerProduct",
-                            "nprobe": 15,
-                            "ncentroids": 256,
-                            "nsubvector": 16,
-                            "nlinks": 16,
-                            "efConstruction": 60,
-                            "efSearch": 32,
-                            "training_threshold": self.training_threshold,
-                        },
-                    },
-                },
-                {
-                    "name": "string_tags",
-                    "type": "stringArray",
-                    "index": {
-                        "name": "string_tags",
-                        "type": "SCALAR",
-                    },
-                },
-            ],
-            "enable_realtime": self.enable_realtime,
-        }
-        logger.debug(router_url + "---" + json.dumps(data))
-        response = create_space(router_url, db_name, data)
-        logger.debug("space_create---\n" + json.dumps(response.json()))
-        if supported:
-            assert response.json()["code"] == 0
-        else:
-            assert response.json()["code"] != 0
-
-    def test_getspace(self):
-        response = get_space(router_url, db_name, space_name)
-        logger.debug("get_space---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_getpartition(self):
-        response = get_cluster_partition(router_url)
-        logger.debug("get_space---\n" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    # def test_changemember():
-    #     url = "http://" + ip_master + "/partition/change_member"
-    #     headers = {"content-type": "application/json"}
-    #     data = {
-    #         "partition_id":7,
-    #         "node_id":1,
-    #         "method":0
-    #     }
-    #     response = requests.post(url, headers=headers, data=json.dumps(data))
-    #     logger.debug("change_member:" + response.text)
-    #     assert response.status_code == 200
-    #     assert response.text.find("\"msg\":\"success\"")>=0
-
-    logger.info("router(PS)")
-
-    def test_documentUpsert(self):
-        logger.info("documentUpsert")
-        url = router_url + "/document/upsert"
-        headers = {"content-type": "application/json"}
-        with open(fileData, "r") as dataLine1:
-            for i, dataLine in zip(range(add_num), dataLine1):
-                idStr = dataLine.split(",", 1)[0].replace("{", "")
-                doc_id = eval(idStr.split(":")[1])
-                data = "{" + dataLine.split(",", 1)[1]
-                upsert_data = {}
-                upsert_data["documents"] = [json.loads(data) for i in range(1)]
-                upsert_data["db_name"] = db_name
-                upsert_data["space_name"] = space_name
-                response = requests.post(
-                    url,
-                    auth=(username, password),
-                    headers=headers,
-                    data=json.dumps(upsert_data),
-                )
-                logger.debug("documentUpsert:" + response.text)
-                assert response.status_code == 200
-
-    def test_documentUpsertWithId(self):
-        logger.info("documentUpsertWithId")
-        url = router_url + "/document/upsert"
-        headers = {"content-type": "application/json"}
-        with open(fileData, "r") as dataLine1:
-            for i, dataLine in zip(range(add_num), dataLine1):
-                idStr = dataLine.split(",", 1)[0].replace("{", "")
-                doc_id = eval(idStr.split(":")[1])
-                data = "{" + dataLine.split(",", 1)[1]
-                json_data = {}
-                upsert_data = json.loads(data)
-                upsert_data["_id"] = doc_id
-                json_data["documents"] = [upsert_data for i in range(1)]
-                json_data["db_name"] = db_name
-                json_data["space_name"] = space_name
-                logger.debug("documentUpsertWithId:" + json.dumps(json_data))
-                response = requests.post(
-                    url,
-                    auth=(username, password),
-                    headers=headers,
-                    data=json.dumps(json_data),
-                )
-                logger.debug("documentUpsertWithId:" + response.text)
-                assert response.status_code == 200
-
-    def test_documentUpsertBulkWithId(self):
-        logger.info("documentUpsertBulkWithId")
-        url = router_url + "/document/upsert"
-        headers = {"content-type": "application/json"}
-
-        with open(fileData, "r") as dataLine1:
-            data_lines = dataLine1.readlines()
-
-            for i in range(0, len(data_lines), 100):
-                batch_data_lines = data_lines[i : i + 100]
-                documents_batch = []
-
-                for dataLine in batch_data_lines:
-                    idStr = dataLine.split(",", 1)[0].replace("{", "")
-                    doc_id = eval(idStr.split(":")[1])
-                    data = "{" + dataLine.split(",", 1)[1]
-                    data_json = json.loads(data)
-                    data_json["_id"] = doc_id
-                    documents_batch.append(data_json)
-
-                upsert_data = {
-                    "documents": documents_batch,
-                    "db_name": db_name,
-                    "space_name": space_name,
-                }
-
-                response = requests.post(
-                    url,
-                    auth=(username, password),
-                    headers=headers,
-                    data=json.dumps(upsert_data),
-                )
-                logger.debug("test_documentUpsertBulkWithId:" + response.text)
-                assert response.status_code == 200
-
-    def test_documentQueryByDocumentIds(self):
-        logger.info("documentQueryByDocumentIds")
-        headers = {"content-type": "application/json"}
-        url = router_url + "/document/query?trace=true"
-        with open(fileData, "r") as dataLine1:
-            for i, dataLine in zip(range(add_num), dataLine1):
-                idStr = dataLine.split(",", 1)[0].replace("{", "")
-                doc_id = eval(idStr.split(":")[1])
-                data = "{" + dataLine.split(",", 1)[1]
-                data = json.loads(data)
-                data["db_name"] = db_name
-                data["space_name"] = space_name
-                data["document_ids"] = [doc_id for i in range(1)]
-                response = requests.post(
-                    url,
-                    auth=(username, password),
-                    headers=headers,
-                    data=json.dumps(data),
-                )
-                logger.debug("insertNoID:" + response.text)
-                assert response.status_code == 200
-
-    def test_documentQueryOnSpecifyPartiton(self):
-        logger.info("documentQueryOnSpecifyPartiton")
-        response = get_space(router_url, db_name, space_name)
-        assert response.json()["code"] == 0
-
-        partitions = response.json()["data"]["partitions"]
-        assert len(partitions) > 0
-        partition = partitions[0]["pid"]
-
-        url = router_url + "/document/query?trace=true"
-        headers = {"content-type": "application/json"}
-
-        add_num_end = add_num + 100
-        if add_num_end > total:
-            add_num_end = total
-        for i in range(add_num, add_num_end):
-            data = {}
-            data["db_name"] = db_name
-            data["space_name"] = space_name
-            data["document_ids"] = [str(i) for j in range(1)]
-            data["partition_id"] = partition
-            response = requests.post(
-                url, auth=(username, password), headers=headers, data=json.dumps(data)
-            )
-            logger.debug("documentQueryOnSpecifyPartiton:" + response.text)
-            assert response.status_code == 200
-            assert response.text.find('"total":1') >= 0
-            assert len(response.json()["data"]["documents"]) == 1
-
-    def test_documentQueryByFilter(self):
-        logger.info("documentQueryByFilter")
-        headers = {"content-type": "application/json"}
-        url = router_url + "/document/query?trace=true"
-        with open(fileData, "r") as dataLine1:
-            for i, dataLine in zip(range(search_num), dataLine1):
-                idStr = dataLine.split(",", 1)[0].replace("{", "")
-                id = eval(idStr.split(":")[1])
-                feature = "{" + dataLine.split(",", 1)[1]
-                feature = json.loads(feature)
-                string_tags = feature["string_tags"]
-                feature = feature["vector"]
-                data = {
-                    "filters": {
-                        "operator": "AND",
-                        "conditions": [
-                            {"field": "string", "operator": "IN", "value": string_tags}
-                        ],
-                    },
-                    "db_name": db_name,
-                    "space_name": space_name,
-                }
-
-                response = requests.post(
-                    url,
-                    auth=(username, password),
-                    headers=headers,
-                    data=json.dumps(data),
-                )
-                logger.debug("searchByFeature---\n" + response.text)
-                assert response.status_code == 200
-
-    def test_documentSearchByVector(self):
-        logger.info("documentSearchByVector")
-        headers = {"content-type": "application/json"}
-        url = router_url + "/document/search?trace=true"
-        with open(fileData, "r") as dataLine1:
-            for i, dataLine in zip(range(search_num), dataLine1):
-                idStr = dataLine.split(",", 1)[0].replace("{", "")
-                id = eval(idStr.split(":")[1])
-                feature = "{" + dataLine.split(",", 1)[1]
-                feature = json.loads(feature)
-                string_tags = feature["string_tags"]
-                feature = feature["vector"]
-                data = {
-                    "vectors": [
-                        {
-                            "field": "vector",
-                            "feature": feature,
-                        }
+    @pytest.mark.parametrize(
+        "database_name, space_schema",
+        [
+            (
+                "database_test_v",
+                SpaceSchema(
+                    "book_info_ivfpq",
+                    [
+                        book_name,
+                        book_num,
+                        Field(
+                            "book_character",
+                            DataType.VECTOR,
+                            IvfPQIndex(
+                                "book_vec_idx",
+                                MetricType.Inner_product,
+                                2048,
+                                8,
+                                training_threshold=2048 * 39,
+                            ),
+                            dimension=512,
+                        ),
                     ],
-                    "db_name": db_name,
-                    "space_name": space_name,
-                    "limit": 3,
-                    "is_brute_search": 2,
-                }
+                    replica_num=1,
+                ),
+            ),
+            (
+                "database_test_v",
+                SpaceSchema(
+                    "book_info_ivfflat",
+                    [
+                        book_name,
+                        book_num,
+                        Field(
+                            "book_character",
+                            DataType.VECTOR,
+                            IvfFlatIndex(
+                                "book_vec_idx", MetricType.Inner_product, 2048
+                            ),
+                            dimension=512,
+                        ),
+                    ],
+                    replica_num=1,
+                ),
+            ),
+            # ("database_test_v",SpaceSchema("book_info_biivf", [book_name, book_num, Field("book_character", DataType.VECTOR, BinaryIvfIndex("book_vec_idx", 2048), dimension=512)])),
+            (
+                "database_test_v",
+                SpaceSchema(
+                    "book_info_flat",
+                    [
+                        book_name,
+                        book_num,
+                        Field(
+                            "book_character",
+                            DataType.VECTOR,
+                            FlatIndex("book_vec_idx", MetricType.Inner_product),
+                            dimension=512,
+                        ),
+                    ],
+                    replica_num=1,
+                ),
+            ),
+            (
+                "database_test_v",
+                SpaceSchema(
+                    "book_info_hnsw",
+                    [
+                        book_name,
+                        book_num,
+                        Field(
+                            "book_character",
+                            DataType.VECTOR,
+                            HNSWIndex("book_vec_idx", MetricType.Inner_product, 32, 40),
+                            dimension=512,
+                        ),
+                    ],
+                    replica_num=1,
+                ),
+            ),
+        ],
+    )
+    def test_create_space(self, database_name, space_schema):
+        ret = vc.create_space(database_name, space_schema)
+        assert ret.code in [220, 0]
 
-                response = requests.post(
-                    url,
-                    auth=(username, password),
-                    headers=headers,
-                    data=json.dumps(data),
-                )
-                logger.debug("searchByFeature---\n" + response.text)
-                assert response.status_code == 200
+    # @pytest.mark.parametrize('database_name, space_schema',
+    #                          [
+    # ("database_new",SpaceSchema("book_info_ivfpq", [book_name, book_num, Field("book_character", DataType.VECTOR, IvfPQIndex("book_vec_idx", MetricType.Inner_product, 2048, 8), dimension=512)])),
+    #                          ])
+    # def test_create_space_badcase(self,database_name,space_schema):
+    #     ret = vc.create_space(database_name, space_schema)
+    #     assert ret.code in [CodeType.CREATE_DATABASE]
 
-    def test_documentModifySinglefield(self):
-        logger.info("documentModifySinglefield")
-        headers = {"content-type": "application/json"}
-        # modify single field
-        url = router_url + "/document/upsert"
-        json_data = {
-            "db_name": db_name,
-            "space_name": space_name,
-            "documents": [{"_id": "0", "float": 888.88, "string": "test"}],
-        }
-        logger.debug("documentUpsertWithId:" + json.dumps(json_data))
-        response = requests.post(
-            url, auth=(username, password), headers=headers, data=json.dumps(json_data)
+    @pytest.mark.parametrize(
+        "database_name, space_name",
+        [
+            ("database_test_v", "book_info_ivfpq"),
+            ("database_test_v", "book_info_biiv"),
+            ("db_test", "book_info_ivfpq"),
+        ],
+    )
+    def test_is_space_exist(self, database_name, space_name):
+        ret = vc.is_space_exist(database_name, space_name)
+        logger.debug(ret)
+        assert ret[0] in [True, False]
+
+    @pytest.mark.parametrize(
+        "database_name",
+        [
+            ("database_test_v"),
+            (""),
+        ],
+    )
+    def test_list_spaces(self, database_name):
+        logger.debug(vc.client.host)
+        ret = vc.list_spaces(database_name)
+        logger.debug(ret)
+        assert len(ret) >= 0
+
+    book_name_template = [
+        "qdbwjfwv",
+        "acwlvvq",
+        "cwvwvqqc",
+        "cwvwvveq",
+        "cevqbgnd",
+        "vrhuofnm",
+        "wkvwveve",
+        "cwbtjimu",
+    ]
+    num = [12, 34, 56, 74, 53, 11, 14, 9]
+    data_complete = []
+    data_miss = []
+    for i in range(8):
+        book_item = [
+            book_name_template[i],
+            num[i],
+            [random.uniform(0, 1) for _ in range(512)],
+        ]
+        book_item_m = [
+            book_name_template[i],
+            [random.uniform(0, 1) for _ in range(512)],
+        ]
+        data_complete.append(book_item)
+        data_miss.append(book_item_m)
+
+    @pytest.mark.parametrize(
+        "database_name, space_name, data",
+        [
+            ("database_test_v", "book_info_ivfpq", data_complete),
+        ],
+    )
+    def test_upsert_doc(self, database_name, space_name, data) -> List:
+        ret = vc.upsert(database_name, space_name, data)
+        logger.debug(f"upsert doc:{ret.document_ids}")
+        assert ret.code == 0
+
+    @pytest.mark.parametrize(
+        "database_name, space_name, data",
+        [
+            ("database_test_v", "book_info_ivfpq", data_miss),
+            ("database_test_v", "book_info_ivfpq", []),
+            ("database_test_v", "book_info_ivpq", data_complete),
+            ("db_test", "book_info_ivfpq", data_complete),
+        ],
+    )
+    def test_upsert_doc_badcase(self, database_name, space_name, data) -> List:
+        ret = vc.upsert(database_name, space_name, data)
+        assert ret.code in [CodeType.UPSERT_DOC, CodeType.CHECK_SPACE_EXIST]
+
+    conditons = [
+        Condition(operator="<", fv=FieldValue(field="book_num", value=25)),
+        Condition(operator=">", fv=FieldValue(field="book_num", value=12)),
+    ]
+    delete_filters = Filter(operator="AND", conditions=conditons)
+
+    @pytest.mark.parametrize(
+        "database_name, space_name, ids,filters",
+        [
+            ("database_test_v", "book_info_ivfpq", None, delete_filters),
+            ("database_test_v", "book_info_ivfpq", ["chjebvbevbhejbve"], None),
+        ],
+    )
+    def test_delete_doc(self, database_name, space_name, ids, filters):
+        time.sleep(1)
+        ret = vc.delete(database_name, space_name, ids, filter=filters)
+        logger.debug(f"delete doc:{ret.document_ids}")
+        assert ret.code == 0
+
+    conditons_query = [
+        Condition(operator=">", fv=FieldValue(field="book_num", value=0)),
+        Condition(
+            operator="IN",
+            fv=FieldValue(
+                field="book_name", value=["bpww57nu", "sykboivx", "edjn9542"]
+            ),
+        ),
+    ]
+    query_filters = Filter(operator="AND", conditions=conditons_query)
+
+    @pytest.mark.parametrize(
+        "database_name, space_name, ids, filters",
+        [
+            ("database_test_v", "book_info_ivfpq", [], query_filters),
+            ("database_test_v", "book_info_ivfpq", ["chjebvbevbhejbve"], None),
+        ],
+    )
+    def test_query(self, database_name, space_name, ids, filters):
+
+        ret = vc.query(database_name, space_name, ids, filters)
+        logger.debug(f"query doc:{ret.documents}")
+        assert ret.code == 0
+
+    @pytest.mark.parametrize(
+        "database_name, space_name, ids, filters",
+        [
+            ("db_test", "book_info_ivfpq", ["chjebvbevbhejbve"], None),
+            ("database_test_v", "book_info_ivpq", ["chjebvbevbhejbve"], None),
+            ("database_test_v", "book_info_ivfpq", None, None),
+        ],
+    )
+    def test_query_badcase(self, database_name, space_name, ids, filters):
+
+        ret = vc.query(database_name, space_name, ids, filters)
+        assert ret.code in [6, 0, CodeType.QUERY_DOC]
+
+    @pytest.mark.parametrize(
+        "database_name, space_name, vec_info,filters,limit",
+        [
+            (
+                "database_test_v",
+                "book_info_ivfpq",
+                [
+                    vi,
+                ],
+                search_filters,
+                3,
+            ),
+        ],
+    )
+    def test_search(self, database_name, space_name, vec_info, filters, limit):
+        ret = vc.search(
+            database_name,
+            space_name,
+            vector_infos=[
+                vi,
+            ],
+            filter=filters,
+            limit=limit,
         )
-        logger.debug("documentUpsertWithId:" + response.text)
-        assert response.status_code == 200
+        logger.debug(f"search doc:{ret.documents}")
+        assert ret.code == 0
 
-        # check result
-        url = router_url + "/document/query?trace=true"
-
-        data = {
-            "db_name": db_name,
-            "space_name": space_name,
-            "document_ids": ["0"],
-        }
-
-        response = requests.post(
-            url, auth=(username, password), headers=headers, data=json.dumps(data)
+    @pytest.mark.parametrize(
+        "database_name, space_name, vec_info,filters,limit",
+        [
+            (
+                "db_test",
+                "book_info_ivfpq",
+                [
+                    vi,
+                ],
+                search_filters,
+                3,
+            ),
+            (
+                "db_test",
+                "book_info_ivfpq",
+                [
+                    vi,
+                ],
+                None,
+                None,
+            ),
+            (
+                "db_test",
+                "book_info_ivpq",
+                [
+                    vi,
+                ],
+                None,
+                None,
+            ),
+        ],
+    )
+    def test_search_badcase(self, database_name, space_name, vec_info, filters, limit):
+        ret = vc.search(
+            database_name,
+            space_name,
+            vector_infos=[
+                vi,
+            ],
+            filter=filters,
+            limit=limit,
         )
-        logger.debug("getById:" + response.text)
-        assert response.status_code == 200
-        result = json.loads(response.text)
-        assert result["data"]["total"] == 1
-        assert result["data"]["documents"][0]["float"] == 888.88
-        assert result["data"]["documents"][0]["string"] == "test"
+        assert ret.code == 6
 
-    def test_documentUpsertSinglefield(self):
-        logger.info("documentUpsertSinglefield")
-        headers = {"content-type": "application/json"}
-        # upsert single field
-        url = router_url + "/document/upsert"
-        json_data = {
-            "db_name": db_name,
-            "space_name": space_name,
-            "documents": [{"float": 888.88, "string": "test"}],
-        }
-        logger.debug("documentUpsertSinglefield:" + json.dumps(json_data))
-        response = requests.post(
-            url, auth=(username, password), headers=headers, data=json.dumps(json_data)
-        )
-        logger.debug("documentUpsertSinglefield:" + response.text)
-        assert response.status_code != 200
+    @pytest.mark.parametrize(
+        "database_name, space_name",
+        [
+            ("database_test_v", "book_info_ivpq"),
+            ("db_test", "book_info_ivfflat"),
+        ],
+    )
+    def test_drop_space_badcase(self, database_name, space_name):
+        ret = vc.drop_space(database_name, space_name)
+        assert ret.__dict__["code"] in [221, 220, 200]
 
-    def test_documentDeleteByDocumentIds(self):
-        logger.info("documentDeleteByDocumentIds")
-        headers = {"content-type": "application/json"}
-        url = router_url + "/document/delete?trace=true&timeout=30000"
-        with open(fileData, "r") as dataLine1:
-            for i, dataLine in zip(range(add_num), dataLine1):
-                idStr = dataLine.split(",", 1)[0].replace("{", "")
-                doc_id = eval(idStr.split(":")[1])
-                data = "{" + dataLine.split(",", 1)[1]
-                data = json.loads(data)
-                data["db_name"] = db_name
-                data["space_name"] = space_name
-                data["document_ids"] = [doc_id for i in range(1)]
-                response = requests.post(
-                    url,
-                    auth=(username, password),
-                    headers=headers,
-                    data=json.dumps(data),
-                )
-                logger.debug("deleteNoID:" + response.text)
-                assert response.status_code == 200
+    @pytest.mark.parametrize(
+        "database_name, space_name",
+        [
+            ("database_test_v", "book_info_ivfpq"),
+            ("database_test_v", "book_info_ivfflat"),
+            ("database_test_v", "book_info_flat"),
+            ("database_test_v", "book_info_hnsw"),
+        ],
+    )
+    def test_drop_space(self, database_name, space_name):
+        ret = vc.drop_space(database_name, space_name)
+        assert ret.code == 0
 
-    def test_documentDeleteByFilter(self):
-        logger.info("documentQueryByFilter")
-        headers = {"content-type": "application/json"}
-        url = router_url + "/document/delete?trace=true"
-        with open(fileData, "r") as dataLine1:
-            for i, dataLine in zip(range(search_num), dataLine1):
-                idStr = dataLine.split(",", 1)[0].replace("{", "")
-                id = eval(idStr.split(":")[1])
-                feature = "{" + dataLine.split(",", 1)[1]
-                feature = json.loads(feature)
-                string_tags = feature["string_tags"]
-                feature = feature["vector"]
-                data = {
-                    "filters": {
-                        "operator": "AND",
-                        "conditions": [
-                            {"field": "string", "operator": "IN", "value": string_tags}
-                        ],
-                    },
-                    "db_name": db_name,
-                    "space_name": space_name,
-                }
-
-                response = requests.post(
-                    url,
-                    auth=(username, password),
-                    headers=headers,
-                    data=json.dumps(data),
-                )
-                logger.debug("searchByFeature---\n" + response.text)
-                assert response.status_code == 200
-
-    def test_deleteSpace(self):
-        response = drop_space(router_url, db_name, space_name)
-        logger.debug("deleteSpace:" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def test_deleteDB(self):
-        response = drop_db(router_url, db_name)
-        logger.debug("deleteDB:" + json.dumps(response.json()))
-        assert response.json()["code"] == 0
-
-    def run_db_space_create_test(self, supported=True):
-        self.test_createDB()
-        self.test_createspace(supported)
-        self.test_stats()
-        self.test_health()
-        self.test_server()
-        if supported:
-            self.test_deleteSpace()
-        self.test_deleteDB()
-
-    def run_db_space_create_multi_test(self):
-        for i in range(10):
-            self.test_stats()
-            self.test_health()
-            self.test_server()
-            self.test_dblist()
-            self.test_createDB()
-            self.test_getDB()
-            self.test_listspace()
-            self.test_createspace()
-            self.test_getspace()
-            self.test_getpartition()
-            self.test_deleteSpace()
-            self.test_deleteDB()
-
-    def test_documentInterface(self):
-        self.test_documentUpsert()
-        self.test_documentUpsertWithId()
-        self.test_documentUpsertBulkWithId()
-        self.test_documentQueryByDocumentIds()
-        self.test_documentQueryOnSpecifyPartiton()
-        self.test_documentQueryByFilter()
-        self.test_documentSearchByVector()
-        self.test_documentModifySinglefield()
-        self.test_documentUpsertSinglefield()
-        self.test_documentDeleteByDocumentIds()
-        self.test_documentDeleteByFilter()
-
-    def run_basic_usage_test(self):
-        self.test_router_info()
-        self.test_stats()
-        self.test_health()
-        self.test_server()
-        self.test_dblist()
-        self.test_createDB()
-        self.test_getDB()
-        self.test_listspace()
-        self.test_createspace()
-        self.test_getspace()
-        self.test_getpartition()
-        self.test_documentInterface()
-        self.test_deleteSpace()
-        self.test_deleteDB()
-
-
-# for HNSW IVFFLAT, now only support one store_type, no need to set
-
-
-@pytest.mark.parametrize(
-    ["training_threshold", "index_type", "store_type"],
-    [
-        [1, "FLAT", "MemoryOnly"],
-        [1, "FLAT", "RocksDB"],
-        [10000, "IVFPQ", "MemoryOnly"],
-        [10000, "IVFPQ", "RocksDB"],
-        [1, "HNSW", ""],
-        [10000, "IVFFLAT", ""],
-    ],
-)
-def test_vearch_basic_usage(training_threshold: int, index_type: str, store_type: str):
-    case = VearchCase()
-    case.setup_class(training_threshold, index_type, store_type)
-    case.run_basic_usage_test()
-
-
-@pytest.mark.parametrize(
-    ["training_threshold", "index_type"],
-    [
-        [1, "FLAT"],
-        [10000, "IVFPQ"],
-        [1, "HNSW"],
-        [10000, "IVFFLAT"],
-    ],
-)
-def test_vearch_basic_usage_with_realtime(training_threshold: int, index_type: str):
-    case = VearchCase()
-    case.setup_class(training_threshold, index_type, "", True)
-    case.run_basic_usage_test()
-
-
-@pytest.mark.parametrize(
-    ["training_threshold", "index_type", "store_type"],
-    [
-        [1, "FLAT", "MemoryOnly"],
-        [1, "FLAT", "RocksDB"],
-        [10000, "IVFPQ", "MemoryOnly"],
-        [10000, "IVFPQ", "RocksDB"],
-        [1, "HNSW", ""],
-        [10000, "IVFFLAT", ""],
-    ],
-)
-def test_vearch_usage_operator_metadata(training_threshold: int, index_type: str, store_type: str):
-    case = VearchCase()
-    case.setup_class(training_threshold, index_type, store_type)
-    case.run_db_space_create_multi_test()
-
-
-# Not support now so should be failed
-
-
-@pytest.mark.parametrize(
-    ["training_threshold", "index_type", "store_type"],
-    [
-        [1, "FLAT", "NOTSUPPORTTYPE"],
-        [1, "HNSW", "RocksDB"],
-        [10000, "IVFFLAT", "MemoryOnly"],
-    ],
-)
-def test_vearch_create_space(training_threshold: int, index_type: str, store_type: str):
-    case = VearchCase()
-    case.setup_class(training_threshold, index_type, store_type)
-    case.run_db_space_create_test(False)
+    @pytest.mark.parametrize(
+        "database_name",
+        [
+            ("database_test_v"),
+        ],
+    )
+    def test_drop_database(self, database_name):
+        ret = vc.drop_database(database_name)
+        assert ret.code == 0
