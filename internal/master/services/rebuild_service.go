@@ -229,7 +229,12 @@ func (s *RebuildService) listRebuildProgressByPrefix(ctx context.Context, prefix
 		return nil, fmt.Errorf("scan rebuild records: %v", err)
 	}
 
-	summary := &entity.RebuildSummaryResponse{}
+	// Results is initialized to an empty (non-nil) slice so JSON always
+	// serializes as `"results": []` rather than `null` when no records
+	// exist. Callers iterate `results` unconditionally.
+	summary := &entity.RebuildSummaryResponse{
+		Results: []*RebuildProgressResponse{},
+	}
 	for _, bs := range bytesList {
 		rec := &SpaceRebuildRecord{}
 		if err := vjson.Unmarshal(bs, rec); err != nil {
@@ -495,7 +500,6 @@ func rebuildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse
 		EnqueuedAt:     rec.EnqueuedAt,
 		StartedAt:      rec.StartedAt,
 		FinishedAt:     rec.FinishedAt,
-		RetryCount:     rec.RetryCount,
 		MaxRetries:     rec.MaxRetries,
 		Tasks:          rec.Tasks,
 		Indexes:        rec.Indexes,
@@ -503,9 +507,10 @@ func rebuildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse
 		CurrentIndex:  clampOneBased(rec.CurrentIndexIdx, len(rec.Indexes)),
 		CurrentTarget: rec.CurrentTarget(),
 	}
-	// Build task counts and weighted progress.
+	// Build task counts, weighted progress, and aggregate retry count.
 	progressSum := 0
 	for _, t := range rec.Tasks {
+		resp.RetryCount += t.RetryCount
 		switch t.Status {
 		case entity.RebuildStatusRunning:
 			if t.Dispatched {
@@ -1085,6 +1090,7 @@ func (sc *RebuildScheduler) handleReplicaFailure(rec *SpaceRebuildRecord,
 	}
 	if rec.PartitionRetries[t.PartitionID] < rec.MaxRetries {
 		rec.PartitionRetries[t.PartitionID]++
+		t.RetryCount++
 		t.Dispatched = false
 		t.Status = entity.RebuildStatusRunning
 		t.Progress = 0
@@ -1313,7 +1319,6 @@ func (sc *RebuildScheduler) prepareNextTarget(ctx context.Context,
 
 	rec.Tasks = tasks
 	rec.PartitionRetries = nil
-	rec.RetryCount = 0
 	rec.TotalTasks = len(tasks)
 	rec.CompletedTasks = 0
 	rec.FailedTasks = 0

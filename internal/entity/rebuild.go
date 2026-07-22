@@ -227,8 +227,8 @@ type SpaceRebuildRecord struct {
 	CompletedTasks int `json:"completed_replicas"`
 	FailedTasks    int `json:"failed_replicas"`
 
-	// Retry control is partition-scoped.
-	RetryCount       int                 `json:"retry_count,omitempty"`
+	// Retry control is partition-scoped; per-task retry counts live on
+	// RebuildTask.RetryCount and are aggregated at the API boundary.
 	MaxRetries       int                 `json:"max_retries,omitempty"`
 	PartitionRetries map[PartitionID]int `json:"partition_retries,omitempty"`
 
