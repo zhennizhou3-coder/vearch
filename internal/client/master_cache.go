@@ -516,6 +516,7 @@ func (cliCache *clientCache) startCacheJob(ctx context.Context) error {
 			cacheKey := cachePartitionKey(space.Name, partition.Id)
 			if old, b := cliCache.partitionCache.Get(cacheKey); !b || partition.UpdateTime > old.(*entity.Partition).UpdateTime {
 				cliCache.partitionCache.Set(cacheKey, partition, cache.NoExpiration)
+				refreshRebuildBusyNode(cliCache.partitionCache)
 			}
 			return nil
 		},
@@ -528,6 +529,7 @@ func (cliCache *clientCache) startCacheJob(ctx context.Context) error {
 					break
 				}
 			}
+			refreshRebuildBusyNode(cliCache.partitionCache)
 			return nil
 		},
 	}
@@ -827,8 +829,37 @@ func (cliCache *clientCache) initPartition(ctx context.Context) error {
 			log.Error(err.Error())
 		}
 	}
+	refreshRebuildBusyNode(cliCache.partitionCache)
 
 	return nil
+}
+
+// refreshRebuildBusyNode scans the partition cache and publishes the node ID
+// that is currently running a rebuild (via ReplicasRebuildingIndex marker),
+// or 0 when none is active. Rebuilds are globally serialized by the master
+// scheduler, so at most one PS is expected to be busy; if the cache reflects
+// more than one during a transient inconsistency, we still publish only the
+// first — router routing has a last-resort fallback when the busy node is
+// the only remaining candidate, so an imperfectly-tracked busy set never
+// costs availability.
+func refreshRebuildBusyNode(partitionCache *cache.Cache) {
+	var busy entity.NodeID
+	for _, item := range partitionCache.Items() {
+		p, ok := item.Object.(*entity.Partition)
+		if !ok || p == nil {
+			continue
+		}
+		for nid, st := range p.ReStatusMap {
+			if st == entity.ReplicasRebuildingIndex {
+				busy = entity.NodeID(nid)
+				break
+			}
+		}
+		if busy != 0 {
+			break
+		}
+	}
+	SetRebuildBusyNode(busy)
 }
 
 func (cliCache *clientCache) initServer(ctx context.Context) error {

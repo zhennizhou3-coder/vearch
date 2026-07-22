@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	stdatomic "sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -1348,6 +1349,82 @@ func isRebuildingIndex(partition *entity.Partition, nodeID entity.NodeID) bool {
 	return partition.ReStatusMap[nodeID] == entity.ReplicasRebuildingIndex
 }
 
+// skippedRebuildingLogged dedups the "skipped rebuilding replica" log
+// per (partitionID, nodeID) per router lifetime
+var skippedRebuildingLogged sync.Map // key: uint64(pid)<<32 | uint64(nid)
+
+// logSkipRebuildingReplica records that the router skipped a specific
+// replica because its index is rebuilding
+func logSkipRebuildingReplica(partition *entity.Partition, nodeID entity.NodeID, clientType string) {
+	k := uint64(partition.Id)<<32 | uint64(nodeID)
+	if _, loaded := skippedRebuildingLogged.LoadOrStore(k, struct{}{}); loaded {
+		return
+	}
+	log.Warn("partition %d skipped nodeID=%d rebuilding, client_type=%s",
+		partition.Id, nodeID, clientType)
+}
+
+// rebuildBusyNodeID names the single PS node currently running an index
+// rebuild, or 0 when none is active. Rebuilds are globally serialized by the
+// master scheduler, so at most one PS is busy at any time
+var rebuildBusyNodeID atomicUint64
+
+// atomicUint64 is a tiny std-lib atomic wrapper so we don't drag the value
+// past a copy vet.
+type atomicUint64 struct{ v uint64 }
+
+func (a *atomicUint64) Load() uint64   { return stdatomic.LoadUint64(&a.v) }
+func (a *atomicUint64) Store(x uint64) { stdatomic.StoreUint64(&a.v, x) }
+
+// SetRebuildBusyNode publishes the node currently running a rebuild, or 0
+// to clear. Called by the partition cache watcher when a ReplicasRebuildingIndex
+// marker appears or disappears.
+func SetRebuildBusyNode(nodeID entity.NodeID) {
+	rebuildBusyNodeID.Store(uint64(nodeID))
+}
+
+// preferredIdleLogged dedups the "prefer idle host over rebuild-busy node"
+// log per (partitionID, busyNodeID). Key layout mirrors skippedRebuildingLogged.
+var preferredIdleLogged sync.Map // key: uint64(pid)<<32 | uint64(busyNid)
+
+// preferIdleHosts filters the rebuild-busy PS node out of the candidate set
+// when at least one other candidate remains; otherwise it returns the
+// original slice so the last reachable replica is not stripped. This is a
+// hard filter with a last-resort fallback — NOT a weighted preference. When
+// idle candidates exist, the busy node receives zero traffic from that
+// call site; when it is the only one left, all traffic still lands on it.
+// The behavior mirrors isRebuildingIndex on the co-tenant path (partition
+// p2 on host X when p1 is rebuilding on X), and differs only in that
+// isRebuildingIndex has no fallback (a rebuilding replica is never a valid
+// target for its own partition). pid is used only for the dedup log key.
+func preferIdleHosts(pid entity.PartitionID, candidates []entity.NodeID) []entity.NodeID {
+	if len(candidates) <= 1 {
+		return candidates
+	}
+	busy := entity.NodeID(rebuildBusyNodeID.Load())
+	if busy == 0 {
+		return candidates
+	}
+	idle := make([]entity.NodeID, 0, len(candidates))
+	for _, nid := range candidates {
+		if nid != busy {
+			idle = append(idle, nid)
+		}
+	}
+	if len(idle) == 0 {
+		return candidates
+	}
+	// Log the first time we route around busyNode for this partition —
+	// this is the observable signal that "p2 on host X was diverted while
+	// p1 was rebuilding on X". Dedup per (pid, busy) keeps volume bounded.
+	k := uint64(pid)<<32 | uint64(busy)
+	if _, loaded := preferredIdleLogged.LoadOrStore(k, struct{}{}); !loaded {
+		log.Warn("partition %d preferred idle replicas over busy nodeID=%d rebuilding",
+			pid, busy)
+	}
+	return idle
+}
+
 // isPartitionNotLeaderError reports whether err is a PARTITION_NOT_LEADER error.
 func isPartitionNotLeaderError(err error) bool {
 	if err == nil {
@@ -1374,6 +1451,7 @@ func pickHealthyNonRebuildingReplica(partition *entity.Partition,
 			continue
 		}
 		if isRebuildingIndex(partition, nodeID) {
+			logSkipRebuildingReplica(partition, nodeID, "fallback")
 			continue
 		}
 		if config.Conf().Global.RaftConsistent &&
@@ -1382,7 +1460,7 @@ func pickHealthyNonRebuildingReplica(partition *entity.Partition,
 		}
 		candidates = append(candidates, nodeID)
 	}
-	return replicaRoundRobin.Next(partition.Id, candidates)
+	return replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, candidates))
 }
 
 // SelectNodeByClientType chooses one target node to serve a read for the given
@@ -1419,6 +1497,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if isRebuildingIndex(partition, nodeID) {
+				logSkipRebuildingReplica(partition, nodeID, request.NotLeader)
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1431,7 +1510,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				}
 			}
 		}
-		nodeId = replicaRoundRobin.Next(partition.Id, noLeaderIDs)
+		nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, noLeaderIDs))
 	case request.Random, "":
 		randIDs := make([]entity.NodeID, 0)
 		for _, nodeID := range partition.Replicas {
@@ -1443,6 +1522,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if isRebuildingIndex(partition, nodeID) {
+				logSkipRebuildingReplica(partition, nodeID, request.Random)
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1453,7 +1533,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				randIDs = append(randIDs, nodeID)
 			}
 		}
-		nodeId = replicaRoundRobin.Next(partition.Id, randIDs)
+		nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, randIDs))
 	case request.LeastConnection:
 		leastId := uint64(0)
 		most := 1<<32 - 1
@@ -1468,8 +1548,13 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if isRebuildingIndex(partition, nodeID) {
+				logSkipRebuildingReplica(partition, nodeID, request.LeastConnection)
 				continue
 			}
+			// Collect the candidate here regardless of rebuild-busy state;
+			// the post-loop preferIdleHosts filter drops the busy node
+			// (with a last-resort fallback) once the full randIDs set and
+			// its GetConcurrent readings are known.
 			if config.Conf().Global.RaftConsistent {
 				if partition.ReStatusMap[nodeID] == entity.ReplicasOK {
 					randIDs = append(randIDs, nodeID)
@@ -1496,7 +1581,23 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				}
 			}
 		}
-		if least > 10 {
+		// Drop the rebuild-busy node from the candidate pool when there
+		// is at least one other candidate; if the least-connection winner
+		// was the busy node, redirect it to an idle one. Falls through to
+		// the original all-candidates decision when no rebuild is running
+		// or when the busy node is the only remaining candidate — that
+		// last case preserves availability at the cost of routing to X.
+		if idle := preferIdleHosts(partition.Id, randIDs); len(idle) > 0 && len(idle) < len(randIDs) {
+			busy := entity.NodeID(rebuildBusyNodeID.Load())
+			if leastId == busy {
+				leastId = idle[0]
+			}
+			if least > 10 {
+				nodeId = leastId
+			} else {
+				nodeId = replicaRoundRobin.Next(partition.Id, idle)
+			}
+		} else if least > 10 {
 			nodeId = leastId
 		} else {
 			nodeId = replicaRoundRobin.Next(partition.Id, randIDs)
@@ -1535,9 +1636,9 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			}
 		}
 		if len(nearestId[entity.HostZone]) > 0 {
-			nodeId = replicaRoundRobin.Next(partition.Id, nearestId[entity.HostZone])
+			nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, nearestId[entity.HostZone]))
 		} else {
-			nodeId = replicaRoundRobin.Next(partition.Id, nearestId[OTHER])
+			nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, nearestId[OTHER]))
 		}
 	default:
 		randIDs := make([]entity.NodeID, 0)
@@ -1560,7 +1661,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				randIDs = append(randIDs, nodeID)
 			}
 		}
-		nodeId = replicaRoundRobin.Next(partition.Id, randIDs)
+		nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, randIDs))
 	}
 	return nodeId, fellBackToFollower
 }
