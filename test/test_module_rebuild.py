@@ -165,15 +165,7 @@ def _wait_rebuild_completed(
     poll_interval: int = 3,
     allow_failed: bool = False,
 ) -> list:
-    """Poll progress until terminal. Returns chronological snapshots.
-
-    Note on monotonicity: overall_percent is the progress of the *current*
-    rebuild target, not the aggregate across all targets. When a multi-
-    index rebuild advances from target N to N+1, master resets
-    Tasks/TotalTasks for the new target and overall_percent drops back
-    toward 0 (see rebuild_service.prepareNextTarget). We only require
-    monotonicity *within* a single target (same current_index).
-    """
+    """Poll progress until terminal. Returns chronological snapshots."""
     deadline = time.time() + timeout
     snapshots = []
     last_overall = -1
@@ -267,17 +259,7 @@ def _check_search(
         assert len(documents) == 1
 
 def _compute_recall(case_space_name: str, k: int = 100) -> dict:
-    """Compute recall@1 and recall@10 against SIFT10K groundtruth.
-
-    Returns a dict with keys ``recall_at_1`` and ``recall_at_10``, each
-    in [0.0, 1.0].
-
-    The groundtruth ``gt`` is indexed by query index; each query's
-    nearest-neighbour ground truth is ``gt[i][:1]`` (recall@1) and
-    ``gt[i][:10]`` (recall@10).  We search the space and check whether
-    the returned ``field_int`` values (which equal the document ID in
-    the standard add() flow) overlap with the groundtruth set.
-    """
+    """Compute recall@1 and recall@10 against SIFT10K groundtruth."""
     url = router_url + "/document/search?timeout=2000000"
     nq = xq.shape[0]
     recall1_hits = 0
@@ -300,8 +282,6 @@ def _compute_recall(case_space_name: str, k: int = 100) -> dict:
         documents = body["data"]["documents"]
         if not documents:
             continue
-        # documents is a list of result-lists (one per query vector).
-        # With a single query vector it is [[result1, result2, ...]].
         results = documents[0] if isinstance(documents[0], list) else documents
         returned_ids = set()
         for r in results:
@@ -323,17 +303,7 @@ def _compute_recall(case_space_name: str, k: int = 100) -> dict:
     }
 
 def _ensure_clean_db():
-    """Drop all spaces then drop DB, then create a fresh DB.
-
-    Step 1/2 are async on the master side (drop_space returns once master
-    accepts the request, but partitions are torn down on PS afterwards;
-    similarly drop_db can race with residual space removal). We poll
-    after each destructive step until the master view actually clears.
-
-    The final create_db is asserted — silent failure here had been
-    masquerading as a "code=1 / db_not_exist" failure on the next
-    create_space, which is exactly the flaky CI hit we just observed.
-    """
+    """Drop all spaces then drop DB, then create a fresh DB."""
     spaces_url = f"{router_url}/dbs/{db_name}/spaces"
     db_url = f"{router_url}/dbs/{db_name}"
 
@@ -478,21 +448,11 @@ def _ivfpq_space_config(
         ],
     }
 
-# ---------------------------------------------------------------------------
-# 1. Basic lifecycle
-# ---------------------------------------------------------------------------
-
 def _add_multi_vector_docs(
     space_name: str,
     field_names=("field_vector_a", "field_vector_b"),
 ):
-    """Insert documents containing each requested vector field.
-
-    The generic ``add()`` helper hard-codes ``field_vector``, which does not
-    exist on multi-vector spaces. We build the payload inline instead.
-
-    Module-level (not bound to any class) so every test class can reuse it.
-    """
+    """Insert documents containing each requested vector field."""
     batch_size = 100
     total = xb.shape[0]
     total_batch = int(total / batch_size)
@@ -534,11 +494,7 @@ def _run_rebuild_lifecycle(
     index_indexed_max_rounds=180,
     do_search=True,
 ):
-    """Run the common create/add/rebuild/verify lifecycle.
-
-    Pass ``config=None`` when the caller already created the space, for
-    example after checking whether an optional index type is supported.
-    """
+    """Run the common create/add/rebuild/verify lifecycle"""
     if config is not None:
         assert create_space(router_url, db_name, config).json()["code"] == 0
     batch_size = 100
@@ -649,17 +605,17 @@ def _multi3_space_config(name, partition_num=1, replica_num=1):
             "replica_num": replica_num, "fields": fields}
 
 
+# ---------------------------------------------------------------------------
+# 1. Basic lifecycle
+# ---------------------------------------------------------------------------
 class TestRebuildBasicLifecycle:
     """Trigger space-level rebuild and verify completion."""
 
     def setup_class(self):
-        # Do the db reset once per class before any method runs, so that
-        # single-method pytest invocations (-k / IDE run) also see a
-        # fresh db instead of depending on the previous class's teardown.
         _ensure_clean_db()
 
     def test_rebuild_hnsw_full_space(self):
-        """Rebuild HNSW and verify lifecycle plus search-result stability."""
+        """Rebuilds every HNSW replica in one space and verifies lifecycle progress and search consistency."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -734,9 +690,7 @@ class TestRebuildBasicLifecycle:
         drop_space(router_url, db_name, case_space)
 
     def test_rebuild_all_spaces_in_db(self):
-        """Trigger DB-level rebuild (POST /index/rebuild/dbs/:db) which
-        rebuilds every space in the DB.  Create 2 spaces, trigger DB-level
-        rebuild, verify both spaces are rebuilt and search works."""
+        """Rebuilds every indexed space in a database and verifies that each record completes."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -780,14 +734,7 @@ class TestRebuildBasicLifecycle:
         drop_space(router_url, db_name, sp_b)
 
     def test_rebuild_space_without_index_built(self):
-        """Rebuild a space whose vector index has never been built should be
-        rejected upfront by the Go master, not fail at the PS level.
-
-        The C++ engine rejects rebuild when index_status_ == UNINDEXED
-        (engine.cc:1009-1016). The Go master now checks index_status via
-        PartitionInfo RPC in checkPartitionsHealthy (rebuild_service.go)
-        and returns an error before dispatching to the PS.
-        """
+        """Verifies that rebuilding an unbuilt index is rejected without creating runnable tasks."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -809,8 +756,6 @@ class TestRebuildBasicLifecycle:
         }
         assert create_space(router_url, db_name, config).json()["code"] == 0
 
-        # Insert vectors — index won't build because total (10000) <
-        # training_threshold (99999).
         add(total_batch, batch_size, xb, True, False, space_name=case_space)
         time.sleep(3)  # Brief wait for docs to land.
 
@@ -824,10 +769,6 @@ class TestRebuildBasicLifecycle:
         idx_statuses = [p.get("index_status", -1) for p in partitions]
         logger.info("index_status before rebuild: %s", idx_statuses)
 
-        # Trigger rebuild — should be rejected upfront by the master
-        # because the index has never been built (index_status=UNINDEXED).
-        # The top-level code is 0 (the HTTP request itself succeeded), but
-        # the rejection appears in data.failures.
         resp = _trigger_rebuild(db_name, case_space, ensure_indexed=False)
         body = resp.json()
         logger.info("rebuild trigger for unindexed space: %s", body)
@@ -844,15 +785,7 @@ class TestRebuildBasicLifecycle:
         drop_space(router_url, db_name, case_space)
 
     def test_concurrent_rebuild_rejected(self):
-        """Trigger two rebuilds for the same space simultaneously.
-        The second request should be rejected because the space already
-        has a non-terminal (pending/running) rebuild record.
-
-        The rejection appears in data.failures (top-level code is 0
-        because the HTTP request itself succeeded).
-
-        Ref: rebuild_service.go StartRebuild, line 313-329.
-        """
+        """Verifies that a second rebuild request is rejected while the same space already has an active rebuild."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -867,9 +800,7 @@ class TestRebuildBasicLifecycle:
         first_results = first.get("data", {}).get("results") or []
         assert len(first_results) > 0, f"first rebuild should succeed: {first}"
 
-        # Second rebuild — should be rejected (space already has a
-        # pending/running rebuild record). The rejection is in
-        # data.failures, not top-level code.
+        # Second rebuild
         second = _trigger_rebuild(db_name, case_space).json()
         logger.info("second rebuild response: %s", second)
         second_failures = second.get("data", {}).get("failures", [])
@@ -888,8 +819,7 @@ class TestRebuildBasicLifecycle:
         first_enqueued_at = first_snapshots[-1].get("enqueued_at")
         _wait_index_status_indexed(db_name, case_space)
 
-        # After completion, a new rebuild should be accepted (terminal
-        # records can be overwritten).
+        # After completion, a new rebuild should be accepted (terminal records can be overwritten).
         third = _trigger_rebuild(db_name, case_space).json()
         third_results = third.get("data", {}).get("results") or []
         assert len(third_results) > 0, f"rebuild after completion should succeed: {third}"
@@ -901,14 +831,7 @@ class TestRebuildBasicLifecycle:
         drop_space(router_url, db_name, case_space)
 
     def test_db_rebuild_after_space_rebuild(self):
-        """One space in a DB is already rebuilding, then a DB-level rebuild
-        is triggered. The already-rebuilding space should be rejected (not
-        re-processed), while the second space should be accepted and rebuilt.
-
-        Ref: rebuild_service.go StartRebuild rejects non-terminal duplicates;
-             cluster_api.go rebuildIndex fans out per-space with failure
-             collection.
-        """
+        """Verifies that a database-level rebuild can run after a completed space-level rebuild."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -932,9 +855,6 @@ class TestRebuildBasicLifecycle:
         logger.info("DB-level rebuild response: %s", json.dumps(db_body, indent=2, default=str))
         assert db_body.get("code") == 0, db_body
 
-        # The response should contain:
-        #   - sp_a in failures (already pending/running)
-        #   - sp_b in results (successfully enqueued)
         results = db_body.get("data", {}).get("results", []) or []
         failures = db_body.get("data", {}).get("failures", []) or []
         result_keys = [r.get("space_key", "") for r in results]
@@ -963,24 +883,7 @@ class TestRebuildBasicLifecycle:
         drop_space(router_url, db_name, sp_b)
 
     def test_rebuild_improves_recall_with_undertrained_init(self):
-        """Rebuild after appending data to an initially-undertrained IVFPQ.
-
-        Phase 1: Insert only the first half (5000 vectors) with
-        training_threshold=1000.  The IVFPQ centroids are trained on
-        the first 1000 vectors — a small sample for ncentroids=32.
-
-        Phase 2: Insert the second half (5000 vectors).  Centroids are
-        now frozen; these vectors get pushed into existing clusters.
-        Recall should be suboptimal.
-
-        Rebuild: Destroy and recreate the index; the engine retrains
-        centroids.  Due to the engine's Indexing() using only the first
-        training_threshold_ vectors from raw_vec (GetVectorHeader), the
-        training sample after rebuild is the same first 1000 vectors
-        that Phase 1 already used — centroids do not change.  This is a
-        known engine limitation; a proper fix would train on ALL live
-        vectors during rebuild.
-        """
+        """Verifies that rebuilding an initially undertrained index improves search recall."""
         case_space = space_name + "_mri_undertrained"
         embedding_size = xb.shape[1]
         config = {
@@ -1004,17 +907,14 @@ class TestRebuildBasicLifecycle:
         total = xb.shape[0]
         half = total // 2   # 5000
 
-        # Phase 1: Insert first half.  training_threshold=1000 < 5000,
-        # so the IVFPQ index trains its centroids on the first 1000
-        # vectors of this half.
+        # Phase 1: Insert first half
         add(half // batch_size, batch_size, xb[:half],
             with_id=False, full_field=False,
             space_name=case_space, offset=0)
         waiting_index_finish(half, space_name=case_space)
         logger.info("phase 1 done: %d vectors, centroids trained on first 1000", half)
 
-        # Phase 2: Insert second half.  Centroids are frozen; these
-        # vectors get assigned to the existing clusters.
+        # Phase 2: Insert second half
         add(half // batch_size, batch_size, xb[half:total],
             with_id=False, full_field=False,
             space_name=case_space, offset=half)
@@ -1062,7 +962,6 @@ class TestRebuildBasicLifecycle:
 # ---------------------------------------------------------------------------
 # 2. Progress query
 # ---------------------------------------------------------------------------
-
 class TestRebuildProgressQuery:
     """Verify progress API shape, monotonicity, and detail."""
 
@@ -1070,7 +969,7 @@ class TestRebuildProgressQuery:
         _ensure_clean_db()
 
     def test_progress_missing_record_returns_error(self):
-        """Querying progress for a space that was never rebuilt returns an error."""
+        """Verifies that querying progress for a space without a rebuild record returns an error."""
         case_space = space_name + "_mri_nf"
         assert create_space(router_url, db_name, _hnsw_space_config(case_space)).json()["code"] == 0
 
@@ -1084,7 +983,7 @@ class TestRebuildProgressQuery:
         drop_space(router_url, db_name, case_space)
 
     def test_rebuild_progress_lifecycle(self):
-        """Full lifecycle: trigger rebuild and walk the progress API end-to-end."""
+        """Verifies the progress record transitions from admission through running to completion."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -1130,8 +1029,7 @@ class TestRebuildProgressQuery:
         drop_space(router_url, db_name, case_space)
 
     def test_list_rebuild_progress(self):
-        """DB-level progress API: create 3 spaces, rebuild only 1, verify
-        the progress list contains exactly that space."""
+        """Verifies the progress-list endpoint returns rebuild records and aggregate counts."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -1174,8 +1072,7 @@ class TestRebuildProgressQuery:
             drop_space(router_url, db_name, sp)
 
     def test_global_progress_partial_rebuild(self):
-        """Global progress API: create 2 DBs with 1 space each, rebuild only
-        1 space in 1 DB, verify global progress shows exactly 1 result."""
+        """Verifies global progress reports mixed states while only part of the requested work has completed."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -1239,9 +1136,7 @@ class TestRebuildProgressQuery:
         drop_db(router_url, extra_db)
 
     def test_global_rebuild_and_progress(self):
-        """Trigger global rebuild via _trigger_rebuild_global, then verify
-        global progress summary contains all rebuilt spaces across
-        multiple DBs."""
+        """Verifies a global rebuild creates and completes progress records for all eligible spaces."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -1317,16 +1212,8 @@ class TestRebuildProgressQuery:
 # ---------------------------------------------------------------------------
 # 3. Cancel rebuild
 # ---------------------------------------------------------------------------
-
 class TestCancelRebuild:
-    """Cancel rebuild: only pending records can be cancelled.
-
-    Strategy: create N spaces, trigger rebuild on all of them, then cancel.
-    Because the scheduler admits at most one space at a time, space-0 will
-    be running (not cancellable) while the others remain pending (cancellable).
-    After cancellation, pending records transition to 'cancelled' (a terminal
-    state persisted in etcd), NOT to 'completed'.
-    """
+    """Cancel rebuild: only pending records can be cancelled."""
 
     _N = 3  # number of spaces
 
@@ -1338,15 +1225,7 @@ class TestCancelRebuild:
         _ensure_clean_db()
 
     def test_cancel_pending_and_running(self):
-        """Trigger N rebuilds, cancel all; running one stays, pending
-        become cancelled.
-
-        Uses HNSW indexes (slower rebuild than FLAT) so that spaces
-        remain in pending/running state long enough to observe the
-        cancel behavior. Because the scheduler admits at most one space
-        at a time, space-0 will be running (not cancellable) while the
-        others remain pending (cancellable).
-        """
+        """Verifies cancellation works for both pending and running rebuild records."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -1397,9 +1276,6 @@ class TestCancelRebuild:
 
         logger.info("cancelled: %s  not_cancelled: %s", cancelled_keys, not_cancelled_keys)
 
-        # With HNSW indexes, we expect at least one pending → cancelled.
-        # If not (e.g. very fast machine), the test still passes because
-        # every entry has a valid reason — we just log a note.
         if len(cancelled_keys) >= 1:
             logger.info("successfully cancelled at least 1 pending rebuild")
         else:
@@ -1486,15 +1362,7 @@ class TestCancelRebuild:
                 f"cancelled=True but reason doesn't mention cancel: {entry}"
             )
         else:
-            # cancelled=False: reason must explain the outcome. This covers
-            # three shapes:
-            #   - Terminal (completed/failed): "rebuild already <status>..."
-            #   - Running, everything already dispatched: "rebuild is running
-            #     and every task is already dispatched..."
-            #   - Running, best-effort task-level cancel applied: "cancelled
-            #     N not-yet-dispatched tasks..." (the record itself stays
-            #     Running; individual pending tasks were transitioned to
-            #     Cancelled).
+            # cancelled=False: reason must explain the outcome.
             assert (
                 status.lower() in reason
                 or "running" in reason
@@ -1505,20 +1373,7 @@ class TestCancelRebuild:
             )
 
     def test_cancel_specific_space_while_all_rebuilding(self):
-        """All DBs are rebuilding; cancel a specific db/space and verify
-        the cancel response is well-formed with a clear reason.
-
-        Uses HNSW indexes (slower rebuild than FLAT) so that spaces
-        remain in pending/running state long enough to observe cancel
-        behavior. The test verifies:
-        - The cancel API returns a well-formed response for each space
-          with cancelled, reason, and status fields.
-        - The reason field clearly explains the outcome.
-        - Cancelling one space does NOT affect other spaces.
-
-        Pattern: create 2 DBs with 2 spaces each → trigger global rebuild
-        → cancel one specific space → verify response.
-        """
+        """Verifies cancelling one space in a database-wide rebuild does not cancel other spaces."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -1611,7 +1466,7 @@ class TestCancelRebuild:
         drop_db(router_url, extra_db)
 
     def test_global_cancel_across_databases(self):
-        """Global cancel returns and settles rebuild records across DBs."""
+        """Verifies global cancellation targets active rebuild records across databases."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -1676,16 +1531,7 @@ class TestCancelRebuild:
             drop_db(router_url, extra_db)
 
     def test_cancel_nonexistent_completed_already_cancelled(self):
-        """Cancel rebuild in various terminal / edge states:
-
-        1. Cancel a space whose index was auto-built (never explicitly
-           rebuilt) → the system still has a completed rebuild record,
-           so cancelled=False with reason mentioning "completed".
-        2. Cancel a completed rebuild → cancelled=False, reason mentions
-           "completed".
-        3. Cancel an already-cancelled rebuild → cancelled=True
-           (idempotent), reason mentions "already cancelled".
-        """
+        """Verifies cancellation responses for missing, completed, and already-cancelled rebuild records."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -1816,23 +1662,7 @@ class TestCancelRebuild:
         drop_space(router_url, db_name, case_space)
 
     def test_cancel_running_stops_subsequent_index_targets(self):
-        """Cancelling a Running multi-index rebuild must abandon the
-        whole record, not just the current target.
-
-        A rebuild without an explicit index_name resolves to every vector
-        index in the space; the scheduler processes them serially,
-        replacing rec.Tasks target-by-target inside finalize.
-        prepareNextTarget. Before this fix, a user cancel only marked the
-        current target's not-yet-dispatched tasks as Cancelled; when
-        finalize replanned the next target it lost that intent and kept
-        going. The fix persists a record-level CancelRequested flag that
-        finalize honors, so the record converges to 'cancelled' instead
-        of advancing.
-
-        This test relies on _multi_vector_space_config producing two
-        indexes (gamma_a / gamma_b), so the rebuild's `indexes` list has
-        length 2 and HasMoreTargets triggers at least once.
-        """
+        """Verifies cancelling a running multi-index rebuild prevents later index targets from starting."""
         case_space = space_name + "_mri_cancel_multitarget"
         assert create_space(
             router_url, db_name, _multi_vector_space_config(case_space)
@@ -1852,9 +1682,7 @@ class TestCancelRebuild:
             f"got {indexes} (progress={progress_before})"
         )
 
-        # Cancel while the record is still active. Because the record is
-        # Running (or Pending on very slow admission), we accept either
-        # response shape — the important assertion is post-finalize state.
+        # Cancel while the record is still active
         cancel_resp = _cancel_rebuild(db_name, case_space)
         cancel_body = cancel_resp.json()
         logger.info("cancel multi-target rebuild: %s", cancel_body)
@@ -1864,10 +1692,7 @@ class TestCancelRebuild:
         assert results, cancel_body
         entry = results[0]
         self._assert_cancel_entry_reason(entry, sp_label=case_space)
-        # When the record was still Running at cancel time, the reason
-        # must advertise the new semantics (no further targets started).
-        # When it was Pending, the record itself is Cancelled and the
-        # subsequent-target semantics apply implicitly.
+
         if entry.get("status") == "running":
             assert "further index target" in entry.get("reason", "").lower(), (
                 f"running cancel must mention subsequent targets are skipped, got {entry}"
@@ -1883,22 +1708,11 @@ class TestCancelRebuild:
             f"multi-target rebuild must converge to 'cancelled' after user "
             f"cancel, got status={final['status']}, progress={final}"
         )
-        # current_index/current_target must NOT have advanced past the
-        # first target — that's the whole point of the fix. current_index
-        # is 1-based in the response; it stays at 1 (the target where
-        # cancel landed) even if some replicas of that target completed.
+        # current_index/current_target must NOT have advanced past the first target
         assert final.get("current_index", 0) <= 1, (
             f"cancel must not advance past target #1, got current_index="
             f"{final.get('current_index')} target={final.get('current_target')}"
         )
-        # error_msg 有两种形态,取决于 cancel 落地时 record 的状态:
-        #   * running → finalize 路径产出 "... N subsequent index target(s)
-        #     skipped"(rebuild_service.go:1257)
-        #   * pending → STM CAS 直接终结,产出 "cancelled by user while
-        #     pending"(rebuild_service.go:404)
-        # 两条路径都满足"cancel 后不进入下一个 target"这个测试主目标
-        # (已由 current_index<=1 覆盖);这里按上文入口断言的同款状态分支
-        # 校验对应措辞。
         err_msg = (final.get("error_msg") or "").lower()
         if entry.get("status") == "running":
             assert "skipped" in err_msg or "subsequent" in err_msg, (
@@ -1915,16 +1729,7 @@ class TestCancelRebuild:
         drop_space(router_url, db_name, case_space)
 
     def test_db_level_cancel_only_targets_recorded_spaces(self):
-        """DB-level cancel must only touch spaces that actually have a
-        rebuild record — not every space under the DB.
-
-        Before this fix, cancelRebuildIndex enumerated every space via
-        QuerySpaces and called CancelRebuild on each; spaces with no
-        rebuild record returned "no rebuild record found" and cluttered
-        failures[]. After the fix the handler does a PrefixScan over
-        etcd rebuild records and only calls CancelRebuild on those,
-        keeping the response clean.
-        """
+        """Verifies database-level cancellation affects only spaces that have rebuild records."""
         case_space_with = space_name + "_mri_dbcancel_with"
         case_space_without = space_name + "_mri_dbcancel_without"
 
@@ -1985,7 +1790,6 @@ class TestCancelRebuild:
 # ---------------------------------------------------------------------------
 # 4. Per-(field, indexType) target rebuild
 # ---------------------------------------------------------------------------
-
 class TestRebuildPerField:
     """Rebuild a specific (field_name, index_type) target."""
 
@@ -1993,7 +1797,7 @@ class TestRebuildPerField:
         _ensure_clean_db()
 
     def test_rebuild_named_non_first_index_only(self):
-        """Rebuild only the second named index in a multi-index space."""
+        """Verifies an explicitly named non-first index is the only index rebuilt."""
         case_space = space_name + "_mri_perfield_flat"
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
@@ -2020,7 +1824,7 @@ class TestRebuildPerField:
         drop_space(router_url, db_name, case_space)
 
     def test_rebuild_nonexistent_index_rejected(self):
-        """Specifying an index that does not exist on the space must be rejected."""
+        """Verifies a rebuild request for an unknown index name is rejected."""
         case_space = space_name + "_mri_bad_index"
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
@@ -2051,8 +1855,7 @@ class TestRebuildPerField:
         drop_space(router_url, db_name, case_space)
 
     def test_rebuild_multi_index_space_all_indexes(self):
-        """Rebuild a space with multiple vector indexes without specifying
-        field_name / index_type — all indexes should be rebuilt sequentially."""
+        """Verifies a space-level rebuild processes every named vector index in the space."""
         case_space = space_name + "_mri_multi_all"
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
@@ -2087,37 +1890,17 @@ class TestRebuildPerField:
     def teardown_class(self):
         drop_db(router_url, db_name)
 
-# ===========================================================================
-# Additional non-cluster coverage from test_module_rebuild_comprehensive.py
-# ===========================================================================
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
 
 # ===========================================================================
 # 5. Concurrent writes during rebuild
 # ===========================================================================
-
-
 class TestRebuildConcurrentWrites:
 
     def setup_class(self):
         _ensure_clean_db()
 
     def test_inserts_during_rebuild_visible_after(self):
-        """5.1: Insert 5000 new docs while rebuild is running; final
-        doc_num == 10000 and new vectors are queryable.
-
-        NOTE on with_id: the add() helper does NOT apply `offset` to
-        `_id` (only to field_int). With with_id=True both batches would
-        produce _id="0".."4999" and the second batch would silently
-        upsert over the first → doc_num stuck at 5000. Letting vearch
-        auto-assign _id (with_id=False) avoids the collision; the
-        post-checks below query by vector content so _id values don't
-        matter.
-        """
+        """Verifies documents inserted during rebuild remain searchable after completion."""
         batch_size, half = 100, 5000
         case_space = space_name + "_comp_ins_during"
 
@@ -2168,8 +1951,6 @@ class TestRebuildConcurrentWrites:
 # ===========================================================================
 # 6. Index type matrix
 # ===========================================================================
-
-
 class TestRebuildIndexTypeMatrix:
 
     def setup_class(self):
@@ -2185,7 +1966,7 @@ class TestRebuildIndexTypeMatrix:
         ids=["FLAT", "IVFFLAT", "IVFPQ"],
     )
     def test_rebuild_common_index_types(self, suffix, config_factory):
-        """Common lifecycle for index types without a special data path."""
+        """Verifies rebuild completion for the common supported vector index types."""
         case_space = f"{space_name}_comp_{suffix}"
         try:
             _run_rebuild_lifecycle(case_space, config_factory(case_space))
@@ -2193,7 +1974,7 @@ class TestRebuildIndexTypeMatrix:
             drop_space(router_url, db_name, case_space)
 
     def test_rebuild_ivfrabitq(self):
-        """6.2: IVFRABITQ basic lifecycle."""
+        """Verifies an IVFRABITQ index can be rebuilt successfully."""
         case_space = space_name + "_comp_rabitq"
         try:
             resp = create_space(router_url, db_name, _ivfrabitq_space_config(case_space))
@@ -2215,18 +1996,7 @@ class TestRebuildIndexTypeMatrix:
 
 
     def test_rebuild_binary_ivf(self):
-        """6.4: BinaryIVF on packed binary vectors.
-
-        Wire format (router/document/doc_parse.go:174-193, :465-485):
-          - dimension declared in space schema is the BIT count.
-          - feature payload is a list of len = dimension/8 of uint8 values
-            (each byte holds 8 bits).
-          - master validator rejects feature length ≠ dimension/8.
-
-        We synthesise random packed bytes with numpy and upsert directly
-        via /document/upsert (the shared `add()` helper in vearch_utils
-        only knows about the float SIFT dataset).
-        """
+        """Verifies a BINARYIVF index can be rebuilt successfully."""
         import numpy as np
         case_space = space_name + "_comp_bivf"
         dim_bits = 128                # multiple of 8
@@ -2306,21 +2076,7 @@ class TestRebuildIndexTypeMatrix:
                 pass
 
     def test_rebuild_diskann(self):
-        """6.5: DISKANN_STATIC — graph-based on-disk index.
-
-        DISKANN_STATIC is **静态索引** —— 写入数据不会触发增量构建,
-        index_status 维持 UNINDEXED, index_num 维持 0;调用 master 的
-        rebuild 接口前必须先把索引「初次构建」起来,否则
-        rebuild_service.go:checkPartitionsHealthy 会以 UNINDEXED 拒
-        掉请求。
-
-        正确顺序 (与 test_vector_index_diskann_static.py 一致):
-          add(数据) → /index/forcemerge → 等到 INDEXED → 这才有「已有索引」
-          可以让 rebuild 重建。
-
-        rebuild 上限 30 分钟 (=1800s);初次 build 单独一段也 30 分钟封顶。
-        SIFT10K + R=32 L=64 num_threads=2 在常规机器上典型 1-3 分钟。
-        """
+        """Verifies a built DiskANN index can be rebuilt successfully."""
         case_space = space_name + "_comp_diskann"
         embedding_size = xb.shape[1]
         cfg = {
@@ -2353,17 +2109,11 @@ class TestRebuildIndexTypeMatrix:
                 f"DISKANN_STATIC not supported on this cluster build: "
                 f"code={body.get('code')} msg={body.get('msg')}")
         try:
-            # 1. 写入数据 — 此时 STATIC 索引保持 UNINDEXED, 不要 polling
-            #    waiting_index_finish (它会死循环等 index_num 涨到 total)。
             batch_size, total = 100, 10000
             logger.info("6.5 inserting %d docs (DISKANN_STATIC, no auto-build)", total)
             add(total // batch_size, batch_size, xb[:total], True, False,
                 space_name=case_space)
-
-            # 让数据落到 raw store, 避免后面 forcemerge 抢先于 last batch
-            # 的写入。
             time.sleep(5)
-
             detail = _get_space_detail(db_name, case_space)
             doc_num_after_insert = detail.get("doc_num", 0)
             logger.info("6.5 inserted: doc_num=%d, partitions=%s",
@@ -2373,7 +2123,7 @@ class TestRebuildIndexTypeMatrix:
             assert doc_num_after_insert >= total, (
                 f"insert lost data: expected ≥{total}, got {doc_num_after_insert}")
 
-            # 2. 显式触发 DiskANN 初次构建 (partition_id=0 表示所有 partition)。
+
             logger.info("6.5 triggering /index/forcemerge for initial DiskANN build")
             fm = requests.post(
                 router_url + "/index/forcemerge",
@@ -2385,7 +2135,7 @@ class TestRebuildIndexTypeMatrix:
             assert fm_body.get("code") == 0, (
                 f"forcemerge failed: {fm.text[:300]}")
 
-            # 3. 轮询 INDEXED, 带可见进度。SIFT10K 上典型 1-3min, 留 30min 上限。
+
             initial_build_deadline = time.time() + 1800
             poll_interval = 5
             last_logged = -1
@@ -2415,11 +2165,11 @@ class TestRebuildIndexTypeMatrix:
 
             pre_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
 
-            # 4. 这才是真正测试的那次 — rebuild 已 INDEXED 的 DiskANN。
+
             logger.info("6.5 triggering rebuild")
             assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
             _wait_rebuild_completed(db_name, case_space, timeout=1800)
-            # rebuild 完之后引擎需要再写一次 INDEXED, 给 25min 上限。
+
             _wait_index_status_indexed(db_name, case_space,
                                        max_rounds=300, poll_interval=5)
 
@@ -2436,10 +2186,7 @@ class TestRebuildIndexTypeMatrix:
                 pass
 
     def test_rebuild_scann(self):
-        """6.6: SCANN — accelerated quantization-based index. Requires
-        engine compiled with USE_SCANN. Skips cleanly if either master
-        rejects the type or PS engine returns an init failure.
-        """
+        """Verifies a SCANN index can be rebuilt successfully."""
         case_space = space_name + "_comp_scann"
         embedding_size = xb.shape[1]
         cfg = {
@@ -2471,17 +2218,7 @@ class TestRebuildIndexTypeMatrix:
                 pass
 
     def test_multi_index_space_runs_consecutively_without_yield(self):
-        """6.7b: When a space has multiple index targets, all of them must
-        run back-to-back under a single Running record. A second space
-        whose rebuild is enqueued *after* the first has started must NOT be
-        admitted until every target of the first space has finished.
-
-        This locks in the R3 semantics: prepareNextTarget advances the
-        target cursor in place and never yields the scheduler slot back to
-        the pending queue between targets. Under the old code the record
-        went Pending between targets, which allowed another space's older
-        pending record to be admitted mid-flight.
-        """
+        """Verifies all targets of one multi-index rebuild finish before another space is admitted."""
         space_multi = space_name + "_comp_multi_consec_a"
         space_single = space_name + "_comp_multi_consec_b"
 
@@ -2508,16 +2245,7 @@ class TestRebuildIndexTypeMatrix:
         time.sleep(0.5)
         assert _trigger_indexed_rebuild(db_name, space_single).json().get("code") == 0
 
-        # While A is Running, B must remain Pending. Sandwich each pb
-        # read between two pa reads so we don't flag the tick where A
-        # finalizes AND B is admitted in the same scheduler pass. Both
-        # writes are persisted together in that tick; two sequential
-        # GETs would then show pa=running/completed + pb=running with
-        # no way to distinguish the legal "A finalized, then B admitted
-        # in the same tick" case from a real R3 violation ("A and B
-        # Running concurrently"). Requiring A to be Running at BOTH ends
-        # of the pb GET collapses the observation window to a range
-        # where A is provably still running.
+        # While A is Running, B must remain Pending
         deadline = time.time() + 900
         a_finished = False
         b_ever_running_while_a_running = False
@@ -2567,18 +2295,13 @@ class TestRebuildIndexTypeMatrix:
 # ===========================================================================
 # 7. API parameter matrix
 # ===========================================================================
-
-
 class TestRebuildParameters:
 
     def setup_class(self):
         _ensure_clean_db()
 
     def test_describe_mode_is_idempotent(self):
-        """7.3: describe=1 should not modify the index.
-        Verify by capturing top-10 of 20 queries before and after; expect
-        identical results.
-        """
+        """Verifies describe mode can be requested repeatedly without mutating index data."""
         case_space = space_name + "_comp_describe"
         _create_populated_hnsw_space(case_space)
 
@@ -2604,7 +2327,7 @@ class TestRebuildParameters:
         drop_space(router_url, db_name, case_space)
 
     def test_max_retries_recorded_in_progress(self):
-        """7.4: progress reflects the requested max_retries."""
+        """Verifies a custom maximum retry count is stored in rebuild progress."""
         case_space = space_name + "_comp_maxretry"
         _create_populated_hnsw_space(case_space)
         resp = _trigger_indexed_rebuild(db_name, case_space, max_retries=5)
@@ -2615,13 +2338,7 @@ class TestRebuildParameters:
         drop_space(router_url, db_name, case_space)
 
     def test_partition_id_zero_means_all_partitions(self):
-        """7.5.1: partition_id=0 语义 —— 覆盖全部 partition。
-
-        entity/rebuild.go:130 显式定义 "0 means all"; selectPartitions
-        (rebuild_service.go:544) 走 space.Partitions 全量分支。这条测试防止
-        以后有人把 0 误当作"合法 partition id"过滤掉,让 API 悄悄退化成
-        单分区重建。
-        """
+        """Verifies partition_id zero schedules tasks for every partition."""
         case_space = space_name + "_comp_pid_zero"
         batch_size, total = 100, 5000
         assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=3)).json()["code"] == 0
@@ -2638,7 +2355,7 @@ class TestRebuildParameters:
         tasks = progress.get("tasks") or []
         task_pids = {t.get("partition_id") for t in tasks}
         assert task_pids == expected_pids, (
-            f"partition_id=0 应覆盖全部分区,got tasks pids={task_pids}, "
+            f"partition_id=0 must cover every partition; got task pids={task_pids}, "
             f"expected={expected_pids}"
         )
         _wait_rebuild_completed(db_name, case_space, timeout=300)
@@ -2646,18 +2363,14 @@ class TestRebuildParameters:
         drop_space(router_url, db_name, case_space)
 
     def test_partition_id_nonexistent_rejected(self):
-        """7.5.2: 不存在的 partition_id 必须被明确拒绝,不能悄悄退化成 all。
-
-        rebuild_service.go:552 会返回 "partition N does not belong to
-        space X";cluster_api.go 的 batch handler 把它放进 data.failures。
-        """
+        """Verifies a rebuild request for a partition outside the space is rejected without creating a record."""
         case_space = space_name + "_comp_pid_bad"
         batch_size, total = 100, 3000
         assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=2)).json()["code"] == 0
         add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
-        # 998877 不可能存在于本 space。传 uint32 允许的大值即可。
+
         bogus_pid = 998877
         resp = _trigger_indexed_rebuild(
             db_name, case_space, partition_id=bogus_pid)
@@ -2668,38 +2381,34 @@ class TestRebuildParameters:
         failures = data.get("failures", [])
         results = data.get("results") or []
 
-        # 允许两种错误形态:
+
         #   (a) top-level code != 0
-        #   (b) batch-style: 该 space 落入 failures[],results 里没有它。
+
         if body.get("code") != 0:
             msg = body.get("msg", "").lower()
             assert "partition" in msg, (
                 f"unexpected top-level error for bogus pid: {body}")
         else:
             assert not any(r.get("space_name") == case_space for r in results), (
-                f"bogus partition_id 竟然被当成成功入队:results={results}")
+                f"invalid partition_id was unexpectedly enqueued: results={results}")
             assert failures, f"expected failure entry, got body={body}"
             err_msg = "".join(f.get("error", "") for f in failures).lower()
             assert "partition" in err_msg and str(bogus_pid) in err_msg, (
-                f"failure 应指明 partition {bogus_pid} 不存在,got={failures}")
+                f"failure must identify missing partition {bogus_pid}; got={failures}")
 
-        # 别忘了确认服务端没有为这条错误请求写下 rebuild record。
-        # 直接查 progress:应该 404 / 或没有该 space 的记录。
+
+
         prog_url = f"{router_url}/index/rebuild/dbs/{db_name}/spaces/{case_space}/progress"
         pr = requests.get(prog_url, auth=(username, password))
-        # 存在两种合法响应:404 (无记录) 或 200 但业务 code!=0。
+
         if pr.status_code == 200:
             pbody = pr.json()
             assert pbody.get("code") != 0, (
-                f"bogus pid 请求不应产生 rebuild record,got progress={pbody}")
+                f"invalid partition request must not create a rebuild record; got={pbody}")
         drop_space(router_url, db_name, case_space)
 
     def test_partition_id_task_count_matches_replica_num(self):
-        """7.5.3: 指定 partition_id 后,total_tasks 必须等于该 partition
-        的 replica_num,不能被其他 partition 的 task 污染。
-
-        这是"单分区重建"最核心的隔离性:任务数量、粒度都要严格局限。
-        """
+        """Verifies a partition-scoped rebuild creates exactly one task per replica of that partition."""
         case_space = space_name + "_comp_pid_taskcount"
         batch_size, total = 100, 3000
         rn = 1
@@ -2720,24 +2429,19 @@ class TestRebuildParameters:
         progress = _wait_tasks_visible(db_name, case_space, timeout=30)
         total_tasks = progress.get("total_tasks", 0)
         assert total_tasks == rn, (
-            f"total_tasks 必须 == replica_num ({rn}),got {total_tasks};"
+            f"total_tasks must equal replica_num ({rn}); got {total_tasks};"
             f"progress={progress}"
         )
         for t in progress.get("tasks") or []:
             assert t.get("partition_id") == target_pid, (
-                f"task 泄漏到别的 pid: {t}")
+                f"task leaked into another partition: {t}")
 
         _wait_rebuild_completed(db_name, case_space, timeout=300)
         _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
 
     def test_partition_id_with_index_name_scopes_to_intersection(self):
-        """7.5.4: partition_id + index_name 组合 —— tasks 必须严格落在
-        (pid, index_name) 交集上,不能扩散到其它 pid 或其它 index。
-
-        用 _multi_vector_space_config (gamma_a HNSW + gamma_b FLAT) 才
-        能观测到"index_name 有实质选择效果"这条不变式。
-        """
+        """Verifies partition_id and index_name restrict tasks to their exact intersection."""
         case_space = space_name + "_comp_pid_index"
         assert create_space(
             router_url, db_name,
@@ -2757,29 +2461,26 @@ class TestRebuildParameters:
 
         progress = _wait_tasks_visible(db_name, case_space, timeout=30)
         indexes = progress.get("indexes") or []
-        # index_name 显式指定后,只能有 1 个 target。
+
         assert indexes == ["gamma_a"], (
-            f"index_name 指定后 indexes 必须 == [gamma_a],got {indexes}")
+            f"indexes must equal [gamma_a] when index_name is specified; got {indexes}")
         tasks = progress.get("tasks") or []
         assert tasks, f"expected tasks for pid/index intersection: {progress}"
         for t in tasks:
             assert t.get("partition_id") == target_pid, (
-                f"task 泄漏到别的 pid: {t}")
-            # tasks 里的 index_name 字段(如有)也应匹配。
+                f"task leaked into another partition: {t}")
+
             name = t.get("index_name")
             if name:
                 assert name == "gamma_a", (
-                    f"task 的 index_name 不匹配: got {name}")
+                    f"task index_name mismatch: got {name}")
 
         _wait_rebuild_completed(db_name, case_space, timeout=600)
         _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
 
     def test_partition_id_cancel_only_touches_target_record(self):
-        """7.5.5: 单 partition rebuild 被 cancel 时,记录应正常收敛到
-        cancelled,并且 error_msg / status 都反映"取消",没有其它 partition
-        的残留 task 阻止收敛。
-        """
+        """Verifies cancelling a partition-scoped rebuild terminates only its recorded tasks."""
         case_space = space_name + "_comp_pid_cancel"
         batch_size, total = 100, 10000
         assert create_space(
@@ -2800,23 +2501,23 @@ class TestRebuildParameters:
         logger.info("single-pid rebuild cancel body: %s", cbody)
         assert cbody.get("code") == 0, cbody
 
-        # 等收敛(cancelled 是终态)。
+
         _wait_rebuild_completed(
             db_name, case_space, timeout=300, allow_failed=True)
         final = _get_rebuild_progress(db_name, case_space)
         logger.info("single-pid rebuild final progress: %s", final)
         assert final.get("status") == "cancelled", (
-            f"单 pid rebuild cancel 后必须收敛为 cancelled,got {final}")
-        # 若 tasks 还在(还没被清),那些 task 也必须全部锁定在 target_pid。
+            f"partition-scoped rebuild must converge to cancelled; got {final}")
+
         for t in final.get("tasks") or []:
             assert t.get("partition_id") == target_pid, (
-                f"cancel 后仍看到别 pid 的 task 残留: {t}")
+                f"task from another partition remained after cancellation: {t}")
 
         _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
 
     def test_drop_before_rebuild_does_not_restore_deleted_documents(self):
-        """Deleted IVFFLAT documents stay deleted after a drop-first rebuild."""
+        """Verifies drop-before rebuild purges deleted documents instead of restoring them."""
         case_space = space_name + "_comp_drop_del"
         batch_size, total = 100, 10000
         assert create_space(router_url, db_name, _ivfflat_space_config(case_space, partition_num=1)).json()["code"] == 0
@@ -2848,15 +2549,13 @@ class TestRebuildParameters:
 # ===========================================================================
 # 8. State machine edges
 # ===========================================================================
-
-
 class TestRebuildStateMachineEdges:
 
     def setup_class(self):
         _ensure_clean_db()
 
     def test_cancel_pending_then_immediate_new_rebuild(self):
-        """8.1"""
+        """Verifies a new rebuild can be admitted immediately after cancelling a pending record."""
         case_space = space_name + "_comp_cancel_re"
         batch_size, total = 100, 5000
         assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=2)).json()["code"] == 0
@@ -2884,17 +2583,13 @@ class TestRebuildStateMachineEdges:
 # ===========================================================================
 # 9. Lifecycle / exception cleanup ⚠️ HIGH-RISK area
 # ===========================================================================
-
-
 class TestRebuildLifecycle:
 
     def setup_class(self):
         _ensure_clean_db()
 
     def test_drop_space_during_running_rebuild(self):
-        """9.1: DROP SPACE while rebuild is running must succeed AND clean
-        up the etcd record. Master must not panic.
-        """
+        """Verifies dropping a space during rebuild removes both the space and its rebuild record."""
         case_space = space_name + "_comp_drop_during"
         batch_size, total = 100, 10000
         assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=2)).json()["code"] == 0
@@ -2980,15 +2675,11 @@ class TestRebuildLifecycle:
         assert rs.status_code == 200
 
     def test_drop_db_during_db_level_rebuild(self):
-        """9.2: DROP DB while a DB-level rebuild is running."""
+        """Verifies dropping a database during a database rebuild removes its active rebuild records."""
         local_db = db_name + "_drop_during"
         case_a = "sp_a"
         case_b = "sp_b"
-        # Best-effort cleanup of leftovers. drop_db alone is not enough:
-        # vearch rejects it when spaces still live under the db (a stuck
-        # prior run may have left sp_a/sp_b behind), so enumerate and drop
-        # each space first, then the db. Finally assert create_db succeeds
-        # so a silent no-op cannot cascade into SPACE_EXIST below.
+
         try:
             rs = requests.get(f"{router_url}/dbs/{local_db}/spaces",
                               auth=(username, password))
@@ -3054,10 +2745,7 @@ class TestRebuildLifecycle:
         assert rs.status_code == 200
 
     def test_terminal_record_retention_query_works(self):
-        """9.3: Completed record can be queried after rebuild ends (PS
-        retention is 2h; not waited here). Just verify the GET works
-        immediately post-completion and returns the right status.
-        """
+        """Verifies a terminal rebuild record remains queryable during its retention period."""
         case_space = space_name + "_comp_retention"
         batch_size, total = 100, 5000
         assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=1)).json()["code"] == 0

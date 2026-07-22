@@ -52,8 +52,6 @@ PSES_IDX = (1, 2, 3)
 # ---------------------------------------------------------------------------
 # Shared helpers (re-implemented locally to keep this file self-contained)
 # ---------------------------------------------------------------------------
-
-
 def _trigger_rebuild(db, space, max_retries=0, drop_before_rebuild=False):
     payload = {}
     if max_retries > 0:
@@ -71,9 +69,9 @@ def _get_progress(db, space):
             f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/progress",
             auth=(username, password), timeout=5)
     except requests.exceptions.RequestException:
-        # PS 死 / 集群降级时 router 可能 hang 到超时;视为本次 poll 无结果,
-        # 由调用方(_wait_terminal / _wait_until_running 等都 `if p:` 兜底)
-        # 下一轮重试,而不是把整条测试带挂。
+
+
+
         return None
     if r.status_code != 200:
         return None
@@ -84,10 +82,7 @@ def _get_progress(db, space):
 
 
 def _get_space_detail(db, space, retries=6, retry_sleep=2):
-    """读 space detail。kill PS / 集群降级时 router 汇总分区信息会 hang 到
-    超时;这里重试若干次(给 leader 重选 / PS 恢复留时间),持续失败才 raise,
-    而不是单次 ReadTimeout 就把整条测试带挂。所有调用方共享这层健壮性。
-    """
+    """Read space details with retries while the cluster recovers."""
     last = None
     for _ in range(retries):
         try:
@@ -107,8 +102,8 @@ def _get_space_detail(db, space, retries=6, retry_sleep=2):
             last = r.text
         time.sleep(retry_sleep)
     raise AssertionError(
-        f"_get_space_detail({db}/{space}) 连续 {retries} 次失败"
-        f"(集群可能严重降级): {last}")
+        f"_get_space_detail({db}/{space}) failed {retries} consecutive times; "
+        f"the cluster may be severely degraded: {last}")
 
 
 def _partition_id(partition):
@@ -116,9 +111,6 @@ def _partition_id(partition):
 
 
 def _partition_restatus_map(partition):
-    # detail 接口把 per-replica rebuild 状态暴露在 "replica_status",值是字符串
-    # (ReplicasOK / ReplicasRebuildingIndex / ReplicasNotReady),见
-    # internal/entity/partition.go:90 + space_service.go:407。不是数字 status_map。
     return partition.get("replica_status") or {}
 
 
@@ -158,31 +150,7 @@ def _wait_terminal(db, space, timeout=600, allow_failed=False):
 
 
 def _ensure_all_ps_alive(timeout=30, expected_count=None, settle_timeout=30):
-    """Pre-test recovery:把所有 PS 拉起来,等 master 心跳重新认可。
-
-    chaos 测试链条里某条用 kill_ps + finally 兜底,如果兜底里 start_ps
-    抛异常被 swallow,集群会留下死 PS,后续 create_space(rn≥2) 必失败
-    (master placement 找不到足够候选)。每次 _ensure_clean_db 都顺手
-    跑一遍这条恢复路径,避免「上一条 chaos 测试副作用污染下一条」。
-
-    幂等:cluster_helpers.start_ps 内部检查 pid 活性,已活就直接 return。
-
-    expected_count: 期望 master /servers 报告的 PS 数 (默认 len(cl.PSES))。
-        helper 会 polling 等到 master 真的看到这么多个 PS,而不是只 sleep
-        固定时间 — start_ps 只等 TCP 端口,但 master 通过 etcd lease +
-        watcher 同步 server cache 还需要额外时间(典型 1-5s,极端 30s+),
-        这之间的差异是「3 PS pid 文件都活了但 create_space 仍然说 only
-        have 1」的根因。
-    settle_timeout: 等 master /servers 的最长时间。
-
-    特殊情形 — PS 进程在但 master 不认 (etcd lease 丢失):
-      chaos 测试 churn master 时,PS 端 KeepAlive 可能初始化失败 / channel
-      关闭而 heartbeat goroutine 退出 (schedule_job.go:119-123)。这时 PS
-      进程仍然在,start_ps 看 pid 活着幂等返回,但 master /servers 里
-      永远不会出现这个 PS。本 helper 检测到「master 缺少某 PS」时,
-      会 kill 该 PS 进程并 start_ps 重启它,触发新的 heartbeat goroutine
-      重新跑 KeepAlive 注册流程。
-    """
+    """Start every PS and wait until Master reports the expected registrations."""
     expected = expected_count if expected_count is not None else len(cl.PSES)
     started_pids = {}
     for idx in cl.PSES:
@@ -192,12 +160,12 @@ def _ensure_all_ps_alive(timeout=30, expected_count=None, settle_timeout=30):
         except Exception as e:
             logger.warning("pre-test start_ps(%d) failed: %s", idx, e)
 
-    # 拿 master 当前认的情况,反查哪些 PS idx 没被认上。
+
     def _missing_idxs():
         if cl.CLUSTER_MODE == "docker":
-            # docker 模式没法用 rpc 端口区分 PS(容器内端口都是 8081,host
-            # 不可见)。先看容器是否 running;容器都在但 master 认的数量不够
-            # → lease 丢失,无法精确定位,返回全部让上层逐个 kill+restart。
+
+
+
             not_running = [idx for idx in cl.PSES
                            if not cl._docker_inspect_running(
                                cl.PSES[idx]["container_name"])]
@@ -230,10 +198,10 @@ def _ensure_all_ps_alive(timeout=30, expected_count=None, settle_timeout=30):
                         "force-release if it persists.",
                         missing, expected)
             last_missing = missing
-        # 持续 8 秒后还有 PS 不在 master 名单里 → 大概率是 lease 丢失。
-        # PS 进程活着但 heartbeat goroutine 没注册成功 / channel 关掉了 —
-        # 此时 cl.start_ps 看到 pid 活直接返回,不会重新走 KeepAlive。
-        # 强制 kill + 重启 PS,让它走一遍新的 heartbeat 初始化。
+
+
+
+
         elapsed = settle_timeout - (deadline - time.time())
         if elapsed > 8:
             for idx in missing:
@@ -266,31 +234,17 @@ def _ensure_all_ps_alive(timeout=30, expected_count=None, settle_timeout=30):
 
 
 def _ensure_all_masters_alive(timeout=60):
-    """同款逻辑,但针对 master 节点。chaos 测试链里 kill_master + finally
-    swallow 是常见 pattern (test_rebuild_resumes_after_leader_kill /
-    test_pending_record_admitted_after_leader_kill / test_no_double_dispatch_
-    under_master_churn 都属于),quorum 会从 3 掉到 2 甚至 1,后面的测试
-    会因为 quorum 不够而 rebuild record 永远卡 pending 进而挂 assert。
-
-    cl.start_master 内部 wait_for_master_quorum,timeout 比 PS 长 — embedded
-    etcd 恢复 + raft re-sync 通常 30-90s。
-    """
+    """Start every Master and wait for the embedded-etcd quorum to stabilize."""
     for name in cl.MASTERS:
         try:
             cl.start_master(name, wait_quorum=True, timeout=timeout)
         except Exception as e:
             logger.warning("pre-test start_master(%s) failed: %s", name, e)
-    # 等 quorum 完全稳定 — 各 master 之间需要一拍 raft heartbeat 才能
-    # 公认新的 leader。
     time.sleep(5)
 
 
 def _ensure_clean_db():
-    # 先把 PS 拉齐(若有的话),否则下面的 drop_space 调用可能撞 master
-    # 的不健康判断超时返回 5xx。
     _ensure_all_ps_alive()
-    # master 自愈 — 上一组 master-failover 测试如果 finally 没拉齐
-    # leader,quorum 残缺会让 _ensure_clean_db 自己的 drop_db 都挂。
     _ensure_all_masters_alive()
     try:
         url = f"{router_url}/dbs/{db_name}/spaces"
@@ -311,14 +265,6 @@ def _ensure_clean_db():
 
 def _hnsw_cfg(name, pn=2, rn=2):
     dim = xb.shape[1]
-    # resource_name 必须显式传 "default":
-    # vearch master 代码里定义了 DefaultResourceName = "default" 常量
-    # (master/services/space_service.go:48) 但 *从来没* 在 CreateSpace
-    # 路径上把 space.ResourceName 默认填成它。结果如果客户端不传该字段,
-    # space.ResourceName = ""(空字符串),placement 时跟 PS 的
-    # ResourceName ("default") 比较 → 全部过滤掉 → "not enough partition
-    # servers" 假阴性。chaos 测试集群所有 PS toml 都是 resource_name=
-    # "default",对齐传 "default" 就能通过 placement 过滤。
     return {"name": name,
             "partition_num": pn, "replica_num": rn,
             "resource_name": "default",
@@ -358,27 +304,19 @@ def _ivfpq_cfg(name, pn=2, rn=2):
                                   "ncentroids": 64,
                                   "nprobe": 16,
                                   "nsubvector": 32,
-                                  "training_threshold": 2000}},
+                                  "training_threshold": 2496}},
              "dimension": dim},
         ],
     }
-
-
 def _wait_index_status_indexed(db, space, max_rounds=180, poll_interval=5):
-    """等到 space 所有 partition 的 index_status 都到 INDEXED(=2) 且 status!="red"。
-
-    waiting_index_finish 只等全局 index_num 到 total,不保证每个 partition 的
-    index_status 已翻成 INDEXED。慢速 CI 上这个间隙会被放大,直接触发 rebuild
-    会撞到 "rebuild requires an existing index"(某 partition 仍 UNINDEXED)。
-    所有 chaos 测试都经 _populate 准备数据,这里统一加闸。
-    """
+    """Wait until every partition reports INDEXED and the space is not red."""
     url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
     for _ in range(max_rounds):
         try:
             rs = requests.get(url, auth=(username, password), timeout=5)
             data = rs.json().get("data", {}) if rs.status_code == 200 else {}
         except requests.exceptions.RequestException:
-            data = {}  # router 暂时 hang(降级)→ 本轮跳过,下一轮重试
+            data = {}
         partitions = data.get("partitions") or []
         statuses = [p.get("index_status", -1) for p in partitions]
         if data.get("status") != "red" and partitions and all(s == 2 for s in statuses):
@@ -402,8 +340,6 @@ def _wait_until_running(db, space, timeout=60):
 # ---------------------------------------------------------------------------
 # Pre-flight check: make sure the multi-node cluster is up.
 # ---------------------------------------------------------------------------
-
-
 @pytest.fixture(scope="module", autouse=True)
 def _verify_multi_node_cluster():
     if not cl.cluster_is_healthy():
@@ -411,23 +347,14 @@ def _verify_multi_node_cluster():
             "Multi-node cluster not detected; run scripts/cluster.sh start "
             "before chaos tests.")
 
-    # 自愈:上一次 chaos 测试如果留下死 PS(典型场景 — kill 后 finally
-    # 里 start_ps 抛异常被 swallow,集群留下少于 3 个 PS),整个 module
-    # 会因为下面那条 < 3 检查被 skip 掉。这里先尝试拉起所有 PS,再判定。
     pses = cl.list_registered_pses()
     if len(pses) < 3:
         for idx in cl.PSES:
             try:
                 cl.start_ps(idx, wait_ready=True, timeout=30)
             except Exception as e:
-                # 起不起来都先继续 — 下面 list_registered_pses 会重新算。
-                # 这里 swallow 是因为某个 PS 可能本来就死且 cluster.sh
-                # 还没拉起来,fixture 自愈是 best-effort。
-                # cluster_helpers 的 start_ps 内部已经 idempotent(已存活
-                # 直接 return),所以重复调用是安全的。
                 pass
-        # 等 master 心跳重新认可 — 拉起 PS 后 master 端 server cache
-        # 还需要一两秒才能反映在 /servers 上。
+
         import time as _time
         _time.sleep(3)
         pses = cl.list_registered_pses()
@@ -443,19 +370,13 @@ def _verify_multi_node_cluster():
 # ===========================================================================
 # Category 1 — PS process failure
 # ===========================================================================
-
-
 class TestRebuildPSFailure:
 
     def setup_class(self):
         _ensure_clean_db()
 
     def test_rebuild_survives_ps_kill_and_restart(self):
-        """Kill the PS executing an IVFPQ task, restart it, and verify retry.
-
-        The victim is selected from an actually dispatched Running task so
-        this test cannot pass merely because a fixed PS had no in-flight work.
-        """
+        """Verifies an in-flight IVFPQ rebuild completes after its PS is killed, restarted, and retried."""
         case_space = space_name + "_chaos_kill"
         _ensure_all_ps_alive()
 
@@ -518,13 +439,7 @@ class TestRebuildPSFailure:
         drop_space(router_url, db_name, case_space)
 
     def test_max_retries_exhausted_then_failed_record_overwritten(self):
-        """Exhaust retries, then replace the failed record with a new run.
-
-        The victim is selected from an actually dispatched Running task;
-        record.status=running alone does not prove that a fixed PS currently
-        owns in-flight work. After failure the PS is restored and a new
-        request must replace the terminal record and complete successfully.
-        """
+        """Verifies retry exhaustion produces a failed record that a later successful request can replace."""
         _ensure_all_ps_alive()
 
         case_space = space_name + "_chaos_maxretry"
@@ -624,16 +539,7 @@ class TestRebuildPSFailure:
                 logger.warning("1.4 cleanup drop_space failed: %s", e)
 
     def test_partition_replica_failure_skips_remaining_replicas(self):
-        """1.4b: R1 invariant — once one replica of a partition exhausts its
-        retry budget, every remaining not-yet-dispatched replica task on
-        the SAME partition must be cancelled (not failed, not run), so at
-        least one physical replica of that partition is left untouched and
-        the partition stays queryable.
-
-        Setup: rn>=2, pn=1, max_retries=1. Kill the PS hosting one specific
-        replica so its retries all fail; the other replica's task must end
-        up Cancelled (not Completed, not Failed).
-        """
+        """Verifies exhausting one replica task cancels undispatched sibling tasks on the same partition."""
         _ensure_all_ps_alive()
 
         case_space = space_name + "_chaos_skip_replicas"
@@ -700,20 +606,13 @@ class TestRebuildPSFailure:
 # ===========================================================================
 # Category 2 — Master leader change
 # ===========================================================================
-
-
 class TestRebuildMasterFailover:
 
     def setup_class(self):
         _ensure_clean_db()
 
     def test_rebuild_resumes_after_leader_kill(self):
-        """2.1: Kill the etcd raft leader mid-rebuild. New leader takes
-        over and resumes scheduler ticks; record reaches completed.
-        """
-        # Pre-test self-guard:test_prepare_db 只在 class 开头跑一次,
-        # 本测试可能在 dirty 状态下被调用 (上一组 chaos 残留)。先把 PS
-        # 和 master 都拉齐避免 placement / quorum 假阴性。
+        """Verifies a rebuild resumes and completes after the Master leader is killed."""
         _ensure_all_ps_alive()
         _ensure_all_masters_alive()
 
@@ -762,8 +661,8 @@ class TestRebuildMasterFailover:
                     progress_before["overall_percent"], \
                     f"progress regressed: {progress_before} -> {progress_after}"
         finally:
-            # 不再 swallow 异常 — 拉不起来下条测试也会自愈,这里直接 log
-            # 出来方便诊断 (除非真的没法恢复)。
+
+
             try:
                 cl.start_master(leader, wait_quorum=True, timeout=30)
             except Exception as e:
@@ -773,10 +672,7 @@ class TestRebuildMasterFailover:
         drop_space(router_url, db_name, case_space)
 
     def test_pending_record_admitted_after_leader_kill(self):
-        """2.2: Trigger rebuild, kill master leader before admit can land
-        (best-effort: rapid kill after POST). New leader admits the
-        record and runs it to completion.
-        """
+        """Verifies a new Master leader admits and completes a rebuild left pending by its predecessor."""
         _ensure_all_ps_alive()
         _ensure_all_masters_alive()
 
@@ -818,24 +714,7 @@ class TestRebuildMasterFailover:
         drop_space(router_url, db_name, case_space)
 
     def test_no_double_dispatch_under_master_churn(self):
-        """2.3: Repeatedly kill master leader during a single rebuild;
-        verify PS never runs the same (space, pid, field, indexType)
-        rebuild concurrently — the per-task sync.Once + 'ignoring
-        duplicate start' gate must protect us.
-
-        Mechanic:
-          - master at-least-once dispatch: every leader change re-runs
-            tick() which can re-issue ExecuteRebuildIndex if Dispatched
-            wasn't persisted in time.
-          - PS-side guard at rebuild_manager.go:117 short-circuits
-            duplicates with log "ignoring duplicate start".
-
-        We assert the weaker but observable invariant:
-          (count of "rebuild engine.RebuildFieldIndex dispatched")
-            <= total task count (= partition_num * replica_num)
-          + zero overlap windows where two CGO RebuildIndex run for the
-            same task key.
-        """
+        """Verifies a rebuild completes while the Master leader repeatedly changes."""
         case_space = space_name + "_chaos_churn"
         _ensure_all_masters_alive()
 
@@ -890,25 +769,13 @@ class TestRebuildMasterFailover:
         _ensure_clean_db()
 
 
-
 # ===========================================================================
-# Category 1 (additional) — slow path + DropBefore=0 invariant
+# Category 3 — Replica serialization and query routing
 # ===========================================================================
-
-
 class TestRebuildReplicaRoutingChaos:
 
     def test_only_one_replica_per_partition_running_at_any_time(self):
-        """3.1: 全局 rebuild 串行 — 任一时刻至多 1 个 task 在 Running。
-
-        新调度语义: 一个 record 内所有 task 严格串行执行 (dispatchPending 里
-        `如果有任何 Dispatched && !terminal 的 task, 就一个都不派发`)。因此:
-          - 每个 progress frame 的 running 集合大小 <= 1
-          - final tasks 的 [start_time, complete_time] 区间两两不重叠
-
-        用 rn=2(而非 rn=3):3-PS 的 docker 集群 + resource_limit_rate=0.98
-        放不下 rn=3 会直接 skip。rn=2 + pn=2 共 4 个 task, 足以观察串行序。
-        """
+        """Verifies all tasks in one rebuild record execute globally and strictly serially."""
         _ensure_clean_db()
         case_space = space_name + "_chaos_serial_r2p2"
         batch_size, total = 100, min(10000, xb.shape[0])
@@ -1026,15 +893,7 @@ class TestRebuildReplicaRoutingChaos:
             drop_space(router_url, db_name, case_space)
 
     def test_search_skips_rebuilding_replica(self):
-        """3.2: rebuild 期间 search 不应打到 Rebuilding 副本。
-
-        当前 search 响应和 PS 默认日志都不暴露每次命中的 nodeID，
-        因此这里用可观测的强行为约束验证:
-          1. 后台轮询 ReStatusMap,确认实际进入 Rebuilding;
-          2. rebuild 期间所有 search 必须 200 + code=0;
-          3. rebuild 期间 P99 latency 不能相对 baseline 暴涨;
-          4. rebuild 后 ReStatusMap 全部恢复 OK,且查询稳定成功。
-        """
+        """Verifies normal searches remain successful while Router skips rebuilding replicas."""
         _ensure_clean_db()
         case_space = space_name + "_chaos_search_skip_r3p2"
         batch_size, total = 100, min(10000, xb.shape[0])
@@ -1055,9 +914,6 @@ class TestRebuildReplicaRoutingChaos:
             search_url = router_url + "/document/search?timeout=5000"
 
             def _search_once():
-                # 不带 partition_names: hash 分区的 HNSW space 里 partition.Name
-                # 为空, router 按 p.Name 匹配, 任何非空过滤都会让 sendMap 为空。
-                # 全 space 搜索同样能体现 rebuild 期间 router 的副本调度健康度。
                 data = {
                     "vector_value": False,
                     "db_name": db_name,
@@ -1094,12 +950,6 @@ class TestRebuildReplicaRoutingChaos:
             stop_evt = threading.Event()
 
             def _poll_restatus():
-                # 用 /rebuild/progress 替代 space detail: detail 接口的
-                # replica_status 把 Rebuilding(3) 和 NotReady(2) 都压成同一个
-                # "ReplicasNotReady" 字符串, 而 progress.tasks 直接暴露
-                # status=1(Running) + dispatched=true, 是 master 对副本是否
-                # 正在重建的权威描述。snapshot 格式保持
-                # {partition_id: {node_id: status_int}}, 不便处保留兼容。
                 while not stop_evt.is_set():
                     try:
                         p = _get_progress(db_name, case_space)
@@ -1111,8 +961,8 @@ class TestRebuildReplicaRoutingChaos:
                                 continue
                             pid = t.get("partition_id")
                             nid = int(t.get("node_id", 0))
-                            # 用 3 (entity.ReplicasRebuildingIndex) 表示 router
-                            # 视角下的 Rebuilding, 让下方 st == 3 的判断保持原样。
+
+
                             snap.setdefault(pid, {})[nid] = 3
                         restatus_snapshots.append((time.time(), snap))
                     except Exception:
@@ -1144,16 +994,16 @@ class TestRebuildReplicaRoutingChaos:
                 any(st == 3 for nodes in snap.values()
                     for st in nodes.values())
                 for _, snap in restatus_snapshots)
-            # Fallback: polling 漏采时, final tasks 里有任何一条已完成 task
-            # ⇒ 该副本曾被 master 标记 Rebuilding (dispatchPending 里
-            # markReplicaRebuilding 与 t.Dispatched=true 一起发生)。
+
+
+
             if not seen_rebuilding:
                 for t in final.get("tasks") or []:
                     if t.get("status") == "completed":
                         seen_rebuilding = True
                         break
             assert seen_rebuilding, (
-                "ReStatusMap 全程没出现 Rebuilding 状态，无法验证路由过滤")
+                "No Rebuilding state was observed, so routing filters were not exercised")
 
             rebuilding_pairs = set()
             for _, snap in restatus_snapshots:
@@ -1167,7 +1017,7 @@ class TestRebuildReplicaRoutingChaos:
                         (int(t.get("partition_id")),
                          int(t.get("node_id", 0))))
             assert rebuilding_pairs, (
-                "未能确定任一 Rebuilding 副本, 无法核对 router 日志")
+                "No rebuilding replica was identified for Router log verification")
 
             skip_pattern = re.compile(
                 r"partition (\d+) skipped nodeID=(\d+) rebuilding, "
@@ -1193,15 +1043,15 @@ class TestRebuildReplicaRoutingChaos:
                 pytest.skip("router logs unavailable in this cluster mode; "
                             "cannot verify replica-skip log line")
             assert skip_lines, (
-                "router 日志未出现非 Leader 分支跳过 Rebuilding 副本的记录, "
+                "Router logs did not show a non-Leader route skipping a rebuilding replica; "
                 "rebuilding_pairs=%s" % (rebuilding_pairs,))
             logger.info("3.2 replica-skip verified, sample=%s",
                          skip_lines[0])
 
-            assert search_results, "rebuild 期间没有发出 search 请求"
+            assert search_results, "no search request was issued during rebuild"
             bad = [r for r in search_results if not r[1]]
             assert not bad, (
-                "rebuild 期间存在 search 非 200/code=0 响应, sample=%s" %
+                "search returned non-200 or nonzero responses during rebuild; sample=%s" %
                 (bad[:5],))
 
             rebuild_latencies = sorted(r[2] for r in search_results if r[1])
@@ -1211,7 +1061,7 @@ class TestRebuildReplicaRoutingChaos:
                          "search_count=%d",
                          baseline_p99, rebuild_p99, len(search_results))
             assert rebuild_p99 < max(baseline_p99 * 5, 50), (
-                "rebuild 期间 search p99 latency 暴涨: "
+                "search p99 latency regressed during rebuild: "
                 "baseline=%.1fms rebuild=%.1fms" %
                 (baseline_p99, rebuild_p99))
 
@@ -1219,18 +1069,18 @@ class TestRebuildReplicaRoutingChaos:
             for p in post_detail.get("partitions") or []:
                 for nid, st in _partition_restatus_map(p).items():
                     assert st == "ReplicasOK", (
-                        "rebuild 后 pid=%s node=%s status=%s 未恢复 OK" %
+                        "replica did not return to OK after rebuild: pid=%s node=%s status=%s" %
                         (_partition_id(p), nid, st))
 
             post_results = [_search_once() for _ in range(30)]
             assert all(r[0] for r in post_results), (
-                "rebuild 后 search 未稳定恢复, sample=%s" %
+                "search was not stable after rebuild; sample=%s" %
                 (post_results[:5],))
         finally:
             drop_space(router_url, db_name, case_space)
 
     def test_leader_rebuild_falls_back_to_follower(self):
-        """3.3: leader 副本 rebuild 时, Leader 查询 fallback 到 follower。"""
+        """Verifies leader-directed searches fall back to a follower while the leader replica rebuilds."""
         _ensure_clean_db()
         case_space = space_name + "_chaos_leader_fb_r3"
         batch_size, total = 100, min(10000, xb.shape[0])
@@ -1272,7 +1122,7 @@ class TestRebuildReplicaRoutingChaos:
                 }
                 rs = requests.post(search_url, auth=(username, password),
                                    json=data, timeout=5)
-                # 非 200 时也尽量保留 body 文本, 失败时方便定位 router/PS 的报错。
+
                 code = None
                 detail = None
                 if rs.status_code == 200:
@@ -1294,12 +1144,6 @@ class TestRebuildReplicaRoutingChaos:
                     time.sleep(0.05)
 
             def _poll_leader_restatus():
-                # 用 rebuild progress 接口判定 leader 副本是否在 Rebuilding:
-                # space detail 的 replica_status 把 Rebuilding(3) 和
-                # NotReady(2) 都映射成 "ReplicasNotReady", 无法区分;
-                # 而 progress.tasks 是 master 持有的权威来源, 每个 task 都
-                # 带 node_id/status/dispatched, 命中 leader_id 即证明 leader
-                # 副本在被重建。
                 lid_int = int(leader_id)
                 while not stop_evt.is_set():
                     try:
@@ -1335,11 +1179,8 @@ class TestRebuildReplicaRoutingChaos:
             bad = [r for r in leader_query_results
                    if not (r[0] == 200 and r[1] == 0)]
             assert not bad, (
-                "Leader 类型查询出现失败, sample=%s" % (bad[:5],))
+                "Leader-directed queries failed; sample=%s" % (bad[:5],))
 
-            # Fallback: polling 漏采时, 直接看 final tasks 是否包含一条
-            # node_id == leader_id 的已完成 task; 有 ⇒ leader 副本确实被
-            # 重建过, 期间 master 必然把它标过 Rebuilding。
             if not leader_seen_rebuilding[0]:
                 lid_int = int(leader_id)
                 for t in final.get("tasks") or []:
@@ -1348,8 +1189,8 @@ class TestRebuildReplicaRoutingChaos:
                         leader_seen_rebuilding[0] = True
                         break
             assert leader_seen_rebuilding[0], (
-                "leader 副本未被观察到 Rebuilding, 也未在 final tasks 中找到 "
-                "node_id=%s 的已完成 task, 无法验证 fallback" % (leader_id,))
+                "the leader replica was neither observed rebuilding nor found in final tasks; "
+                "no completed task for node_id=%s was available to verify fallback" % (leader_id,))
 
             fallback_lines = []
             router_logs_available = False
@@ -1364,70 +1205,40 @@ class TestRebuildReplicaRoutingChaos:
                 pytest.skip("router logs unavailable in this cluster mode; "
                             "cannot verify fallback log line")
             assert fallback_lines, (
-                "router 日志未出现 'partition X leader=Y rebuilding, "
+                "Router logs did not contain 'partition X leader=Y rebuilding, "
                 "fallback to nodeID=Z'")
             logger.info("leader fallback verified, sample=%s",
                         fallback_lines[0])
 
             post_detail = _get_space_detail(db_name, case_space)
             post_parts = post_detail.get("partitions") or []
-            assert post_parts, "rebuild 后 detail 未返回任何 partition"
+            assert post_parts, "space details returned no partition after rebuild"
             post_partition = post_parts[0]
             post_leader_id = (post_partition.get("leader")
                               or post_partition.get("LeaderID")
                               or post_partition.get("raft_status", {}).get("Leader"))
             assert post_leader_id == leader_id, (
-                "rebuild 后 leader 发生变化: before=%s after=%s" %
+                "leader changed after rebuild: before=%s after=%s" %
                 (leader_id, post_leader_id))
             post_results = [_leader_query_once() for _ in range(20)]
             assert all(status == 200 and code == 0
                        for status, code, _ in post_results), (
-                "rebuild 后 Leader 查询未恢复稳定, sample=%s" %
+                "Leader-directed queries were not stable after rebuild; sample=%s" %
                 (post_results[:5],))
         finally:
             drop_space(router_url, db_name, case_space)
 
     def test_cross_partition_no_routing_interference(self):
-        """3.5: rebuild p1 时 router 对共驻 PS 节点 X 上 p2 的候选过滤。
-
-        pn=2/rn=2 时两个 partition 的 replica 集合可能在某 PS 节点 X 上相交,
-        X 同时持有 p1.r1 与 p2.r2。触发 p1 单 partition rebuild 后:
-          (a) X.r1 进入 Rebuilding 期间, 针对 p1 的查询不能落到 X.r1 —
-              否则会撞上正在 tear-down 的引擎(硬过滤, isRebuildingIndex,
-              无回退——rebuilding 副本永远不是自己 partition 的合法目标)。
-              可观测信号: router 日志 "partition <p1> skipped nodeID=<X>
-              rebuilding, client_type=<...>" (与 3.2 用例同一条日志)。
-          (b) 同时间窗内, 针对 p2 的查询应把 X.r2 从候选集里踢掉, 转去
-              其他副本 — X 上重建吃 CPU/IO, 让 co-tenant p2 也走这台会
-              被拖累 (preferIdleHosts / rebuildBusyNodeID)。这是"带
-              last-resort 回退的硬过滤": idle 子集非空时 busy 节点权重
-              为 0; 若 p2 在 X 之外的副本都不可达, 回退到 X.r2 保住可
-              用性 (不是加权路由,busy 节点在有其他候选时拿不到流量)。
-              可观测信号: router 日志 "partition <p2> preferred idle
-              replicas over busy nodeID=<X> rebuilding"。
-
-        HTTP 响应和 partition 心跳都不暴露每次命中的 nodeID, 本用例复用
-        3.2 用例已建立的"抓 router 日志"模式——两个信号都是 router 内
-        logSkipRebuildingReplica / preferredIdleLogged 首见去重后写出的
-        Warn 行, 直接 grep 即可。测试不 kill 任何进程, 拓扑要求仅"存在
-        某 X 同时承载 p1、p2 的副本, 且 p2 在 X 之外还有其他副本"
-        (后者保证 (b) 分支不退化到 last-resort); 若拓扑不满足则 skip。
-        """
+        """Verifies Router avoids a rebuild-busy PS for both the rebuilding partition and co-located partitions."""
         _ensure_clean_db()
         case_space = "%s_chaos_cross_iso_r2p2_%d" % (
             space_name, int(time.time() * 1000))
-
-        # 1. 建 space 并写入数据 -----------------------------------------
         resp = create_space(router_url, db_name, _hnsw_cfg(case_space, pn=2, rn=2))
         if resp.json().get("code") != 0:
             pytest.skip(f"cluster cannot host pn=2 rn=2: {resp.json()}")
         try:
             _populate(case_space, total=min(xb.shape[0], 10000))
 
-            # 2. 拿 partition 布局, 找到 (p1, p2, X): 至少存在一个 PS 节点
-            #    X 同时是 p1、p2 的副本。detail API 的 replica_status 由 PS
-            #    心跳异步写入, 新建 space 后可能为空; 改用 master /partitions
-            #    直接从 etcd 读权威 Replicas。
             detail = _get_space_detail(db_name, case_space)
             partitions = detail.get("partitions") or []
             assert len(partitions) >= 2, f"need ≥2 partitions: {partitions}"
@@ -1482,15 +1293,14 @@ class TestRebuildReplicaRoutingChaos:
                     shared = r1 & r2
                     if not shared:
                         continue
-                    # 优先挑 p2 有 idle 副本可换 (r2 - {X}) 非空的 X, 否则
-                    # 只剩 last-resort 回退路径, 观测不到 preferred-idle 日志。
+
                     for x in shared:
                         if r2 - {x}:
                             chosen = (p1_e, p2_e, x)
                             break
                     if chosen is None:
-                        # 拓扑退化: r1 == r2, 任何 shared X 都让 p2 只剩 X;
-                        # 仍记下来, 后面 skip 说明清楚。
+
+
                         chosen = (p1_e, p2_e, next(iter(shared)))
                     break
                 if chosen:
@@ -1506,8 +1316,8 @@ class TestRebuildReplicaRoutingChaos:
             p2_reps = _replica_nodes(p2_e)
             if not (p2_reps - {x_node}):
                 pytest.skip(
-                    f"p2({p2_pid}) 副本 == {{X={x_node}}} — 没有 idle 备选, "
-                    "只能验 last-resort 回退, 覆盖不到 preferIdleHosts 的踢除逻辑")
+                    f"p2({p2_pid}) has no idle replica besides X={x_node}; "
+                    "only last-resort fallback is testable, not preferIdleHosts filtering")
             logger.info(
                 "3.5 chosen layout: p1=pid:%s replicas=%s, "
                 "p2=pid:%s replicas=%s, X=%d",
@@ -1515,18 +1325,6 @@ class TestRebuildReplicaRoutingChaos:
                 p2_pid, p2_reps, x_node,
             )
 
-            # 3. 查询函数: /document/search 走 SearchByPartitions →
-            #    searchFromPartition, 每个 partition 独立走一次
-            #    SelectNodeByClientType(clientType=""/Random)。一次整空间
-            #    search 会同时命中 p1 与 p2 各自的候选筛选路径, 从而在
-            #    router 日志里同时写出 (i) p1 skip X.r1 与 (ii) p2 prefer
-            #    idle-over-X 两条 Warn。hash 分区的 space 里 partition.Name
-            #    为空, partition_names 过滤会让 sendMap 空 (与 3.2 一致),
-            #    故不带 partition_names, 用全空间 search 覆盖 p1、p2。
-            #    setRequestHeadFromGin 不读 body 的 load_balance, 默认
-            #    ClientType="", SelectNodeByClientType 走 Random 分支。
-            #    /document/query + partition_id 走 Execute() 是 leader-only,
-            #    不进 SelectNodeByClientType, 抓不到目标日志——不能用它。
             def _search(client_timeout=2, url_timeout_ms=2000):
                 search_url = (router_url +
                               f"/document/search?timeout={url_timeout_ms}")
@@ -1549,7 +1347,7 @@ class TestRebuildReplicaRoutingChaos:
                 except Exception as e:
                     return False, repr(e)
 
-            # 4. 触发 p1 单 partition rebuild --------------------------
+
             rebuild_url = (f"{router_url}/index/rebuild/dbs/{db_name}"
                            f"/spaces/{case_space}")
             trig_resp = requests.post(rebuild_url,
@@ -1558,10 +1356,6 @@ class TestRebuildReplicaRoutingChaos:
                                       timeout=30)
             assert trig_resp.json().get("code") == 0, trig_resp.text
 
-            # 5. 启动 watcher + search 线程, 仅在 X.r1 处于 Rebuilding
-            #    窗口内采样。一次整空间 search 同时驱动 p1、p2 各自的
-            #    SelectNodeByClientType, 首见去重的两条日志只需要窗口内
-            #    发生一次即可落盘。
             search_results = []
             stop_evt = threading.Event()
             window_open = [False]
@@ -1606,39 +1400,24 @@ class TestRebuildReplicaRoutingChaos:
             stop_evt.set()
             watcher.join(timeout=5)
             searcher.join(timeout=5)
-
-            # 6. 断言 -------------------------------------------------
             if not x_running_seen[0]:
-                # 没看到 X.r1 进入 Rebuilding: rebuild 太快或先重建了另一
-                # replica。本次运行没有有效窗口, skip (与 3.3 行为一致)。
                 pytest.skip(
-                    "X.r1 未在 rebuild 期间被观察到 Rebuilding 状态;"
-                    "本次运行不构成有效窗口,无法验证 3.5 不变量"
+                    "X.r1 was not observed rebuilding; "
+                    "this run had no valid window for invariant 3.5"
                 )
-
-            assert search_results, "窗口内未采集到 search 样本"
-
-            # 6a. 全空间 search 必须整体 200/code=0 — router 既跳过 X.r1
-            #    (硬过滤, 无回退), 又不把 p2 候选清空 (preferIdleHosts 的
-            #    last-resort 回退保证 p2 至少有一个可达副本)。search 是
-            #    fan-out 广播, 只要任一 partition 失败整体 code!=0, 就
-            #    等价于 p1 或 p2 路由被打断。
+            assert search_results, "no search samples were collected in the rebuild window"
             search_fail = [r for r in search_results if not r[0]]
             fail_rate = len(search_fail) / len(search_results)
             assert fail_rate <= 0.05, (
-                f"rebuild 窗口内 search 失败率 {fail_rate:.2%} "
-                f"({len(search_fail)}/{len(search_results)}) 过高: "
-                f"router 未跳过 Rebuilding 副本, 或 preferIdleHosts 把 p2 "
-                f"候选清空 (sample fail={search_fail[:3]})"
+                f"search failure rate during rebuild was {fail_rate:.2%} "
+                f"({len(search_fail)}/{len(search_results)}), which is too high: "
+                f"Router did not skip the rebuilding replica or preferIdleHosts emptied p2 "
+                f"candidates (sample failures={search_fail[:3]})"
             )
-
-            # 6b. router 日志双信号 (核心断言, 复用 3.2 的 grep 模式):
-            #   (i)  硬过滤 X.r1(无回退):
             #        "partition <p1> skipped nodeID=<X> rebuilding"
-            #   (ii) 带回退的硬过滤把 X.r2 踢出候选:
+
             #        "partition <p2> preferred idle replicas over busy
             #         nodeID=<X> rebuilding"
-            #   两条都是 首见去重 + Warn 级别, 窗口内只要发生就会写一次。
             skip_pattern = re.compile(
                 r"partition (\d+) skipped nodeID=(\d+) rebuilding, "
                 r"client_type=(\S+)"
@@ -1666,26 +1445,24 @@ class TestRebuildReplicaRoutingChaos:
                 pytest.skip("router logs unavailable in this cluster mode; "
                             "cannot verify replica-skip / prefer-idle log lines")
             assert skip_hits, (
-                f"router 日志未出现 p1={p1_pid} 硬过滤 X.r1(node={x_node}) "
-                f"的记录 — 与 3.2 断言同一条 (skipped nodeID=... rebuilding)")
+                f"Router logs did not show p1={p1_pid} filtering X.r1(node={x_node}); "
+                f"expected the same skipped-node signal as test 3.2")
             assert prefer_hits, (
-                f"router 日志未出现 p2={p2_pid} 把 X.r2(busy nodeID={x_node}) "
-                f"从候选踢出的记录 — preferIdleHosts 未生效, 跨 partition "
-                f"路由隔离被破坏")
+                f"Router logs did not show p2={p2_pid} filtering X.r2(busy nodeID={x_node}); "
+                f"preferIdleHosts did not filter the busy node and cross-partition "
+                f"routing isolation was violated")
             logger.info(
                 "3.5 verified: search_ok=%d/%d, skip_hit=%s, prefer_hit=%s",
                 len(search_results) - len(search_fail), len(search_results),
                 skip_hits[0], prefer_hits[0],
             )
-
-            # 7. rebuild 完成后所有 ReStatus 回到 OK ------------------
             post = _get_space_detail(db_name, case_space)
             for p in post.get("partitions") or []:
                 rsm = p.get("replica_status") or {}
                 for nid, st in rsm.items():
                     assert st != "ReplicasRebuildingIndex", (
-                        f"rebuild 完成后 pid={p.get('pid')} node={nid} "
-                        f"残留 Rebuilding"
+                        f"after rebuild pid={p.get('pid')} node={nid} "
+                        f"still reported Rebuilding"
                     )
         finally:
             try:
@@ -1694,37 +1471,27 @@ class TestRebuildReplicaRoutingChaos:
                 pass
 
 
+# ===========================================================================
+# Category 4 — Failure cleanup and retry invariants
+# ===========================================================================
 class TestRebuildPSFailureExtras:
 
     def setup_class(self):
         _ensure_clean_db()
 
     def test_rebuild_marks_replica_failed_via_poll_timeout(self):
-        """1.2: PS永久死(不重启)→ master 走 PollFailureStreak 慢路径
-        累计 15 次连接失败后(~30s)markReplicaFailed → partition retry
-        → 重新派发到健康 PS → 重建完成。
-
-        和已有 test_rebuild_survives_ps_kill_and_restart 的对比:
-          - 那条用 PS restart 触发 fast path (Exists=false, ~2s)
-          - 这条用 PS 永不回来触发 slow path (PollFailureStreak ~30s)
-
-        replica_num=2 保证 partition 有另一个健康副本可以顶上。
-        """
+        """Verifies a permanently unavailable PS eventually drives its rebuild task to a terminal state."""
         case_space = space_name + "_chaos_polltimeout"
         # replica_num=2: each partition has exactly 2 replicas.
         # When ps2 dies, the surviving replica on another PS must finish
         # the partition (or partition retry redispatches to a live PS).
-        # 先把所有 PS 拉齐 — 上面的 chaos 测试链如果有副作用残留 dead PS,
-        # 这里 rn=2 placement 会直接失败。_ensure_clean_db 已经 cover,
-        # 但是 test_prepare_db 跟具体测试方法之间还有别的测试在跑(同一
-        # class 内顺序),所以再保险一次。
         _ensure_all_ps_alive()
         resp = create_space(router_url, db_name,
                             _hnsw_cfg(case_space, pn=2, rn=2))
         body = resp.json()
         assert body.get("code") == 0, (
             f"create_space failed for 1.2: code={body.get('code')} "
-            f"msg={body.get('msg')} (集群 PS 是否齐全?)")
+            f"msg={body.get('msg')} (verify that all PS nodes are registered)")
         _populate(case_space, total=10000)
 
         assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
@@ -1770,16 +1537,7 @@ class TestRebuildPSFailureExtras:
         drop_space(router_url, db_name, case_space)
 
     def test_partition_retry_forces_drop_before_zero(self):
-        """1.5: P0-3 invariant. Trigger rebuild with drop_before=true.
-        Force partition retry by killing a PS mid-rebuild. The retried
-        task on that partition MUST be dispatched with dropBefore=0,
-        not 1, to avoid destroying replicas that already succeeded.
-
-        Verification: parse PS logs for the line printed by
-        rebuild_manager.go:217 — `engine.RebuildFieldIndex dispatched ...
-        dropBefore=N`. Same (pid, field, indexType) should appear with
-        dropBefore=1 (initial) and then dropBefore=0 (retry).
-        """
+        """Verifies a partition retry dispatches with dropBefore zero after an initial drop-before rebuild."""
         case_space = space_name + "_chaos_drop0"
         _ensure_all_ps_alive()
         resp = create_space(router_url, db_name,
@@ -1857,23 +1615,7 @@ class TestRebuildPSFailureExtras:
         drop_space(router_url, db_name, case_space)
 
     def test_restatus_map_resets_on_real_failure(self):
-        """3.4: After a rebuild that ends in status=failed (NOT cancelled),
-        the partition.ReStatusMap MUST NOT contain any ReplicasRebuilding
-        (=3) entries — they must be reset to ReplicasOK (=1) by the
-        finalize sweep (rebuild_service.go:1450
-        unmarkRebuildingForTerminalTasks).
-
-        Without this guarantee, a failed replica would stay 'invisible'
-        to the router forever, even after the user manually fixes the
-        underlying cause.
-
-        Setup: max_retries=1 + persistent ps2 kill. API 契约里
-        max_retries=0 表示"use default" (defaultMaxRetries=3),不是
-        "零重试"; 想在最少的重试次数下走完 "in-place retry → markFailed
-        → sibling cancel → unmarkRebuildingForTerminalTasks" 全链路,
-        max_retries=1 就够 — 一次 in-place retry 之后 markFailed,同款
-        marker 清扫路径,不会因为 retry 计数不同产生分支。
-        """
+        """Verifies terminal failure removes all rebuilding markers from replica status."""
         case_space = space_name + "_chaos_restatus_fail"
         _ensure_all_ps_alive()
         resp = create_space(router_url, db_name,
@@ -1884,8 +1626,6 @@ class TestRebuildPSFailureExtras:
             f"msg={body.get('msg')}")
         _populate(case_space, total=5000)
 
-        # max_retries=1 → 一次 in-place retry 后 markFailed,触发 sibling cancel
-        # + unmarkRebuildingForTerminalTasks 完整清扫路径。
         assert _trigger_rebuild(db_name, case_space,
                                 max_retries=1).json().get("code") == 0
         _wait_until_running(db_name, case_space, timeout=60)
@@ -1908,16 +1648,16 @@ class TestRebuildPSFailureExtras:
                     if r.status_code == 200:
                         partitions = (r.json().get("data") or {}).get("partitions")
                 except requests.exceptions.RequestException:
-                    # ps2 死期间 router 汇总分区信息会 hang 到超时 → 视为本轮
-                    # 拿不到,继续重试(等 leader 重选 / 集群稳定)。
+
+
                     partitions = None
                 if partitions:
                     break
                 time.sleep(2)
             if not partitions:
                 pytest.skip(
-                    "ps2 死期间 detail 持续返回空 partitions(leader 重选/"
-                    "集群降级),本次无法观测 ReStatusMap")
+                    "space details remained empty while ps2 was down due to leader election or "
+                    "cluster degradation, so ReStatusMap could not be observed")
 
             stuck_rebuilding = []
             for p in partitions:
@@ -1937,8 +1677,8 @@ class TestRebuildPSFailureExtras:
 
             # Bonus: search must still respond 200 (not stuck due to a
             # stale Rebuilding marker preventing replica from receiving
-            # query traffic). ps2 死期间 router 可能 hang,重试几次并容忍瞬时
-            # 超时;只要有一次正常响应即可。
+
+
             search_url = router_url + "/document/search?timeout=5000"
             search_data = {
                 "vector_value": False,
@@ -1959,17 +1699,11 @@ class TestRebuildPSFailureExtras:
                     sr = None
                 time.sleep(2)
             assert sr is not None and sr.status_code == 200, (
-                "post-failure search 始终未正常响应(ps2 死期间 router 持续"
-                f"hang/超时):{getattr(sr, 'text', 'no response')[:200]}")
+                "post-failure search never returned normally while ps2 was down and Router kept "
+                f"hanging or timing out: {getattr(sr, 'text', 'no response')[:200]}")
             logger.info("post-failure search response code=%s",
                          sr.json().get("code"))
         finally:
-            # best-effort:mid-rebuild kill 后 ps2 冷启动可能超过 30s
-            # (raft 追赶 + Gamma 引擎 reload + master lease 重认),
-            # 30s 超时不代表清理失败 — 下一条测试的 _ensure_all_ps_alive
-            # 会兜底 kill+restart 走完整的 KeepAlive 注册流程。
-            # 参见同文件 1.5 用例(test_partition_retry_forces_drop_before_zero)
-            # 的同款 pattern。
             try:
                 cl.start_ps(2, wait_ready=True, timeout=30)
             except Exception:
@@ -1977,13 +1711,7 @@ class TestRebuildPSFailureExtras:
         drop_space(router_url, db_name, case_space)
 
     def test_restatus_map_resets_on_cancelled_rebuild(self):
-        """A cancelled running rebuild must not leave router-visible
-        ReplicasRebuildingIndex markers behind.
-
-        Unlike the former standalone smoke test, this case first proves that
-        a concrete replica entered Rebuilding, then cancels the running record
-        and checks every replica after the record reaches a terminal state.
-        """
+        """Verifies cancellation removes all rebuilding markers from replica status."""
         case_space = space_name + "_chaos_restatus_cancel"
         _ensure_all_ps_alive()
         resp = create_space(
@@ -2043,35 +1771,7 @@ class TestRebuildPSFailureExtras:
         drop_space(router_url, db_name, case_space)
 
     def test_multi_target_fail_first_aborts_rest(self):
-        """6.8: 多 vector field 的 space 触发 rebuild 时,如果第一个 target
-        (HNSW) 因 partition retry 全部用完而失败,后续 target (IVFFLAT,
-        IVFPQ) 不能被 silently 推进。
-
-        Per design (rebuild_service.go:1599-1602):
-          "Any failed replica → finalize the whole record as failed.
-           We deliberately do NOT continue to the next target after a
-           failure because the user almost always wants to investigate
-           the failure first."
-
-        故障注入时序 (race-free):
-          rn=1 pn=1 ⇒ partition 仅有 1 个 replica,kill 后无 alternate;
-          触发 rebuild 后 *立刻* kill PS,而不是等到 running ——
-            master tick=2s, HTTP POST 返回到 SIGKILL 完成 < 200ms,远早于
-            master 第一次 dispatchPending tick → master 派发的 RPC 全部撞死
-            PS (connection refused) → maxDispatchAttempts=3 后 task 失败 →
-            partition retry × max_retries=1 后 record 终态 failed。
-          这条路径跳过了「引擎已完成 + master 还没来得及回收 completed」的
-          race,即使 HNSW 引擎工作只有几十 ms 也不会误判成 completed。
-
-        断言:
-          (1) 终态 status == failed
-          (2) indexes 数组长度 == 3 (HNSW + IVFFLAT + IVFPQ 都被识别为
-              IndexTarget)
-          (3) current_index == 1 (1-based,首个 target 即停;若静默推进了,
-              这里会变成 2 或 3)
-          (4) indexes[0] 是合法 vector target(target 顺序来自 SpaceProperties
-              map,不保证 = 字段声明顺序,故不假设首个一定是 HNSW)
-        """
+        """Verifies failure of the first index target aborts all later targets in a multi-index rebuild."""
         _ensure_clean_db()
 
         case_space = "%s_chaos_multi_fail_first_%d" % (
@@ -2079,9 +1779,6 @@ class TestRebuildPSFailureExtras:
         dim = xb.shape[1]
         _ensure_all_ps_alive()
 
-        # 三个 vector field 的 space, 参数对齐 comprehensive._multi3_cfg —
-        # 那套已经在 6.7 测试里被证实可以建出来。
-        # rn=1 pn=1: 单点, kill 后无 alternate 可挪 ⇒ 必然 failed。
         cfg = {
             "name": case_space, "partition_num": 1, "replica_num": 1,
             "fields": [
@@ -2139,7 +1836,7 @@ class TestRebuildPSFailureExtras:
             assert up.json().get("code") == 0, up.text
         waiting_index_finish(total, space_name=case_space)
 
-        # 找到唯一 partition 的唯一 replica 所在的 PS instance。
+
         kill_ps_idx = None
         try:
             pl = requests.get(f"{router_url}/partitions",
@@ -2169,35 +1866,26 @@ class TestRebuildPSFailureExtras:
             assert resp.json().get("code") == 0, resp.text
             cl.kill_ps(kill_ps_idx, hard=True)
 
-            # 等终态 (允许 failed)。
             final = _wait_terminal(db_name, case_space, timeout=300,
                                    allow_failed=True)
 
             # (1) status == failed
             assert final["status"] == "failed", (
-                f"expected failed (单 replica + 永久 kill 没法 retry 成功),"
+                f"expected failure because the only replica was killed permanently; "
                 f"got {final}"
             )
-
-            # (2) indexes 数组长度 == 3
             indexes = final.get("indexes") or []
             assert len(indexes) == 3, (
                 f"expected 3 IndexTargets (HNSW+IVFFLAT+IVFPQ), got "
                 f"{len(indexes)}: {indexes}"
             )
-
-            # (3) current_index == 1 (1-based;首 target 即停)
-            #     若静默推进到 IVFFLAT/IVFPQ,这里会是 2 或 3。
             cur = final.get("current_index")
             assert cur == 1, (
-                f"current_index 应该停在 1 (HNSW 首个 target 失败立即终态),"
-                f"实际为 {cur} — 这意味着失败后游标被静默推进到了下一个 "
-                f"target,违反 rebuild_service.go:1599-1602 的设计意图"
+                f"current_index must remain 1 after the first target fails; "
+                f"got {cur}, meaning failure silently advanced to another "
+                f"target contrary to rebuild_service.go fail-fast semantics"
             )
 
-            # (4) 失败确实发生在「第一个 target」上。#3 的 current_index==1
-            #     已证明游标停在首个 target,indexes[0] 按定义就是那个失败的
-            #     target。target 现在是 IndexName 字符串 (e.g. "gamma_a")。
             first_target = indexes[0]
             assert isinstance(first_target, str) and first_target, (
                 f"first target should be a non-empty index name, got: {first_target!r}"
@@ -2223,50 +1911,30 @@ class TestRebuildPSFailureExtras:
 
 
 # ===========================================================================
-# Concurrent search during rebuild
+# Category 5 — Concurrent search during rebuild
 # ===========================================================================
-
 class TestRebuildConcurrentWrites:
 
     def setup_class(self):
         _ensure_clean_db()
 
     def test_search_no_errors_during_rebuild(self):
-        """5.3: 持续 search 期间触发 rebuild,running 窗口内错误率应当低。
-
-        过去把 [baseline + rebuild_running + post_stop] 三段都揉成一个
-        err_rate,假阳性很高 — baseline 阶段的偶发错和 post 阶段集群刚
-        收尾的瞬态错都会把分子顶起来。改成按时间戳分段统计 rebuild
-        running 窗口内的 err_rate,并把错误样本打印到日志(否则失败
-        时只看到 "22.6%" 完全不知道是什么错)。
-
-        阈值放到 10%(在单机 chaos 集群上跑 rn=2 时,master→router cache
-        同步空挡 + per-partition 串行重建副本切换都会带来 1-3% 的瞬态错,
-        2% 不现实)。如果 ≥10% 那才是真有问题。
-        """
+        """Verifies search error rate stays below the allowed threshold during rebuild."""
         batch_size, total = 100, 10000
         case_space = space_name + "_chaos_search_load"
 
-        # rn=2 是本测试的硬前提:重建期间唯一 replica 被标 Rebuilding 后
-        # router 的 random 路由会把它过滤干净 (`randIDs=[]`),
-        # `replicaRoundRobin.Next(_, [])` 返回 nodeID=0,最后撞
-        # `create_rpcclient_failed` (code 703)。这条 503 错跟 rebuild
-        # 本身无关,纯粹是「单点 + 副本被滤」的副作用。如果集群规模
-        # 不够放 rn=2,直接 skip — 否则这条测试的语义不成立。
         cfg = _hnsw_cfg(case_space, pn=1, rn=2)
         resp = create_space(router_url, db_name, cfg)
         if resp.json().get("code") != 0:
             pytest.skip(
                 f"5.3 needs ≥2 PS to satisfy rn=2: {resp.json()}")
-        # 即便 create_space 返回 0,也要验证 placement 真的给了 2 份
-        # — 有些集群配置下 rn 会被静默降级,空看 code 不靠谱。
+
         detail0 = _get_space_detail(db_name, case_space)
         placement_check = []
         for p in detail0.get("partitions", []):
             rsm = p.get("replica_status") or {}
             placement_check.append((p.get("pid"), len(rsm), list(rsm.keys())))
-        # 注意 rsm 可能在创建后还没立刻写满,这里只用 raft_status.Replicas
-        # 这条权威源做断言。
+
         first = (detail0.get("partitions") or [{}])[0]
         raft_replicas = (first.get("raft_status") or {}).get("Replicas") or {}
         if len(raft_replicas) < 2:
@@ -2279,7 +1947,7 @@ class TestRebuildConcurrentWrites:
         waiting_index_finish(total, space_name=case_space)
 
         stop_evt = threading.Event()
-        # 改成存 (timestamp, kind, detail) 三元组,kind ∈ {ok, http_err, exception}
+
         events = []
         events_lock = threading.Lock()
 
@@ -2292,8 +1960,8 @@ class TestRebuildConcurrentWrites:
                 ts = time.time()
                 try:
                     rs = requests.post(url, auth=(username, password), json=data, timeout=10)
-                    # 关键: vearch router 在 status_code != 200 时 body 仍是
-                    # JSON 带 {code, msg};不要 silently 丢掉。
+
+
                     try:
                         body = rs.json()
                     except Exception:
@@ -2303,7 +1971,7 @@ class TestRebuildConcurrentWrites:
                         with events_lock:
                             events.append((ts, "ok", None))
                     else:
-                        # 把 HTTP status + vearch code + msg 全捕获
+
                         with events_lock:
                             events.append((ts, "http_err",
                                            (rs.status_code, code,
@@ -2316,15 +1984,12 @@ class TestRebuildConcurrentWrites:
 
         t = threading.Thread(target=search_loop, daemon=True)
         t.start()
-        time.sleep(2)  # 让 baseline 阶段先跑一会儿,稍后剔除
+        time.sleep(2)
 
         _wait_index_status_indexed(db_name, case_space)
         rebuild_start = time.time()
         assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
 
-        # 后台同步快照 ReStatusMap, 用于诊断 503/703 类错误时 partition 副本
-        # 状态: 重建途中是否出现「所有 replica 同时被标 Rebuilding」的窗口
-        # (即 router 视角下没有任何可用 replica → nodeID=0 → code=703)。
         restatus_snapshots = []  # list of (ts, {nodeID: state})
 
         def restatus_poller():
@@ -2350,9 +2015,8 @@ class TestRebuildConcurrentWrites:
         t.join(timeout=5)
         rs_thread.join(timeout=5)
 
-        # === 分段统计 ===
         # baseline:   ts < rebuild_start
-        # during:     rebuild_start <= ts <= rebuild_end (这是我们要 assert 的窗口)
+
         # post:       ts > rebuild_end
         baseline = [e for e in events if e[0] < rebuild_start]
         during   = [e for e in events if rebuild_start <= e[0] <= rebuild_end]
@@ -2364,11 +2028,11 @@ class TestRebuildConcurrentWrites:
             rate = len(errs) / max(1, len(slice_))
             logger.info("5.3 %s: n=%d ok=%d err=%d rate=%.2f%%",
                         label, len(slice_), ok, len(errs), rate * 100)
-            # 打前 5 条错误的细节,失败时方便定位
+
             if errs:
                 for ts, kind, detail in errs[:5]:
                     logger.info("    sample err (%s): %s", kind, detail)
-                # 按 (kind, http_status, vearch_code) 聚合 — 看错误是不是同源
+
                 from collections import Counter
                 buckets = Counter()
                 for _, kind, detail in errs:
@@ -2388,18 +2052,16 @@ class TestRebuildConcurrentWrites:
         rebuild_secs = rebuild_end - rebuild_start
         logger.info("5.3 rebuild window duration: %.1fs", rebuild_secs)
 
-        # 把 ReStatusMap 时序压成一行行 (相邻同状态 dedup), 看是否真出现
-        # 「所有 replica 同时 Rebuilding」的窗口。
         prev_state = None
         for ts, rsm in restatus_snapshots:
-            # 只统计有非 ReplicasOK 的快照 (Rebuilding=3 / NotReady=2 都算)
+
             non_ok = {nid: st for nid, st in rsm.items()
                       if st != "ReplicasOK"}
             if non_ok != prev_state:
                 logger.info("    ReStatusMap @%.2fs: %s",
                             ts - rebuild_start, rsm)
                 prev_state = non_ok
-        # 直接判:是否存在「所有 replica 同时 Rebuilding」的瞬间
+
         all_rebuilding_windows = []
         for ts, rsm in restatus_snapshots:
             if rsm and all(st == "ReplicasRebuildingIndex" for st in rsm.values()):
@@ -2412,16 +2074,13 @@ class TestRebuildConcurrentWrites:
                 len(all_rebuilding_windows), duration)
 
         assert len(during) >= 5, (
-            f"during-rebuild 样本太少 (n={len(during)});rebuild 太快或 search "
-            f"loop 太慢,无法统计真实 error rate")
+            f"too few during-rebuild samples (n={len(during)}); rebuild or search "
+            f"loop timing prevented a meaningful error-rate calculation")
 
-        # 真正的 assert:rebuild 窗口内 error rate < 10%。这个阈值容忍
-        # master→router cache 同步空挡 + per-partition 串行重建副本切换
-        # 这类瞬态错;真出现 ≥10% 那才是回归。
         assert during_rate < 0.10, (
             f"search error rate during rebuild = {during_rate:.2%}, "
-            f"超出 10% 容忍线;查看日志 'sample err' / 'error breakdown' "
-            f"定位是哪一种错")
+            f"exceeded the 10% threshold; inspect 'sample err' and 'error breakdown' "
+            f"logs to identify the error type")
         drop_space(router_url, db_name, case_space)
 
     def teardown_class(self):
