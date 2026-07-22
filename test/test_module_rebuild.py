@@ -30,20 +30,12 @@ Covers:
   7. DB-level trigger / query / cancel.
   8. Global-scope trigger / query / cancel.
 
-Each test class follows the standard pattern:
-    test_prepare_db    -> create_db
-    test_xxx           -> create_space -> add docs -> waiting_index_finish
-                        -> trigger rebuild -> verify -> check_search -> drop_space
-    test_destroy_db    -> drop_db
+Each test class resets the database in setup_class, exercises one API
+responsibility per test, and removes the database in teardown_class.
 """
 
 import json
-import os
-import shutil
 import time
-import threading
-import random
-import concurrent.futures
 
 import pytest
 import requests
@@ -75,9 +67,14 @@ def _trigger_rebuild(
     space: str,
     index_name: str = "",
     max_retries: int = 0,
+    drop_before_rebuild: bool = False,
+    describe: int = 0,
+    partition_id=None,
+    ensure_indexed: bool = False,
 ):
-    """POST /index/rebuild/dbs/:db/spaces/:space[/indexes/:index_name]
-    """
+    """Trigger a rebuild, optionally scoped to one index or partition."""
+    if ensure_indexed:
+        _wait_index_status_indexed(db, space)
     payload = {}
     if index_name:
         url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/indexes/{index_name}"
@@ -85,9 +82,21 @@ def _trigger_rebuild(
         url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}"
     if max_retries > 0:
         payload["max_retries"] = max_retries
+    if drop_before_rebuild:
+        payload["drop_before_rebuild"] = True
+    if describe > 0:
+        payload["describe"] = describe
+    if partition_id is not None:
+        payload["partition_id"] = partition_id
     resp = requests.post(url, auth=(username, password), json=payload)
     logger.info("trigger_rebuild url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
     return resp
+
+
+def _trigger_indexed_rebuild(db, space, **kwargs):
+    """Trigger rebuild after every partition has reached INDEXED."""
+    kwargs["ensure_indexed"] = True
+    return _trigger_rebuild(db, space, **kwargs)
 
 def _trigger_rebuild_db(db: str):
     """POST /index/rebuild/dbs/:db — rebuild all spaces in a DB."""
@@ -102,11 +111,6 @@ def _trigger_rebuild_global():
     resp = requests.post(url, auth=(username, password), json={})
     logger.info("trigger_rebuild_global url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
     return resp
-
-def _trigger_rebuild_drop(db, space):
-      url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}"
-      return requests.post(url, auth=(username, password),
-                           json={"drop_before_rebuild": True})
 
 def _get_rebuild_progress(db: str, space: str) -> dict:
     """GET /index/rebuild/dbs/:db/spaces/:space/progress"""
@@ -159,6 +163,7 @@ def _wait_rebuild_completed(
     space: str,
     timeout: int = 600,
     poll_interval: int = 3,
+    allow_failed: bool = False,
 ) -> list:
     """Poll progress until terminal. Returns chronological snapshots.
 
@@ -200,6 +205,8 @@ def _wait_rebuild_completed(
         if status == "completed":
             return snapshots
         if status == "failed":
+            if allow_failed:
+                return snapshots
             pytest.fail(
                 f"rebuild failed for {db}/{space}: {json.dumps(progress, indent=2)}"
             )
@@ -236,8 +243,13 @@ def _wait_index_status_indexed(
         time.sleep(poll_interval)
     pytest.fail(f"index_status did not reach INDEXED for {db}/{space} within {max_rounds} rounds")
 
-def _check_search(case_space_name: str, times: int = 5, db_name_override: str = ""):
-    """Light search smoke test after rebuild."""
+def _check_search(
+    case_space_name: str,
+    times: int = 5,
+    db_name_override: str = "",
+    field: str = "field_vector",
+):
+    """Run a strict search smoke test against the requested vector field."""
     target_db = db_name_override or db_name
     url = router_url + "/document/search?timeout=2000000"
     for i in range(times):
@@ -245,13 +257,12 @@ def _check_search(case_space_name: str, times: int = 5, db_name_override: str = 
             "vector_value": True,
             "db_name": target_db,
             "space_name": case_space_name,
-            "vectors": [{"field": "field_vector", "feature": xb[i : i + 1].flatten().tolist()}],
+            "vectors": [{"field": field, "feature": xb[i : i + 1].flatten().tolist()}],
         }
         rs = requests.post(url, auth=(username, password), json=data)
+        assert rs.status_code == 200, rs.text
         body = rs.json()
-        if body.get("code") != 0:
-            logger.warning("search returned non-zero code: %s", body)
-            continue
+        assert body.get("code") == 0, body
         documents = body["data"]["documents"]
         assert len(documents) == 1
 
@@ -310,25 +321,6 @@ def _compute_recall(case_space_name: str, k: int = 100) -> dict:
         "recall_at_1": recall1_hits / nq if nq else 0.0,
         "recall_at_10": recall10_hits / nq if nq else 0.0,
     }
-
-def _check_search_field(case_space_name: str, field: str, times: int = 3, db_name_override: str = ""):
-    """Search smoke test targeting a specific vector field."""
-    target_db = db_name_override or db_name
-    url = router_url + "/document/search?timeout=2000000"
-    for i in range(times):
-        data = {
-            "vector_value": True,
-            "db_name": target_db,
-            "space_name": case_space_name,
-            "vectors": [{"field": field, "feature": xb[i : i + 1].flatten().tolist()}],
-        }
-        rs = requests.post(url, auth=(username, password), json=data)
-        body = rs.json()
-        if body.get("code") != 0:
-            logger.warning("search returned non-zero code: %s", body)
-            continue
-        documents = body["data"]["documents"]
-        assert len(documents) == 1
 
 def _ensure_clean_db():
     """Drop all spaces then drop DB, then create a fresh DB.
@@ -456,10 +448,12 @@ def _multi_vector_space_config(name: str, partition_num: int = 1) -> dict:
         ],
     }
 
-def _ivfflat_space_config(name: str, partition_num: int = 1) -> dict:
+def _ivfflat_space_config(
+    name: str, partition_num: int = 1, replica_num: int = 1
+) -> dict:
     embedding_size = xb.shape[1]
     return {
-        "name": name, "partition_num": partition_num, "replica_num": 1,
+        "name": name, "partition_num": partition_num, "replica_num": replica_num,
         "fields": [
             {"name": "field_int", "type": "integer"},
             {"name": "field_vector", "type": "vector",
@@ -469,10 +463,12 @@ def _ivfflat_space_config(name: str, partition_num: int = 1) -> dict:
         ],
     }
 
-def _ivfpq_space_config(name: str, partition_num: int = 1) -> dict:
+def _ivfpq_space_config(
+    name: str, partition_num: int = 1, replica_num: int = 1
+) -> dict:
     embedding_size = xb.shape[1]
     return {
-        "name": name, "partition_num": partition_num, "replica_num": 1,
+        "name": name, "partition_num": partition_num, "replica_num": replica_num,
         "fields": [
             {"name": "field_int", "type": "integer"},
             {"name": "field_vector", "type": "vector",
@@ -486,8 +482,11 @@ def _ivfpq_space_config(name: str, partition_num: int = 1) -> dict:
 # 1. Basic lifecycle
 # ---------------------------------------------------------------------------
 
-def _add_multi_vector_docs(space_name: str):
-    """Insert documents with two vector fields (field_vector_a, field_vector_b).
+def _add_multi_vector_docs(
+    space_name: str,
+    field_names=("field_vector_a", "field_vector_b"),
+):
+    """Insert documents containing each requested vector field.
 
     The generic ``add()`` helper hard-codes ``field_vector``, which does not
     exist on multi-vector spaces. We build the payload inline instead.
@@ -505,9 +504,9 @@ def _add_multi_vector_docs(space_name: str):
             docs.append({
                 "_id": str(doc_id),
                 "field_int": doc_id,
-                "field_vector_a": xb[i * batch_size + j].tolist(),
-                "field_vector_b": xb[i * batch_size + j].tolist(),
             })
+            for field in field_names:
+                docs[-1][field] = xb[doc_id].tolist()
         data = {"db_name": db_name, "space_name": space_name, "documents": docs}
         rs = requests.post(url, auth=(username, password), json=data)
         body = rs.json()
@@ -516,20 +515,151 @@ def _add_multi_vector_docs(space_name: str):
         assert body.get("code") == 0, f"add docs failed batch {i}: {body}"
     waiting_index_finish(total, space_name=space_name)
 
+
+def _create_populated_hnsw_space(case_space: str, total: int = 5000):
+    """Create a one-partition HNSW space and wait until it is indexed."""
+    batch_size = 100
+    config = _hnsw_space_config(case_space, partition_num=1)
+    assert create_space(router_url, db_name, config).json()["code"] == 0
+    add(total // batch_size, batch_size, xb[:total], True, True,
+        space_name=case_space)
+    waiting_index_finish(total, space_name=case_space)
+
+
+def _run_rebuild_lifecycle(
+    case_space,
+    config=None,
+    total=10000,
+    rebuild_timeout=600,
+    index_indexed_max_rounds=180,
+    do_search=True,
+):
+    """Run the common create/add/rebuild/verify lifecycle.
+
+    Pass ``config=None`` when the caller already created the space, for
+    example after checking whether an optional index type is supported.
+    """
+    if config is not None:
+        assert create_space(router_url, db_name, config).json()["code"] == 0
+    batch_size = 100
+    add(total // batch_size, batch_size, xb[:total], True, False,
+        space_name=case_space)
+    waiting_index_finish(total, space_name=case_space)
+    pre_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
+
+    assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
+    _wait_rebuild_completed(db_name, case_space, timeout=rebuild_timeout)
+    _wait_index_status_indexed(
+        db_name, case_space, max_rounds=index_indexed_max_rounds)
+
+    post_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
+    assert post_doc_num == pre_doc_num
+    if do_search:
+        _check_search(case_space, times=3)
+
+
+def _wait_tasks_visible(db, space, timeout=30, poll_interval=0.5):
+    """Wait until asynchronous scheduler expansion exposes task details."""
+    deadline = time.time() + timeout
+    progress = _get_rebuild_progress(db, space)
+    while time.time() < deadline:
+        progress = _get_rebuild_progress(db, space)
+        if progress.get("tasks"):
+            return progress
+        if progress.get("status") in ("completed", "failed", "cancelled"):
+            return progress
+        time.sleep(poll_interval)
+    return progress
+
+
+def _get_space_detail(db, space):
+    url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
+    rs = requests.get(url, auth=(username, password))
+    body = rs.json()
+    assert body.get("code") == 0, body
+    return body.get("data", {})
+
+
+def _delete_documents(db, space, doc_ids):
+    url = router_url + "/document/delete?timeout=300000"
+    batch = 200
+    for start in range(0, len(doc_ids), batch):
+        chunk = doc_ids[start:start + batch]
+        data = {
+            "db_name": db,
+            "space_name": space,
+            "document_ids": [str(doc_id) for doc_id in chunk],
+        }
+        resp = requests.post(url, auth=(username, password), json=data)
+        assert resp.json().get("code") == 0, f"delete failed: {resp.json()}"
+
+
+def _query_document(db, space, doc_id):
+    url = router_url + "/document/query"
+    data = {
+        "db_name": db,
+        "space_name": space,
+        "document_ids": [doc_id],
+        "fields": ["field_int", "field_vector"],
+    }
+    return requests.post(url, auth=(username, password), json=data).json()
+
+
+def _ivfrabitq_space_config(name, partition_num=1, replica_num=1):
+    dim = xb.shape[1]
+    return {
+        "name": name,
+        "partition_num": partition_num,
+        "replica_num": replica_num,
+        "fields": [
+            {"name": "field_int", "type": "integer"},
+            {"name": "field_vector", "type": "vector",
+             "index": {"name": "gamma", "type": "IVFRABITQ",
+                       "params": {"metric_type": "InnerProduct",
+                                  "ncentroids": 128,
+                                  "training_threshold": 4992}},
+             "dimension": dim},
+        ],
+    }
+
+
+def _multi3_space_config(name, partition_num=1, replica_num=1):
+    """Create a space with HNSW, IVFFLAT, and IVFPQ vector indexes."""
+    dim = xb.shape[1]
+    index_specs = [
+        ("field_vector_a", "gamma_a", "HNSW",
+         {"metric_type": "L2", "nlinks": 32, "efConstruction": 40,
+          "training_threshold": 1}),
+        ("field_vector_b", "gamma_b", "IVFFLAT",
+         {"metric_type": "L2", "ncentroids": 32, "nprobe": 8,
+          "training_threshold": 1248}),
+        ("field_vector_c", "gamma_c", "IVFPQ",
+         {"metric_type": "InnerProduct", "ncentroids": 32, "nprobe": 8,
+          "nsubvector": 32, "training_threshold": 1248}),
+    ]
+    fields = [{"name": "field_int", "type": "integer"}]
+    for field, index, index_type, params in index_specs:
+        fields.append({
+            "name": field,
+            "type": "vector",
+            "index": {"name": index, "type": index_type, "params": params},
+            "dimension": dim,
+        })
+    return {"name": name, "partition_num": partition_num,
+            "replica_num": replica_num, "fields": fields}
+
+
 class TestRebuildBasicLifecycle:
     """Trigger space-level rebuild and verify completion."""
 
     def setup_class(self):
         # Do the db reset once per class before any method runs, so that
         # single-method pytest invocations (-k / IDE run) also see a
-        # fresh db instead of hitting DB_NOT_EXIST from the previous
-        # class's test_destroy_db.
-        _ensure_clean_db()
-
-    def test_prepare_db(self):
+        # fresh db instead of depending on the previous class's teardown.
         _ensure_clean_db()
 
     def test_rebuild_hnsw_full_space(self):
+        """Rebuild HNSW and verify lifecycle plus search-result stability."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
@@ -538,32 +668,45 @@ class TestRebuildBasicLifecycle:
         assert create_space(router_url, db_name, _hnsw_space_config(case_space)).json()["code"] == 0
         add(total_batch, batch_size, xb, True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
+        _wait_index_status_indexed(db_name, case_space)
 
-        # ---- Compute recall BEFORE rebuild ----
-        recall_before = _compute_recall(case_space, k=100)
-        logger.info(
-            "recall BEFORE rebuild: recall@1=%.4f recall@10=%.4f",
-            recall_before["recall_at_1"], recall_before["recall_at_10"],
-        )
+        def topk(query_index):
+            response = requests.post(
+                router_url + "/document/search?timeout=10000",
+                auth=(username, password),
+                json={
+                    "vector_value": False,
+                    "db_name": db_name,
+                    "space_name": case_space,
+                    "vectors": [{
+                        "field": "field_vector",
+                        "feature": xq[query_index].tolist(),
+                    }],
+                    "fields": ["field_int"],
+                    "limit": 10,
+                },
+                timeout=10,
+            )
+            body = response.json()
+            assert body.get("code") == 0, body
+            documents = body.get("data", {}).get("documents", [[]])
+            results = (
+                documents[0]
+                if documents and isinstance(documents[0], list)
+                else documents
+            )
+            values = [
+                doc["field_int"] for doc in results
+                if doc.get("field_int") is not None
+            ]
+            assert values, body
+            return values
 
-        # Diagnostic: test rebuild route via both Router and Master directly
-        rebuild_url_via_router = f"{router_url}/index/rebuild/dbs/{db_name}/spaces/{case_space}"
-        rebuild_url_via_master = f"{master_url}/index/rebuild/dbs/{db_name}/spaces/{case_space}"
-        logger.info("rebuild URL via router: %s", rebuild_url_via_router)
-        logger.info("rebuild URL via master: %s", rebuild_url_via_master)
-
-        # Try Master directly to isolate routing issues
-        master_resp = requests.post(rebuild_url_via_master, auth=(username, password), json={})
-        logger.info("master direct rebuild: status=%d body=%s", master_resp.status_code, master_resp.text[:500])
+        query_count = 100
+        results_before = [topk(i) for i in range(query_count)]
 
         resp = _trigger_rebuild(db_name, case_space)
-        assert resp.status_code == 200, (
-            f"rebuild trigger failed: status={resp.status_code} body={resp.text[:500]}\n"
-            f"URL={rebuild_url_via_router}\n"
-            f"Master direct: status={master_resp.status_code} body={master_resp.text[:500]}\n"
-            f"If both return 404, the running vearch binary may not include rebuild routes — "
-            f"rebuild with 'make build' and restart the cluster."
-        )
+        assert resp.status_code == 200, resp.text
         body = resp.json()
         logger.info("rebuild trigger response: %s", body)
         assert body.get("code") == 0, body
@@ -572,12 +715,23 @@ class TestRebuildBasicLifecycle:
         _wait_index_status_indexed(db_name, case_space)
         _check_search(case_space)
 
-        # ---- Compute recall AFTER rebuild ----
-        recall_after = _compute_recall(case_space, k=100)
+        results_after = [topk(i) for i in range(query_count)]
+        top1_rate = sum(
+            before[0] == after[0]
+            for before, after in zip(results_before, results_after)
+        ) / query_count
+        jaccard_avg = sum(
+            len(set(before) & set(after))
+            / max(1, len(set(before) | set(after)))
+            for before, after in zip(results_before, results_after)
+        ) / query_count
         logger.info(
-            "recall AFTER rebuild: recall@1=%.4f recall@10=%.4f",
-            recall_after["recall_at_1"], recall_after["recall_at_10"],
+            "HNSW search stability after rebuild: top1=%.3f jaccard=%.3f",
+            top1_rate, jaccard_avg,
         )
+        assert top1_rate >= 0.90, f"top1 hit rate too low: {top1_rate:.3f}"
+        assert jaccard_avg >= 0.85, f"jaccard too low: {jaccard_avg:.3f}"
+        drop_space(router_url, db_name, case_space)
 
     def test_rebuild_all_spaces_in_db(self):
         """Trigger DB-level rebuild (POST /index/rebuild/dbs/:db) which
@@ -607,7 +761,9 @@ class TestRebuildBasicLifecycle:
 
         # Both spaces should appear in the DB-level progress summary.
         summary = _list_rebuild_progress(db_name)
-        rebuilt_keys = {r["space_key"] for r in summary.get("results", [])}
+        rebuilt_keys = {
+            r["space_key"] for r in (summary.get("results") or [])
+        }
         assert f"{db_name}-{sp_a}" in rebuilt_keys, f"{sp_a} not in {rebuilt_keys}"
         assert f"{db_name}-{sp_b}" in rebuilt_keys, f"{sp_b} not in {rebuilt_keys}"
 
@@ -672,7 +828,7 @@ class TestRebuildBasicLifecycle:
         # because the index has never been built (index_status=UNINDEXED).
         # The top-level code is 0 (the HTTP request itself succeeded), but
         # the rejection appears in data.failures.
-        resp = _trigger_rebuild(db_name, case_space)
+        resp = _trigger_rebuild(db_name, case_space, ensure_indexed=False)
         body = resp.json()
         logger.info("rebuild trigger for unindexed space: %s", body)
 
@@ -708,7 +864,7 @@ class TestRebuildBasicLifecycle:
 
         # First rebuild — should succeed.
         first = _trigger_rebuild(db_name, case_space).json()
-        first_results = first.get("data", {}).get("results", [])
+        first_results = first.get("data", {}).get("results") or []
         assert len(first_results) > 0, f"first rebuild should succeed: {first}"
 
         # Second rebuild — should be rejected (space already has a
@@ -727,15 +883,20 @@ class TestRebuildBasicLifecycle:
         )
 
         # Wait for the first rebuild to complete.
-        _wait_rebuild_completed(db_name, case_space, timeout=300)
+        first_snapshots = _wait_rebuild_completed(
+            db_name, case_space, timeout=300)
+        first_enqueued_at = first_snapshots[-1].get("enqueued_at")
         _wait_index_status_indexed(db_name, case_space)
 
         # After completion, a new rebuild should be accepted (terminal
         # records can be overwritten).
         third = _trigger_rebuild(db_name, case_space).json()
-        third_results = third.get("data", {}).get("results", [])
+        third_results = third.get("data", {}).get("results") or []
         assert len(third_results) > 0, f"rebuild after completion should succeed: {third}"
-        _wait_rebuild_completed(db_name, case_space, timeout=300)
+        third_snapshots = _wait_rebuild_completed(
+            db_name, case_space, timeout=300)
+        assert third_snapshots[-1].get("enqueued_at") != first_enqueued_at, (
+            "completed rebuild record was not replaced by the new request")
 
         drop_space(router_url, db_name, case_space)
 
@@ -867,7 +1028,9 @@ class TestRebuildBasicLifecycle:
         )
 
         # Trigger rebuild with drop_before_rebuild=True.
-        resp = _trigger_rebuild_drop(db_name, case_space)
+        resp = _trigger_rebuild(
+            db_name, case_space, drop_before_rebuild=True
+        )
         assert resp.status_code == 200, f"trigger failed: {resp.text[:500]}"
         body = resp.json()
         assert body.get("code") == 0, body
@@ -893,7 +1056,7 @@ class TestRebuildBasicLifecycle:
 
         drop_space(router_url, db_name, case_space)
 
-    def test_destroy_db(self):
+    def teardown_class(self):
         drop_db(router_url, db_name)
 
 # ---------------------------------------------------------------------------
@@ -904,9 +1067,6 @@ class TestRebuildProgressQuery:
     """Verify progress API shape, monotonicity, and detail."""
 
     def setup_class(self):
-        _ensure_clean_db()
-
-    def test_prepare_db(self):
         _ensure_clean_db()
 
     def test_progress_missing_record_returns_error(self):
@@ -1129,7 +1289,7 @@ class TestRebuildProgressQuery:
         # Query global progress — should contain all 3 spaces.
         global_progress = _list_rebuild_progress()
         logger.info("global progress: %s", json.dumps(global_progress, indent=2, default=str))
-        results = global_progress.get("results", [])
+        results = global_progress.get("results") or []
         space_keys = [r.get("space_key", "") for r in results]
 
         assert any(sp_main_a in k for k in space_keys), f"sp_main_a not found in global progress: {space_keys}"
@@ -1151,7 +1311,7 @@ class TestRebuildProgressQuery:
         drop_db(router_url, extra_db)
 
 
-    def test_destroy_db(self):
+    def teardown_class(self):
         drop_db(router_url, db_name)
 
 # ---------------------------------------------------------------------------
@@ -1175,9 +1335,6 @@ class TestCancelRebuild:
         return chr(ord('a') + idx)
 
     def setup_class(self):
-        _ensure_clean_db()
-
-    def test_prepare_db(self):
         _ensure_clean_db()
 
     def test_cancel_pending_and_running(self):
@@ -1223,7 +1380,7 @@ class TestCancelRebuild:
             logger.info("cancel response for %s: %s", sp, body)
             assert body.get("code") == 0, body
             data = body.get("data", {})
-            results = data.get("results", [])
+            results = data.get("results") or []
             if results:
                 cancel_results.append(results[0])
 
@@ -1407,7 +1564,7 @@ class TestCancelRebuild:
         assert cancel_body.get("code") == 0, cancel_body
 
         data = cancel_body.get("data", {})
-        results = data.get("results", [])
+        results = data.get("results") or []
         failures = data.get("failures", [])
 
         # The targeted space should appear in results (record exists)
@@ -1435,10 +1592,9 @@ class TestCancelRebuild:
         # Verify the other 3 spaces are NOT cancelled by this targeted cancel.
         for db, sp in [(db_name, sp_a), (extra_db, sp_c), (extra_db, sp_d)]:
             progress = _get_rebuild_progress(db, sp)
-            # They may be in any state EXCEPT cancelled (targeted cancel
-            # only affects the specified space).
-            if progress["status"] == "cancelled":
-                logger.warning("unexpected cancelled status for %s/%s (not targeted by cancel)", db, sp)
+            assert progress["status"] != "cancelled", (
+                f"targeted cancel leaked from {db_name}/{sp_b} to {db}/{sp}: "
+                f"{progress}")
 
         # Wait for all rebuilds to reach a terminal state.
         for db, sp in [(db_name, sp_a), (db_name, sp_b), (extra_db, sp_c), (extra_db, sp_d)]:
@@ -1454,69 +1610,70 @@ class TestCancelRebuild:
             drop_space(router_url, extra_db, sp)
         drop_db(router_url, extra_db)
 
-    def test_cancel_db_and_global_pending_rebuilds(self):
-        """Only some spaces in the DB are rebuilding; cancel all rebuilds
-        in the DB and verify pending spaces are cancelled.
-
-        Uses HNSW indexes (slower rebuild than FLAT) so that spaces
-        remain in pending state long enough to be cancelled.
-        """
+    def test_global_cancel_across_databases(self):
+        """Global cancel returns and settles rebuild records across DBs."""
         batch_size = 100
         total = xb.shape[0]
         total_batch = int(total / batch_size)
+        extra_db = db_name + "_mri_global_cancel"
+        targets = [
+            (db_name, space_name + "_mri_global_cancel_main"),
+            (extra_db, space_name + "_mri_global_cancel_extra"),
+        ]
 
-        sp_x = space_name + "_mri_cancel_db_x"
-        sp_y = space_name + "_mri_cancel_db_y"
-        sp_z = space_name + "_mri_cancel_db_z"
+        drop_db(router_url, extra_db)
+        create_db(router_url, extra_db)
+        try:
+            for db, sp in targets:
+                assert create_space(
+                    router_url, db,
+                    _hnsw_space_config(sp, partition_num=2),
+                ).json()["code"] == 0
+                add(total_batch, batch_size, xb, True, True,
+                    db_name=db, space_name=sp)
+                waiting_index_finish(total, db_name=db, space_name=sp)
 
-        for sp in (sp_x, sp_y, sp_z):
-            assert create_space(router_url, db_name, _hnsw_space_config(sp)).json()["code"] == 0
-            add(total_batch, batch_size, xb, True, False, space_name=sp)
-            waiting_index_finish(total, space_name=sp)
-
-        # Only rebuild sp_x and sp_y, NOT sp_z.
-        for sp in (sp_x, sp_y):
-            resp = _trigger_rebuild(db_name, sp)
+            resp = _trigger_rebuild_global()
             assert resp.json().get("code") == 0, resp.text
+            time.sleep(1)
 
-        # HNSW rebuilds are slower; give the scheduler time to start
-        # some but not all spaces, so some remain pending.
-        time.sleep(5)
+            cancel_resp = _cancel_rebuild_global()
+            body = cancel_resp.json()
+            logger.info("global cancel response: %s", body)
+            assert body.get("code") == 0, body
 
-        # Cancel all rebuilds in this DB.
-        db_cancel_resp = _cancel_rebuild_db(db_name)
-        db_cancel_body = db_cancel_resp.json()
-        logger.info("DB-level cancel response: %s", db_cancel_body)
-        assert db_cancel_body.get("code") == 0, db_cancel_body
+            results = body.get("data", {}).get("results") or []
+            result_keys = {
+                (entry.get("db_name"), entry.get("space_name"))
+                for entry in results
+            }
+            assert set(targets).issubset(result_keys), (
+                f"global cancel omitted rebuild records: "
+                f"expected={targets}, results={results}"
+            )
+            for entry in results:
+                key = (entry.get("db_name"), entry.get("space_name"))
+                if key in targets:
+                    self._assert_cancel_entry_reason(
+                        entry, sp_label=f"{key[0]}/{key[1]}"
+                    )
 
-        db_results = db_cancel_body.get("data", {}).get("results", [])
-
-        # Verify pending spaces were cancelled.
-        cancelled_names = {r["space_name"] for r in db_results if r.get("cancelled")}
-        logger.info("cancelled spaces: %s", cancelled_names)
-
-        # With HNSW indexes and 5s wait, at least one of sp_x/sp_y
-        # should still be pending → cancelled.
-        if len(cancelled_names) >= 1:
-            logger.info("successfully cancelled pending rebuild(s): %s", cancelled_names)
-            for name in cancelled_names:
-                progress = _get_rebuild_progress(db_name, name)
-                assert progress["status"] == "cancelled", (
-                    f"{name} should be cancelled, got {progress['status']}"
-                )
-        else:
-            logger.info("no pending rebuilds were caught (rebuilds too fast on this machine)")
-
-        # Only sp_x and sp_y have rebuild records. Wait for any running
-        # rebuilds to complete before cleaning up all three spaces.
-        for sp in (sp_x, sp_y):
-            progress = _get_rebuild_progress(db_name, sp)
-            if progress["status"] == "running":
-                _wait_rebuild_completed(db_name, sp, timeout=600)
-
-        for sp in (sp_x, sp_y, sp_z):
-            _wait_index_status_indexed(db_name, sp)
-            drop_space(router_url, db_name, sp)
+            for db, sp in targets:
+                progress = _get_rebuild_progress(db, sp)
+                if progress["status"] == "running":
+                    progress = _wait_rebuild_completed(
+                        db, sp, timeout=600
+                    )[-1]
+                assert progress["status"] in ("completed", "cancelled"), progress
+                assert progress.get("pending_tasks", 0) == 0, progress
+                if progress["status"] == "cancelled":
+                    for task in progress.get("tasks") or []:
+                        assert task["status"] != "pending", task
+                _wait_index_status_indexed(db, sp)
+        finally:
+            for db, sp in targets:
+                drop_space(router_url, db, sp)
+            drop_db(router_url, extra_db)
 
     def test_cancel_nonexistent_completed_already_cancelled(self):
         """Cancel rebuild in various terminal / edge states:
@@ -1548,7 +1705,7 @@ class TestCancelRebuild:
         logger.info("cancel auto-built space response: %s", cancel_body)
         assert cancel_body.get("code") == 0, cancel_body
 
-        results1 = cancel_body.get("data", {}).get("results", [])
+        results1 = cancel_body.get("data", {}).get("results") or []
         failures1 = cancel_body.get("data", {}).get("failures", [])
         # The auto-built index creates a completed rebuild record, so
         # the cancel should appear in results (not failures) with
@@ -1577,7 +1734,7 @@ class TestCancelRebuild:
         cancel_body2 = cancel_resp2.json()
         logger.info("cancel completed rebuild response: %s", cancel_body2)
 
-        results2 = cancel_body2.get("data", {}).get("results", [])
+        results2 = cancel_body2.get("data", {}).get("results") or []
         # The completed rebuild should appear in results with cancelled=False.
         completed_entry = None
         for r in results2:
@@ -1619,7 +1776,7 @@ class TestCancelRebuild:
         first_body = first_cancel.json()
         logger.info("first cancel of sp_b: %s", first_body)
 
-        first_results = first_body.get("data", {}).get("results", [])
+        first_results = first_body.get("data", {}).get("results") or []
         if first_results:
             first_entry = first_results[0]
             self._assert_cancel_entry_reason(first_entry, sp_label=sp_b + " (first cancel)")
@@ -1631,7 +1788,7 @@ class TestCancelRebuild:
             second_body = second_cancel.json()
             logger.info("second cancel of already-cancelled sp_b: %s", second_body)
 
-            results3 = second_body.get("data", {}).get("results", [])
+            results3 = second_body.get("data", {}).get("results") or []
             already_entry = None
             for r in results3:
                 if r.get("space_name") == sp_b:
@@ -1703,7 +1860,7 @@ class TestCancelRebuild:
         logger.info("cancel multi-target rebuild: %s", cancel_body)
         assert cancel_body.get("code") == 0, cancel_body
 
-        results = cancel_body.get("data", {}).get("results", [])
+        results = cancel_body.get("data", {}).get("results") or []
         assert results, cancel_body
         entry = results[0]
         self._assert_cancel_entry_reason(entry, sp_label=case_space)
@@ -1793,7 +1950,7 @@ class TestCancelRebuild:
         assert cancel_body.get("code") == 0, cancel_body
 
         data = cancel_body.get("data", {})
-        results = data.get("results", [])
+        results = data.get("results") or []
         failures = data.get("failures", [])
 
         # The space with a rebuild record must appear.
@@ -1822,7 +1979,7 @@ class TestCancelRebuild:
             _wait_index_status_indexed(db_name, sp)
             drop_space(router_url, db_name, sp)
 
-    def test_destroy_db(self):
+    def teardown_class(self):
         drop_db(router_url, db_name)
 
 # ---------------------------------------------------------------------------
@@ -1835,103 +1992,8 @@ class TestRebuildPerField:
     def setup_class(self):
         _ensure_clean_db()
 
-    def test_prepare_db(self):
-        _ensure_clean_db()
-
-    def test_search_routes_each_field_to_its_named_index(self):
-        """Search resolves field_name -> index_name without crossing indexes.
-
-        The two documents deliberately store opposite vectors in the two
-        fields.  A zero-vector query must therefore hit a different document
-        depending on the requested field.  A missing field->index mapping, or
-        routing both fields to the same named index, makes this assertion fail.
-        """
-        case_space = space_name + "_mri_search_index_route"
-        assert create_space(
-            router_url, db_name, _multi_vector_space_config(case_space)
-        ).json()["code"] == 0
-
-        zero = [0.0] * xb.shape[1]
-        one = [1.0] * xb.shape[1]
-        data = {
-            "db_name": db_name,
-            "space_name": case_space,
-            "documents": [
-                {
-                    "_id": "doc_a",
-                    "field_int": 0,
-                    "field_vector_a": zero,
-                    "field_vector_b": one,
-                },
-                {
-                    "_id": "doc_b",
-                    "field_int": 1,
-                    "field_vector_a": one,
-                    "field_vector_b": zero,
-                },
-            ],
-        }
-        try:
-            rs = requests.post(
-                router_url + "/document/upsert?timeout=2000000",
-                auth=(username, password), json=data,
-            )
-            assert rs.json().get("code") == 0, rs.text
-            waiting_index_finish(2, timewait=1, space_name=case_space)
-
-            def search_top1(field):
-                query = {
-                    "vector_value": False,
-                    "db_name": db_name,
-                    "space_name": case_space,
-                    "vectors": [{"field": field, "feature": zero}],
-                    "fields": ["field_int"],
-                    "limit": 1,
-                }
-                response = requests.post(
-                    router_url + "/document/search?timeout=2000000",
-                    auth=(username, password), json=query,
-                )
-                body = response.json()
-                assert body.get("code") == 0, body
-                documents = body["data"]["documents"]
-                results = documents[0] if isinstance(documents[0], list) else documents
-                assert len(results) == 1, body
-                return results[0]["field_int"]
-
-            assert search_top1("field_vector_a") == 0
-            assert search_top1("field_vector_b") == 1
-        finally:
-            drop_space(router_url, db_name, case_space)
-
-    def test_per_field_rebuild_hnsw(self):
-        """Rebuild field_vector_a / HNSW on a multi-vector space."""
-        case_space = space_name + "_mri_perfield_hnsw"
-        assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
-        _add_multi_vector_docs(case_space)
-
-        resp = _trigger_rebuild(db_name, case_space, index_name="gamma_a")
-        body = resp.json()
-        logger.info("per-field rebuild trigger response: %s", body)
-        assert body.get("code") == 0, body
-
-        first = _get_rebuild_progress(db_name, case_space)
-        indexes = first.get("indexes", [])
-        assert len(indexes) == 1, f"expected 1 index target, got {indexes}"
-        assert indexes[0] == "gamma_a"
-        logger.info("rebuild detail: db_name %s, space_name %s, index_name %s",
-                    db_name, case_space, indexes[0])
-
-        snapshots = _wait_rebuild_completed(db_name, case_space, timeout=600)
-        assert snapshots[-1]["status"] == "completed"
-
-        _wait_index_status_indexed(db_name, case_space)
-        _check_search_field(case_space, field="field_vector_a")
-        _check_search_field(case_space, field="field_vector_b")
-        drop_space(router_url, db_name, case_space)
-
-    def test_per_field_rebuild_flat(self):
-        """Rebuild field_vector_b / FLAT on a multi-vector space."""
+    def test_rebuild_named_non_first_index_only(self):
+        """Rebuild only the second named index in a multi-index space."""
         case_space = space_name + "_mri_perfield_flat"
         assert create_space(router_url, db_name, _multi_vector_space_config(case_space)).json()["code"] == 0
         _add_multi_vector_docs(case_space)
@@ -1941,41 +2003,20 @@ class TestRebuildPerField:
         logger.info("per-field rebuild flat trigger response: %s", body)
         assert body.get("code") == 0, body
 
-        first = _get_rebuild_progress(db_name, case_space)
+        first = _wait_tasks_visible(db_name, case_space, timeout=30)
         indexes = first.get("indexes", [])
         assert len(indexes) == 1, f"expected 1 index target, got {indexes}"
         assert indexes[0] == "gamma_b"
 
-        _wait_rebuild_completed(db_name, case_space, timeout=600)
-        _wait_index_status_indexed(db_name, case_space)
-        _check_search_field(case_space, field="field_vector_a")
-        _check_search_field(case_space, field="field_vector_b")
-        drop_space(router_url, db_name, case_space)
-
-    def test_rebuild_single_field_on_single_vector_space(self):
-        """Rebuild a single-field space by specifying (field, indexType) explicitly."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_mri_single_field"
-
-        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=1)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        resp = _trigger_rebuild(db_name, case_space, index_name="gamma")
-        body = resp.json()
-        logger.info("single-field per-target rebuild response: %s", body)
-        assert body.get("code") == 0, body
-
-        first = _get_rebuild_progress(db_name, case_space)
-        indexes = first.get("indexes", [])
-        assert len(indexes) == 1, f"expected 1 index target, got {indexes}"
-        assert indexes[0] == "gamma"
+        tasks = first.get("tasks") or []
+        assert tasks, f"expected visible gamma_b tasks, got {first}"
+        for task in tasks:
+            assert task.get("index_name") == "gamma_b", task
 
         _wait_rebuild_completed(db_name, case_space, timeout=600)
         _wait_index_status_indexed(db_name, case_space)
-        _check_search(case_space)
+        _check_search(case_space, field="field_vector_a")
+        _check_search(case_space, field="field_vector_b")
         drop_space(router_url, db_name, case_space)
 
     def test_rebuild_nonexistent_index_rejected(self):
@@ -2038,95 +2079,13 @@ class TestRebuildPerField:
 
         # Verify index status is healthy and search still works.
         _wait_index_status_indexed(db_name, case_space)
-        _check_search_field(case_space, field="field_vector_a")
-        _check_search_field(case_space, field="field_vector_b")
+        _check_search(case_space, field="field_vector_a")
+        _check_search(case_space, field="field_vector_b")
 
         drop_space(router_url, db_name, case_space)
 
-    def test_destroy_db(self):
+    def teardown_class(self):
         drop_db(router_url, db_name)
-
-# ---------------------------------------------------------------------------
-# 8. Global-scope trigger / query / cancel
-# ---------------------------------------------------------------------------
-
-class TestRebuildGlobalScope:
-    """Exercise the global rebuild endpoints.
-
-    POST /index/rebuild                            — trigger all DBs
-    GET  /index/rebuild/progress                    — global summary
-    POST /index/rebuild/cancel                     — cancel all DBs
-    """
-
-    def setup_class(self):
-        _ensure_clean_db()
-
-    def test_prepare_db(self):
-        _ensure_clean_db()
-
-    def test_global_trigger_and_progress(self):
-        """Trigger global rebuild and verify global progress summary."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-
-        case_space = space_name + "_mri_global"
-        assert create_space(router_url, db_name, _flat_space_config(case_space)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, False, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        resp = _trigger_rebuild_global()
-        body = resp.json()
-        logger.info("global trigger response: %s", body)
-        assert body.get("code") == 0, body
-
-        global_progress = _list_rebuild_progress()
-        logger.info("global progress: %s", json.dumps(global_progress, indent=2, default=str))
-        results = global_progress.get("results", [])
-        space_keys = [r.get("space_key", "") for r in results]
-        assert any(case_space in k for k in space_keys), f"our space not found in global progress: {space_keys}"
-
-        _wait_rebuild_completed(db_name, case_space, timeout=300)
-        _wait_index_status_indexed(db_name, case_space)
-        drop_space(router_url, db_name, case_space)
-
-    def test_global_cancel(self):
-        """Trigger global rebuild, then cancel globally."""
-        batch_size = 100
-        total = xb.shape[0]
-        total_batch = int(total / batch_size)
-
-        case_space = space_name + "_mri_global_cancel"
-        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=2)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        resp = _trigger_rebuild_global()
-        assert resp.json().get("code") == 0, resp.text
-
-        time.sleep(3)
-
-        cancel_resp = _cancel_rebuild_global()
-        body = cancel_resp.json()
-        logger.info("global cancel response: %s", body)
-        assert body.get("code") == 0, body
-
-        results = body.get("data", {}).get("results", [])
-        if results:
-            for entry in results:
-                assert "cancelled" in entry, entry
-                assert "reason" in entry, entry
-
-        progress = _get_rebuild_progress(db_name, case_space)
-        if progress["status"] not in ("completed", "cancelled"):
-            _wait_rebuild_completed(db_name, case_space, timeout=600)
-
-        _wait_index_status_indexed(db_name, case_space)
-        drop_space(router_url, db_name, case_space)
-
-    def test_destroy_db(self):
-        drop_db(router_url, db_name)
-
 
 # ===========================================================================
 # Additional non-cluster coverage from test_module_rebuild_comprehensive.py
@@ -2137,511 +2096,6 @@ class TestRebuildGlobalScope:
 # ---------------------------------------------------------------------------
 
 
-def _comp_trigger_rebuild(db, space, index_name="", max_retries=0,
-                     drop_before_rebuild=False, describe=0, partition_id=-1,
-                     ensure_indexed=True):
-    """POST rebuild with optional parameters.
-
-    ensure_indexed: gate on every partition reaching index_status==INDEXED
-        before triggering. waiting_index_finish() only waits the *aggregate*
-        index_num to reach total — it does NOT guarantee per-partition
-        index_status has flipped to INDEXED. There is a window (wider for
-        range-partitioned spaces, where index build is more staggered) in
-        which the doc count is complete but some partition is still
-        UNINDEXED. Triggering then is rejected by the server with
-        "rebuild requires an existing index", the rebuild never starts, and
-        the progress poller times out. Gating here makes every trigger
-        deterministic. Pass ensure_indexed=False only when the space is
-        intentionally not (yet) fully indexed at trigger time.
-    """
-    if ensure_indexed:
-        _comp_wait_index_status_indexed(db, space)
-    payload = {}
-    if index_name:
-        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/indexes/{index_name}"
-    else:
-        url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}"
-    if max_retries > 0:
-        payload["max_retries"] = max_retries
-    if drop_before_rebuild:
-        payload["drop_before_rebuild"] = True
-    if describe > 0:
-        payload["describe"] = describe
-    if partition_id >= 0:
-        payload["partition_id"] = partition_id
-    resp = requests.post(url, auth=(username, password), json=payload)
-    logger.info("trigger_rebuild url=%s status=%d body=%s", url, resp.status_code, resp.text[:500])
-    return resp
-
-
-def _comp_trigger_rebuild_db(db):
-    url = f"{router_url}/index/rebuild/dbs/{db}"
-    return requests.post(url, auth=(username, password), json={})
-
-
-def _comp_get_rebuild_progress(db, space):
-    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/progress"
-    resp = requests.get(url, auth=(username, password))
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body.get("code") == 0, body
-    return body.get("data", {}) or {}
-
-
-def _comp_cancel_rebuild(db, space):
-    url = f"{router_url}/index/rebuild/dbs/{db}/spaces/{space}/cancel"
-    return requests.post(url, auth=(username, password))
-
-
-def _comp_wait_rebuild_completed(db, space, timeout=600, poll_interval=3, allow_failed=False):
-    """Poll progress until terminal. Returns chronological snapshots.
-
-    Note on monotonicity: overall_percent is the progress of the *current*
-    rebuild target, not the aggregate across all targets. When a multi-index
-    rebuild advances from target N to N+1, master resets Tasks/TotalTasks
-    for the new target and overall_percent drops back toward 0. We only
-    require monotonicity *within* a single target (same current_index).
-    """
-    deadline = time.time() + timeout
-    snapshots = []
-    last_overall = -1
-    last_current_index = -1
-    while time.time() < deadline:
-        progress = _comp_get_rebuild_progress(db, space)
-        snapshots.append(progress)
-        status = progress["status"]
-        overall = progress.get("overall_percent", 0)
-        current_index = progress.get("current_index", 0)
-        if current_index == last_current_index:
-            assert overall >= last_overall, (
-                f"overall_percent decreased within target #{current_index}: "
-                f"{last_overall} -> {overall}"
-            )
-        last_overall = overall
-        last_current_index = current_index
-        logger.info(
-            "progress: status=%s target=%d overall=%d%% completed=%d/%d running=%d failed=%d",
-            status, current_index, overall,
-            progress["completed_tasks"], progress["total_tasks"],
-            progress["running_tasks"], progress["failed_tasks"],
-        )
-        if status == "completed":
-            return snapshots
-        if status == "failed":
-            if allow_failed:
-                return snapshots
-            pytest.fail(f"rebuild failed for {db}/{space}: {json.dumps(progress, indent=2)}")
-        if status == "cancelled":
-            return snapshots
-        time.sleep(poll_interval)
-    pytest.fail(f"rebuild did not complete within {timeout}s for {db}/{space}")
-
-
-def _comp_wait_index_status_indexed(db, space, max_rounds=180, poll_interval=5):
-    url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
-    for r in range(max_rounds):
-        rs = requests.get(url, auth=(username, password))
-        body = rs.json()
-        data = body.get("data", {})
-        partitions = data.get("partitions", [])
-        statuses = [p.get("index_status", -1) for p in partitions]
-        if data.get("status") != "red" and partitions and all(s == 2 for s in statuses):
-            return
-        time.sleep(poll_interval)
-    pytest.fail(f"index_status did not reach INDEXED for {db}/{space}")
-
-
-def _comp_ensure_clean_db():
-    url = f"{router_url}/dbs/{db_name}/spaces"
-    rs = requests.get(url, auth=(username, password))
-    if rs.status_code == 200:
-        body = rs.json()
-        if body.get("code") == 0 and body.get("data"):
-            for sp in body["data"]:
-                sp_name = sp.get("space_name") or sp.get("name") or ""
-                if sp_name:
-                    drop_space(router_url, db_name, sp_name)
-    drop_db(router_url, db_name)
-    create_db(router_url, db_name)
-
-
-def _comp_check_search(case_space_name, times=5, db_name_override=""):
-    target_db = db_name_override or db_name
-    url = router_url + "/document/search?timeout=2000000"
-    for i in range(times):
-        data = {"vector_value": True, "db_name": target_db, "space_name": case_space_name,
-                "vectors": [{"field": "field_vector", "feature": xb[i:i+1].flatten().tolist()}]}
-        rs = requests.post(url, auth=(username, password), json=data)
-        body = rs.json()
-        if body.get("code") != 0:
-            logger.warning("search returned non-zero code: %s", body)
-            continue
-        assert len(body["data"]["documents"]) == 1
-
-
-def _comp_get_space_detail(db, space):
-    url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
-    rs = requests.get(url, auth=(username, password))
-    body = rs.json()
-    assert body.get("code") == 0, body
-    return body.get("data", {})
-
-
-def _comp_delete_documents(db, space, doc_ids):
-    url = router_url + "/document/delete?timeout=300000"
-    batch = 200
-    for start in range(0, len(doc_ids), batch):
-        chunk = doc_ids[start:start+batch]
-        del_data = {"db_name": db, "space_name": space, "document_ids": [str(d) for d in chunk]}
-        resp = requests.post(url, auth=(username, password), json=del_data)
-        assert resp.json().get("code") == 0, f"delete failed: {resp.json()}"
-
-
-def _comp_query_document(db, space, doc_id):
-    url = router_url + "/document/query"
-    data = {"db_name": db, "space_name": space, "document_ids": [doc_id], "fields": ["field_int", "field_vector"]}
-    return requests.post(url, auth=(username, password), json=data).json()
-
-
-# ---------------------------------------------------------------------------
-# Space config factories
-# ---------------------------------------------------------------------------
-
-
-def _comp_hnsw_cfg(name, pn=2, rn=1):
-    dim = xb.shape[1]
-    return {"name": name, "partition_num": pn, "replica_num": rn,
-            "fields": [
-                {"name": "field_int", "type": "integer"},
-                {"name": "field_long", "type": "long"},
-                {"name": "field_float", "type": "float"},
-                {"name": "field_double", "type": "double"},
-                {"name": "field_string", "type": "string", "index": {"name": "field_string", "type": "SCALAR"}},
-                {"name": "field_vector", "type": "vector",
-                 "index": {"name": "gamma", "type": "HNSW",
-                           "params": {"metric_type": "InnerProduct", "nlinks": 32, "efConstruction": 40, "training_threshold": 1}},
-                 "dimension": dim},
-            ]}
-
-def _comp_hnsw_range_partition_cfg(name, pn=1, rn=2):
-    dim = xb.shape[1]
-    return {"name": name, "partition_num": pn, "replica_num": rn,
-            "fields": [
-                {"name": "field_int", "type": "integer"},
-                {"name": "field_date", "type": "date"},
-                {"name": "field_vector", "type": "vector",
-                 "index": {"name": "gamma", "type": "HNSW",
-                           "params": {"metric_type": "InnerProduct", "nlinks": 32, "efConstruction": 40, "training_threshold": 1}},
-                 "dimension": dim},
-            ],
-            "partition_rule": {
-                "type": "RANGE",
-                "field": "field_date",
-                "ranges": [
-                    {"name": "p0", "value": "2026-01-02"},
-                    {"name": "p1", "value": "2026-01-03"},
-                ],
-            }}
-
-def _comp_flat_cfg(name, pn=1, rn=1):
-    dim = xb.shape[1]
-    return {"name": name, "partition_num": pn, "replica_num": rn,
-            "fields": [{"name": "field_int", "type": "integer"},
-                       {"name": "field_vector", "type": "vector",
-                        "index": {"name": "gamma", "type": "FLAT", "params": {"metric_type": "L2", "training_threshold": 1}},
-                        "dimension": dim}]}
-
-def _comp_ivfflat_cfg(name, pn=1, rn=1):
-    dim = xb.shape[1]
-    return {"name": name, "partition_num": pn, "replica_num": rn,
-            "fields": [{"name": "field_int", "type": "integer"},
-                       {"name": "field_vector", "type": "vector",
-                        "index": {"name": "gamma", "type": "IVFFLAT",
-                                  "params": {"metric_type": "L2", "ncentroids": 128, "training_threshold": 4992}},
-                        "dimension": dim}]}
-
-def _comp_ivfpq_cfg(name, pn=1, rn=1):
-    dim = xb.shape[1]
-    return {"name": name, "partition_num": pn, "replica_num": rn,
-            "fields": [{"name": "field_int", "type": "integer"},
-                       {"name": "field_vector", "type": "vector",
-                        "index": {"name": "gamma", "type": "IVFPQ",
-                                  "params": {"metric_type": "InnerProduct", "ncentroids": 128, "nsubvector": 32, "training_threshold": 4992}},
-                        "dimension": dim}]}
-
-def _comp_ivfrabitq_cfg(name, pn=1, rn=1):
-    dim = xb.shape[1]
-    return {"name": name, "partition_num": pn, "replica_num": rn,
-            "fields": [{"name": "field_int", "type": "integer"},
-                       {"name": "field_vector", "type": "vector",
-                        "index": {"name": "gamma", "type": "IVFRABITQ",
-                                  "params": {"metric_type": "InnerProduct", "ncentroids": 128, "training_threshold": 4992}},
-                        "dimension": dim}]}
-
-def _comp_multi3_cfg(name, pn=1, rn=1):
-    """3 vector fields: HNSW + IVFFLAT + IVFPQ.
-    """
-    dim = xb.shape[1]
-    return {"name": name, "partition_num": pn, "replica_num": rn,
-            "fields": [
-                {"name": "field_int", "type": "integer"},
-                {"name": "field_vector_a", "type": "vector",
-                 "index": {"name": "gamma_a", "type": "HNSW",
-                           "params": {"metric_type": "L2", "nlinks": 32, "efConstruction": 40, "training_threshold": 1}},
-                 "dimension": dim},
-                {"name": "field_vector_b", "type": "vector",
-                 "index": {"name": "gamma_b", "type": "IVFFLAT",
-                           "params": {"metric_type": "L2", "ncentroids": 32, "nprobe": 8, "training_threshold": 1248}},
-                 "dimension": dim},
-                {"name": "field_vector_c", "type": "vector",
-                 "index": {"name": "gamma_c", "type": "IVFPQ",
-                           "params": {"metric_type": "InnerProduct", "ncentroids": 32, "nprobe": 8, "nsubvector": 32, "training_threshold": 1248}},
-                 "dimension": dim},
-            ]}
-
-
-def _comp_add_multi3_docs(space_name, n_fields=3):
-    """Insert docs with multiple vector fields."""
-    batch_size, total = 100, xb.shape[0]
-    total_batch = int(total / batch_size)
-    url = router_url + "/document/upsert?timeout=2000000"
-    field_names = ["field_vector_a", "field_vector_b", "field_vector_c"]
-    for i in range(total_batch):
-        docs = []
-        for j in range(batch_size):
-            doc = {"_id": str(i*batch_size+j), "field_int": i*batch_size+j}
-            for k in range(min(n_fields, len(field_names))):
-                doc[field_names[k]] = xb[i*batch_size+j].tolist()
-            docs.append(doc)
-        rs = requests.post(url, auth=(username, password), json={"db_name": db_name, "space_name": space_name, "documents": docs})
-        assert rs.json().get("code") == 0
-    waiting_index_finish(total, space_name=space_name)
-
-def _comp_add_range_partition_docs(space_name, total=10000, batch_size=100):
-    """Insert docs into named range partitions p0 and p1."""
-    url = router_url + "/document/upsert?timeout=2000000"
-    for i in range(total // batch_size):
-        docs = []
-        for j in range(batch_size):
-            idx = i * batch_size + j
-            docs.append({
-                "_id": str(idx),
-                "field_int": idx,
-                "field_date": "2026-01-01" if idx < total // 2 else "2026-01-02",
-                "field_vector": xb[idx].tolist(),
-            })
-        rs = requests.post(url, auth=(username, password),
-                           json={"db_name": db_name, "space_name": space_name,
-                                 "documents": docs},
-                           timeout=30)
-        assert rs.json().get("code") == 0, rs.text
-    waiting_index_finish(total, space_name=space_name)
-
-
-# ===========================================================================
-# 3. Per-partition serialization visibility
-# ===========================================================================
-
-
-
-class TestRebuildReplicaSerialization:
-
-    def setup_class(self):
-        _comp_ensure_clean_db()
-
-    def test_prepare_db(self):
-        _comp_ensure_clean_db()
-
-
-    def test_restatus_map_resets_on_cancelled_rebuild(self):
-        """3.4: Cancelled rebuild leaves space healthy."""
-        batch_size, total = 100, xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_comp_restatus"
-
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=1)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        _comp_trigger_rebuild(db_name, case_space)
-        time.sleep(2)
-        _comp_cancel_rebuild(db_name, case_space)
-
-        progress = _comp_get_rebuild_progress(db_name, case_space)
-        if progress["status"] == "running":
-            _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-
-        _comp_wait_index_status_indexed(db_name, case_space)
-        _comp_check_search(case_space)
-        drop_space(router_url, db_name, case_space)
-
-    def test_destroy_db_3(self):
-        drop_db(router_url, db_name)
-
-
-# ===========================================================================
-# 4. Data integrity
-# ===========================================================================
-
-
-class TestRebuildDataIntegrity:
-
-    def setup_class(self):
-        _comp_ensure_clean_db()
-
-    def test_prepare_db(self):
-        _comp_ensure_clean_db()
-
-    def test_doc_num_preserved_after_rebuild(self):
-        """4.1: doc_num / max_docid unchanged; deleted IDs stay invisible;
-        non-deleted vector data preserved byte-equal.
-        """
-        batch_size, total = 100, xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_comp_invariant"
-
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=1)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        random.seed(42)
-        deleted_ids = random.sample(range(total), 3000)
-        _comp_delete_documents(db_name, case_space, deleted_ids)
-        time.sleep(2)
-
-        pre_detail = _comp_get_space_detail(db_name, case_space)
-        pre_doc_num = pre_detail.get("doc_num")
-        pre_max = sum(p.get("max_docid", 0) for p in pre_detail.get("partitions", []))
-
-        # Sample 30 known-non-deleted IDs and capture their vectors.
-        non_deleted = list(set(range(total)) - set(deleted_ids))
-        sample_ids = random.sample(non_deleted, 30)
-        pre_vectors = {}
-        for did in sample_ids:
-            r = _comp_query_document(db_name, case_space, str(did))
-            assert r.get("code") == 0, r
-            docs = r.get("data", {}).get("documents", [])
-            if docs and docs[0]:
-                pre_vectors[did] = docs[0].get("field_vector") or docs[0].get("_source", {}).get("field_vector")
-
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        _comp_wait_index_status_indexed(db_name, case_space)
-
-        post_detail = _comp_get_space_detail(db_name, case_space)
-        post_doc_num = post_detail.get("doc_num")
-        post_max = sum(p.get("max_docid", 0) for p in post_detail.get("partitions", []))
-
-        assert post_doc_num == pre_doc_num, f"doc_num changed: {pre_doc_num} -> {post_doc_num}"
-        assert post_max == pre_max, f"max_docid sum changed: {pre_max} -> {post_max}"
-
-        # Deleted IDs must remain invisible.
-        for did in deleted_ids[:50]:
-            r = _comp_query_document(db_name, case_space, str(did))
-            docs = r.get("data", {}).get("documents", []) or []
-            # vearch query API typically returns empty list or document with _found=false
-            for d in docs:
-                if d:
-                    found = d.get("_found", True)
-                    assert not found, f"deleted id {did} resurrected: {d}"
-
-        # Sampled non-deleted vectors must be byte-equal.
-        diffs = 0
-        for did, pre_v in pre_vectors.items():
-            r = _comp_query_document(db_name, case_space, str(did))
-            docs = r.get("data", {}).get("documents", []) or []
-            if not docs or not docs[0]:
-                continue
-            post_v = docs[0].get("field_vector") or docs[0].get("_source", {}).get("field_vector")
-            if pre_v != post_v:
-                diffs += 1
-        assert diffs == 0, f"{diffs}/{len(pre_vectors)} sampled vectors differ post-rebuild"
-
-        drop_space(router_url, db_name, case_space)
-
-    def test_search_consistent_pre_post_rebuild(self):
-        """4.2: For 100 fixed queries, top-1 hit rate ≥ 95% (HNSW allows
-        small graph reshaping); top-10 Jaccard ≥ 0.85 between pre and post.
-        """
-        batch_size, total = 100, xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_comp_consistent"
-
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=1)).json()["code"] == 0
-        add(total_batch, batch_size, xb, True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        nq = 100
-        url = router_url + "/document/search?timeout=10000"
-
-        def topk(idx):
-            data = {"vector_value": False, "db_name": db_name, "space_name": case_space,
-                    "vectors": [{"field": "field_vector", "feature": xq[idx].tolist()}],
-                    "fields": ["field_int"], "limit": 10}
-            rs = requests.post(url, auth=(username, password), json=data, timeout=10)
-            body = rs.json()
-            if body.get("code") != 0:
-                return []
-            docs = body.get("data", {}).get("documents", [[]])
-            res = docs[0] if docs and isinstance(docs[0], list) else docs
-            return [d.get("field_int") for d in res if d.get("field_int") is not None]
-
-        pre = [topk(i) for i in range(nq)]
-
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        _comp_wait_index_status_indexed(db_name, case_space)
-
-        post = [topk(i) for i in range(nq)]
-
-        top1_hits = sum(1 for a, b in zip(pre, post) if a and b and a[0] == b[0])
-        jaccard_sum = 0.0
-        for a, b in zip(pre, post):
-            sa, sb = set(a), set(b)
-            if not sa and not sb:
-                jaccard_sum += 1.0
-                continue
-            jaccard_sum += len(sa & sb) / max(1, len(sa | sb))
-
-        top1_rate = top1_hits / nq
-        jaccard_avg = jaccard_sum / nq
-        logger.info("4.2 top1=%.3f jaccard=%.3f", top1_rate, jaccard_avg)
-        assert top1_rate >= 0.90, f"top1 hit rate too low: {top1_rate:.3f}"
-        assert jaccard_avg >= 0.85, f"jaccard too low: {jaccard_avg:.3f}"
-
-        drop_space(router_url, db_name, case_space)
-
-    def test_schema_unchanged_after_rebuild(self):
-        """4.3: Schema dump byte-equal pre and post rebuild."""
-        batch_size, total = 100, xb.shape[0]
-        total_batch = int(total / batch_size)
-        case_space = space_name + "_comp_schema"
-
-        assert create_space(router_url, db_name, _comp_multi3_cfg(case_space)).json()["code"] == 0
-        _comp_add_multi3_docs(case_space)
-
-        def get_schema(target):
-            url = f"{router_url}/dbs/{db_name}/spaces/{target}"
-            body = requests.get(url, auth=(username, password)).json()
-            data = body.get("data", {})
-            # Strip mutable runtime fields.
-            for k in ("doc_num", "partitions", "status", "update_time", "id"):
-                data.pop(k, None)
-            return json.dumps(data, sort_keys=True)
-
-        pre = get_schema(case_space)
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
-        _comp_wait_index_status_indexed(db_name, case_space)
-        post = get_schema(case_space)
-
-        assert pre == post, f"schema drift:\nPRE  : {pre[:500]}\nPOST : {post[:500]}"
-        drop_space(router_url, db_name, case_space)
-
-    def test_destroy_db_4(self):
-        drop_db(router_url, db_name)
-
-
 # ===========================================================================
 # 5. Concurrent writes during rebuild
 # ===========================================================================
@@ -2650,10 +2104,7 @@ class TestRebuildDataIntegrity:
 class TestRebuildConcurrentWrites:
 
     def setup_class(self):
-        _comp_ensure_clean_db()
-
-    def test_prepare_db(self):
-        _comp_ensure_clean_db()
+        _ensure_clean_db()
 
     def test_inserts_during_rebuild_visible_after(self):
         """5.1: Insert 5000 new docs while rebuild is running; final
@@ -2670,16 +2121,16 @@ class TestRebuildConcurrentWrites:
         batch_size, half = 100, 5000
         case_space = space_name + "_comp_ins_during"
 
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=1)).json()["code"] == 0
+        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=1)).json()["code"] == 0
         add(half // batch_size, batch_size, xb[:half],
             with_id=False, full_field=False,
             space_name=case_space, offset=0)
         waiting_index_finish(half, space_name=case_space)
 
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
+        assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
         # Wait until rebuild is actually running.
         for _ in range(20):
-            if _comp_get_rebuild_progress(db_name, case_space)["status"] == "running":
+            if _get_rebuild_progress(db_name, case_space)["status"] == "running":
                 break
             time.sleep(0.5)
 
@@ -2689,12 +2140,12 @@ class TestRebuildConcurrentWrites:
             with_id=False, full_field=False,
             space_name=case_space, offset=half)
 
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
+        _wait_rebuild_completed(db_name, case_space, timeout=600)
         logger.info("rebuild finished after concurrent insert")
         waiting_index_finish(2 * half, space_name=case_space)
-        _comp_wait_index_status_indexed(db_name, case_space)
+        _wait_index_status_indexed(db_name, case_space)
 
-        detail = _comp_get_space_detail(db_name, case_space)
+        detail = _get_space_detail(db_name, case_space)
         assert detail.get("doc_num") == 2 * half, f"expected 10000 docs, got {detail.get('doc_num')}"
 
         # Sample new vectors and confirm reachable via vector search.
@@ -2710,7 +2161,7 @@ class TestRebuildConcurrentWrites:
             assert res, f"no result for inserted vector at index={sid}"
         drop_space(router_url, db_name, case_space)
 
-    def test_destroy_db_5(self):
+    def teardown_class(self):
         drop_db(router_url, db_name)
 
 
@@ -2722,49 +2173,30 @@ class TestRebuildConcurrentWrites:
 class TestRebuildIndexTypeMatrix:
 
     def setup_class(self):
-        _comp_ensure_clean_db()
+        _ensure_clean_db()
 
-    def test_prepare_db(self):
-        _comp_ensure_clean_db()
-
-    def _basic_rebuild_lifecycle(self, case_space, cfg, total=10000, do_search=True):
-        batch_size = 100
-        total_batch = total // batch_size
-        assert create_space(router_url, db_name, cfg).json()["code"] == 0
-        add(total_batch, batch_size, xb[:total], True, False, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-        pre_doc_num = _comp_get_space_detail(db_name, case_space).get("doc_num")
-
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
-        _comp_wait_index_status_indexed(db_name, case_space)
-
-        post_doc_num = _comp_get_space_detail(db_name, case_space).get("doc_num")
-        assert post_doc_num == pre_doc_num
-        if do_search:
-            _comp_check_search(case_space, times=3)
-        drop_space(router_url, db_name, case_space)
-
-    def test_rebuild_flat(self):
-        """6.1: FLAT — no training; rebuild should be effectively a noop
-        but must complete without error.
-        """
-        case_space = space_name + "_comp_flat"
-        self._basic_rebuild_lifecycle(case_space, _comp_flat_cfg(case_space))
-
-    def test_rebuild_ivfflat(self):
-        case_space = space_name + "_comp_ivfflat"
-        self._basic_rebuild_lifecycle(case_space, _comp_ivfflat_cfg(case_space))
-
-    def test_rebuild_ivfpq(self):
-        case_space = space_name + "_comp_ivfpq"
-        self._basic_rebuild_lifecycle(case_space, _comp_ivfpq_cfg(case_space))
+    @pytest.mark.parametrize(
+        "suffix,config_factory",
+        [
+            ("flat", _flat_space_config),
+            ("ivfflat", _ivfflat_space_config),
+            ("ivfpq", _ivfpq_space_config),
+        ],
+        ids=["FLAT", "IVFFLAT", "IVFPQ"],
+    )
+    def test_rebuild_common_index_types(self, suffix, config_factory):
+        """Common lifecycle for index types without a special data path."""
+        case_space = f"{space_name}_comp_{suffix}"
+        try:
+            _run_rebuild_lifecycle(case_space, config_factory(case_space))
+        finally:
+            drop_space(router_url, db_name, case_space)
 
     def test_rebuild_ivfrabitq(self):
         """6.2: IVFRABITQ basic lifecycle."""
         case_space = space_name + "_comp_rabitq"
         try:
-            resp = create_space(router_url, db_name, _comp_ivfrabitq_cfg(case_space))
+            resp = create_space(router_url, db_name, _ivfrabitq_space_config(case_space))
             if resp.json().get("code") != 0:
                 pytest.skip(f"IVFRABITQ not supported: {resp.json()}")
         except Exception as e:
@@ -2773,49 +2205,14 @@ class TestRebuildIndexTypeMatrix:
         batch_size, total = 100, 10000
         add(total // batch_size, batch_size, xb[:total], True, False, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
-        pre = _comp_get_space_detail(db_name, case_space).get("doc_num")
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
-        _comp_wait_index_status_indexed(db_name, case_space)
-        post = _comp_get_space_detail(db_name, case_space).get("doc_num")
+        pre = _get_space_detail(db_name, case_space).get("doc_num")
+        assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
+        _wait_rebuild_completed(db_name, case_space, timeout=600)
+        _wait_index_status_indexed(db_name, case_space)
+        post = _get_space_detail(db_name, case_space).get("doc_num")
         assert pre == post
         drop_space(router_url, db_name, case_space)
 
-    # def test_rebuild_ivfpqfs(self):
-    #     """6.3: IVFPQFS — fast-scan IVFPQ variant. The master allowlist
-    #     (entity/space.go:370-387) is build-dependent: in a default build
-    #     IVFPQFS is not whitelisted and the request fails at the master
-    #     validator with PARAM_ERROR. In that case we skip; the test still
-    #     documents the intent and runs end-to-end on builds that include it.
-    #     """
-    #     case_space = space_name + "_comp_ivfpqfs"
-    #     embedding_size = xb.shape[1]
-    #     cfg = {
-    #         "name": case_space, "partition_num": 1, "replica_num": 1,
-    #         "fields": [
-    #             {"name": "field_int", "type": "integer"},
-    #             {"name": "field_vector", "type": "vector",
-    #              "index": {"name": "gamma", "type": "IVFPQFS",
-    #                        "params": {"metric_type": "L2",
-    #                                   "ncentroids": 128, "nsubvector": 32,
-    #                                   "training_threshold": 4992}},
-    #              "dimension": embedding_size},
-    #         ],
-    #     }
-    #     resp = create_space(router_url, db_name, cfg)
-    #     body = resp.json()
-    #     if body.get("code") != 0:
-    #         pytest.skip(
-    #             f"IVFPQFS not accepted by master allowlist on this build: "
-    #             f"code={body.get('code')} msg={body.get('msg')}")
-    #     try:
-    #         self._run_lifecycle_existing_space(case_space, total=10000,
-    #                                             rebuild_timeout=600)
-    #     finally:
-    #         try:
-    #             drop_space(router_url, db_name, case_space)
-    #         except Exception:
-    #             pass
 
     def test_rebuild_binary_ivf(self):
         """6.4: BinaryIVF on packed binary vectors.
@@ -2877,13 +2274,13 @@ class TestRebuildIndexTypeMatrix:
                     f"upsert binary docs failed at start={start}: {r.text[:300]}")
             waiting_index_finish(n_docs, space_name=case_space)
 
-            pre_doc_num = _comp_get_space_detail(db_name, case_space).get("doc_num")
+            pre_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
 
-            assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-            _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
-            _comp_wait_index_status_indexed(db_name, case_space)
+            assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
+            _wait_rebuild_completed(db_name, case_space, timeout=600)
+            _wait_index_status_indexed(db_name, case_space)
 
-            post_doc_num = _comp_get_space_detail(db_name, case_space).get("doc_num")
+            post_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
             assert post_doc_num == pre_doc_num, (
                 f"doc_num diverged across rebuild: pre={pre_doc_num} "
                 f"post={post_doc_num}")
@@ -2967,7 +2364,7 @@ class TestRebuildIndexTypeMatrix:
             # 的写入。
             time.sleep(5)
 
-            detail = _comp_get_space_detail(db_name, case_space)
+            detail = _get_space_detail(db_name, case_space)
             doc_num_after_insert = detail.get("doc_num", 0)
             logger.info("6.5 inserted: doc_num=%d, partitions=%s",
                         doc_num_after_insert,
@@ -2993,7 +2390,7 @@ class TestRebuildIndexTypeMatrix:
             poll_interval = 5
             last_logged = -1
             while time.time() < initial_build_deadline:
-                d = _comp_get_space_detail(db_name, case_space)
+                d = _get_space_detail(db_name, case_space)
                 partitions = d.get("partitions", [])
                 statuses = [p.get("index_status", -1) for p in partitions]
                 index_nums = [p.get("index_num", 0) for p in partitions]
@@ -3016,22 +2413,22 @@ class TestRebuildIndexTypeMatrix:
                     "6.5 initial DiskANN build did not reach INDEXED in 30min; "
                     "check ps logs for engine errors")
 
-            pre_doc_num = _comp_get_space_detail(db_name, case_space).get("doc_num")
+            pre_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
 
             # 4. 这才是真正测试的那次 — rebuild 已 INDEXED 的 DiskANN。
             logger.info("6.5 triggering rebuild")
-            assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-            _comp_wait_rebuild_completed(db_name, case_space, timeout=1800)
+            assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
+            _wait_rebuild_completed(db_name, case_space, timeout=1800)
             # rebuild 完之后引擎需要再写一次 INDEXED, 给 25min 上限。
-            _comp_wait_index_status_indexed(db_name, case_space,
+            _wait_index_status_indexed(db_name, case_space,
                                        max_rounds=300, poll_interval=5)
 
-            post_doc_num = _comp_get_space_detail(db_name, case_space).get("doc_num")
+            post_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
             assert post_doc_num == pre_doc_num, (
                 f"doc_num diverged across rebuild: pre={pre_doc_num} "
                 f"post={post_doc_num}")
 
-            _comp_check_search(case_space, times=3)
+            _check_search(case_space, times=3)
         finally:
             try:
                 drop_space(router_url, db_name, case_space)
@@ -3065,70 +2462,13 @@ class TestRebuildIndexTypeMatrix:
                 f"SCANN not supported on this cluster build: "
                 f"code={body.get('code')} msg={body.get('msg')}")
         try:
-            self._run_lifecycle_existing_space(case_space, total=10000,
-                                                rebuild_timeout=900)
+            _run_rebuild_lifecycle(
+                case_space, total=10000, rebuild_timeout=900)
         finally:
             try:
                 drop_space(router_url, db_name, case_space)
             except Exception:
                 pass
-
-    def _run_lifecycle_existing_space(self, case_space, total=10000,
-                                      rebuild_timeout=600,
-                                      index_indexed_max_rounds=180,
-                                      do_search=True):
-        """Variant of _basic_rebuild_lifecycle that assumes the space is
-        already created (so the caller can skip-on-create-failure for
-        index types whose support is build-dependent)."""
-        batch_size = 100
-        total_batch = total // batch_size
-        add(total_batch, batch_size, xb[:total], True, False,
-            space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        pre_doc_num = _comp_get_space_detail(db_name, case_space).get("doc_num")
-
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=rebuild_timeout)
-        _comp_wait_index_status_indexed(db_name, case_space,
-                                   max_rounds=index_indexed_max_rounds)
-
-        post_doc_num = _comp_get_space_detail(db_name, case_space).get("doc_num")
-        assert post_doc_num == pre_doc_num, (
-            f"doc_num diverged across rebuild: pre={pre_doc_num} "
-            f"post={post_doc_num}")
-
-        if do_search:
-            _comp_check_search(case_space, times=3)
-
-    def test_rebuild_multi_vector_field_fanout(self):
-        """6.7: Space with 3 vector fields, no field/index_type → fan-out.
-        indexes array should contain all 3, current_index should advance.
-        """
-        case_space = space_name + "_comp_fanout"
-        assert create_space(router_url, db_name, _comp_multi3_cfg(case_space)).json()["code"] == 0
-        _comp_add_multi3_docs(case_space)
-
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        first = _comp_get_rebuild_progress(db_name, case_space)
-        indexes = first.get("indexes", [])
-        assert len(indexes) >= 2, f"expected ≥2 IndexTargets, got {indexes}"
-        seen_indexes = {first.get("current_index")}
-
-        deadline = time.time() + 900
-        while time.time() < deadline:
-            p = _comp_get_rebuild_progress(db_name, case_space)
-            if p.get("current_index") is not None:
-                seen_indexes.add(p["current_index"])
-            if p["status"] in ("completed", "failed"):
-                assert p["status"] == "completed", p
-                break
-            time.sleep(2)
-
-        # current_index should have advanced through ≥2 distinct values.
-        assert len(seen_indexes) >= 2, f"current_index didn't advance: seen={seen_indexes}"
-        _comp_wait_index_status_indexed(db_name, case_space)
-        drop_space(router_url, db_name, case_space)
 
     def test_multi_index_space_runs_consecutively_without_yield(self):
         """6.7b: When a space has multiple index targets, all of them must
@@ -3146,19 +2486,27 @@ class TestRebuildIndexTypeMatrix:
         space_single = space_name + "_comp_multi_consec_b"
 
         # Space A: multi-vector so the record has ≥2 targets.
-        assert create_space(router_url, db_name, _comp_multi3_cfg(space_multi)).json()["code"] == 0
-        _comp_add_multi3_docs(space_multi)
+        assert create_space(router_url, db_name, _multi3_space_config(space_multi)).json()["code"] == 0
+        _add_multi_vector_docs(
+            space_multi,
+            ("field_vector_a", "field_vector_b", "field_vector_c"),
+        )
 
         # Space B: single-vector, fast target. Would race ahead if A ever
         # yielded its scheduler slot mid-way through its target list.
-        assert create_space(router_url, db_name, _comp_multi3_cfg(space_single)).json()["code"] == 0
-        _comp_add_multi3_docs(space_single)
+        assert create_space(
+            router_url, db_name,
+            _hnsw_space_config(space_single, partition_num=1),
+        ).json()["code"] == 0
+        add(xb.shape[0] // 100, 100, xb, True, False,
+            space_name=space_single)
+        waiting_index_finish(xb.shape[0], space_name=space_single)
 
         # Trigger A first so it wins admission.
-        assert _comp_trigger_rebuild(db_name, space_multi).json().get("code") == 0
+        assert _trigger_indexed_rebuild(db_name, space_multi).json().get("code") == 0
         # Trigger B a moment later — B stays Pending.
         time.sleep(0.5)
-        assert _comp_trigger_rebuild(db_name, space_single).json().get("code") == 0
+        assert _trigger_indexed_rebuild(db_name, space_single).json().get("code") == 0
 
         # While A is Running, B must remain Pending. Sandwich each pb
         # read between two pa reads so we don't flag the tick where A
@@ -3175,9 +2523,9 @@ class TestRebuildIndexTypeMatrix:
         b_ever_running_while_a_running = False
         b_ever_completed_while_a_running = False
         while time.time() < deadline:
-            pa_before = _comp_get_rebuild_progress(db_name, space_multi)
-            pb        = _comp_get_rebuild_progress(db_name, space_single)
-            pa_after  = _comp_get_rebuild_progress(db_name, space_multi)
+            pa_before = _get_rebuild_progress(db_name, space_multi)
+            pb        = _get_rebuild_progress(db_name, space_single)
+            pa_after  = _get_rebuild_progress(db_name, space_multi)
 
             a_running_throughout = (
                 pa_before["status"] == "running"
@@ -3205,24 +2553,14 @@ class TestRebuildIndexTypeMatrix:
         )
 
         # Space B should complete once A releases the slot.
-        _comp_wait_rebuild_completed(db_name, space_single, timeout=600)
-        _comp_wait_index_status_indexed(db_name, space_multi)
-        _comp_wait_index_status_indexed(db_name, space_single)
+        _wait_rebuild_completed(db_name, space_single, timeout=600)
+        _wait_index_status_indexed(db_name, space_multi)
+        _wait_index_status_indexed(db_name, space_single)
 
         drop_space(router_url, db_name, space_multi)
         drop_space(router_url, db_name, space_single)
 
-    # def test_multi_target_fail_first_aborts_rest(self):
-    #     """6.8: When the first IndexTarget fails its retries, subsequent
-    #     targets must NOT be attempted (per design: surface failures).
-
-    #     Real implementation lives in test_module_rebuild_chaos.py
-    #     (TestRebuildPSFailureExtras.test_multi_target_fail_first_aborts_rest)
-    #     because it needs PS-kill fault injection. Skipping here.
-    #     """
-    #     pytest.skip("see chaos: test_multi_target_fail_first_aborts_rest")
-
-    def test_destroy_db_6(self):
+    def teardown_class(self):
         drop_db(router_url, db_name)
 
 
@@ -3234,38 +2572,7 @@ class TestRebuildIndexTypeMatrix:
 class TestRebuildParameters:
 
     def setup_class(self):
-        _comp_ensure_clean_db()
-
-    def test_prepare_db(self):
-        _comp_ensure_clean_db()
-
-    def _make_basic_space(self, case_space, total=5000):
-        batch_size = 100
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=1)).json()["code"] == 0
-        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-    def test_drop_before_true_completes(self):
-        """7.1"""
-        case_space = space_name + "_comp_drop1"
-        self._make_basic_space(case_space)
-        resp = _comp_trigger_rebuild(db_name, case_space, drop_before_rebuild=True)
-        assert resp.json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        _comp_wait_index_status_indexed(db_name, case_space)
-        _comp_check_search(case_space)
-        drop_space(router_url, db_name, case_space)
-
-    def test_drop_before_false_completes(self):
-        """7.2"""
-        case_space = space_name + "_comp_drop0"
-        self._make_basic_space(case_space)
-        resp = _comp_trigger_rebuild(db_name, case_space, drop_before_rebuild=False)
-        assert resp.json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        _comp_wait_index_status_indexed(db_name, case_space)
-        _comp_check_search(case_space)
-        drop_space(router_url, db_name, case_space)
+        _ensure_clean_db()
 
     def test_describe_mode_is_idempotent(self):
         """7.3: describe=1 should not modify the index.
@@ -3273,7 +2580,7 @@ class TestRebuildParameters:
         identical results.
         """
         case_space = space_name + "_comp_describe"
-        self._make_basic_space(case_space)
+        _create_populated_hnsw_space(case_space)
 
         url = router_url + "/document/search?timeout=10000"
         def topk(idx):
@@ -3288,49 +2595,23 @@ class TestRebuildParameters:
             return [d.get("field_int") for d in res if d.get("field_int") is not None]
 
         pre = [topk(i) for i in range(20)]
-        resp = _comp_trigger_rebuild(db_name, case_space, describe=1)
+        resp = _trigger_indexed_rebuild(db_name, case_space, describe=1)
         if resp.json().get("code") != 0:
             pytest.skip(f"describe mode rejected: {resp.json()}")
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=120)
+        _wait_rebuild_completed(db_name, case_space, timeout=120)
         post = [topk(i) for i in range(20)]
         assert pre == post, "describe rebuild changed search results"
         drop_space(router_url, db_name, case_space)
 
-    def test_max_retries_custom_value(self):
+    def test_max_retries_recorded_in_progress(self):
         """7.4: progress reflects the requested max_retries."""
         case_space = space_name + "_comp_maxretry"
-        self._make_basic_space(case_space)
-        resp = _comp_trigger_rebuild(db_name, case_space, max_retries=5)
+        _create_populated_hnsw_space(case_space)
+        resp = _trigger_indexed_rebuild(db_name, case_space, max_retries=5)
         assert resp.json().get("code") == 0
-        progress = _comp_get_rebuild_progress(db_name, case_space)
-        # The API may surface this under different key; accept either.
-        mr = progress.get("max_retries", progress.get("MaxRetries"))
-        if mr is not None:
-            assert int(mr) == 5, f"max_retries not honored: {mr}"
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        drop_space(router_url, db_name, case_space)
-
-    def test_partition_id_specific_only(self):
-        """7.5: Single-partition rebuild — record contains only that pid."""
-        case_space = space_name + "_comp_pid"
-        batch_size, total = 100, 5000
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=3)).json()["code"] == 0
-        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        partitions = _comp_get_space_detail(db_name, case_space).get("partitions", [])
-        assert len(partitions) == 3
-        target_pid = partitions[1]["pid"]
-
-        resp = _comp_trigger_rebuild(db_name, case_space, partition_id=target_pid)
-        assert resp.json().get("code") == 0
-        progress = _comp_get_rebuild_progress(db_name, case_space)
-        tasks = progress.get("tasks") or []
-        for t in tasks:
-            assert t.get("partition_id") == target_pid,\
-                f"task on wrong pid: expected {target_pid}, got {t.get('partition_id')}"
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        _comp_wait_index_status_indexed(db_name, case_space)
+        progress = _get_rebuild_progress(db_name, case_space)
+        assert progress.get("max_retries") == 5, progress
+        _wait_rebuild_completed(db_name, case_space, timeout=300)
         drop_space(router_url, db_name, case_space)
 
     def test_partition_id_zero_means_all_partitions(self):
@@ -3343,25 +2624,25 @@ class TestRebuildParameters:
         """
         case_space = space_name + "_comp_pid_zero"
         batch_size, total = 100, 5000
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=3)).json()["code"] == 0
+        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=3)).json()["code"] == 0
         add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
-        partitions = _comp_get_space_detail(db_name, case_space).get("partitions", [])
+        partitions = _get_space_detail(db_name, case_space).get("partitions", [])
         expected_pids = {p["pid"] for p in partitions}
         assert len(expected_pids) == 3
 
-        resp = _comp_trigger_rebuild(db_name, case_space, partition_id=0)
+        resp = _trigger_indexed_rebuild(db_name, case_space, partition_id=0)
         assert resp.json().get("code") == 0
-        progress = _comp_get_rebuild_progress(db_name, case_space)
+        progress = _wait_tasks_visible(db_name, case_space)
         tasks = progress.get("tasks") or []
         task_pids = {t.get("partition_id") for t in tasks}
         assert task_pids == expected_pids, (
             f"partition_id=0 应覆盖全部分区,got tasks pids={task_pids}, "
             f"expected={expected_pids}"
         )
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        _comp_wait_index_status_indexed(db_name, case_space)
+        _wait_rebuild_completed(db_name, case_space, timeout=300)
+        _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
 
     def test_partition_id_nonexistent_rejected(self):
@@ -3372,20 +2653,20 @@ class TestRebuildParameters:
         """
         case_space = space_name + "_comp_pid_bad"
         batch_size, total = 100, 3000
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=2)).json()["code"] == 0
+        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=2)).json()["code"] == 0
         add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
         # 998877 不可能存在于本 space。传 uint32 允许的大值即可。
         bogus_pid = 998877
-        resp = _comp_trigger_rebuild(
+        resp = _trigger_indexed_rebuild(
             db_name, case_space, partition_id=bogus_pid)
         body = resp.json()
         logger.info("bogus partition_id trigger response: %s", body)
 
         data = body.get("data", {}) or {}
         failures = data.get("failures", [])
-        results = data.get("results", [])
+        results = data.get("results") or []
 
         # 允许两种错误形态:
         #   (a) top-level code != 0
@@ -3424,31 +2705,30 @@ class TestRebuildParameters:
         rn = 1
         assert create_space(
             router_url, db_name,
-            _comp_hnsw_cfg(case_space, pn=3, rn=rn),
+            _hnsw_space_config(case_space, partition_num=3, replica_num=rn),
         ).json()["code"] == 0
         add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
-        partitions = _comp_get_space_detail(db_name, case_space).get("partitions", [])
+        partitions = _get_space_detail(db_name, case_space).get("partitions", [])
         assert len(partitions) == 3
         target_pid = partitions[0]["pid"]
 
-        resp = _comp_trigger_rebuild(db_name, case_space, partition_id=target_pid)
+        resp = _trigger_indexed_rebuild(db_name, case_space, partition_id=target_pid)
         assert resp.json().get("code") == 0
 
-        progress = _comp_get_rebuild_progress(db_name, case_space)
+        progress = _wait_tasks_visible(db_name, case_space, timeout=30)
         total_tasks = progress.get("total_tasks", 0)
         assert total_tasks == rn, (
             f"total_tasks 必须 == replica_num ({rn}),got {total_tasks};"
             f"progress={progress}"
         )
-        # 双保险:tasks[] 明细里也必须全部落在 target_pid。
         for t in progress.get("tasks") or []:
             assert t.get("partition_id") == target_pid, (
                 f"task 泄漏到别的 pid: {t}")
 
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        _comp_wait_index_status_indexed(db_name, case_space)
+        _wait_rebuild_completed(db_name, case_space, timeout=300)
+        _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
 
     def test_partition_id_with_index_name_scopes_to_intersection(self):
@@ -3465,22 +2745,24 @@ class TestRebuildParameters:
         ).json()["code"] == 0
         _add_multi_vector_docs(case_space)
 
-        partitions = _comp_get_space_detail(db_name, case_space).get("partitions", [])
+        partitions = _get_space_detail(db_name, case_space).get("partitions", [])
         assert len(partitions) == 3
         target_pid = partitions[1]["pid"]
 
-        resp = _comp_trigger_rebuild(
+        resp = _trigger_indexed_rebuild(
             db_name, case_space,
             index_name="gamma_a", partition_id=target_pid,
         )
         assert resp.json().get("code") == 0
 
-        progress = _comp_get_rebuild_progress(db_name, case_space)
+        progress = _wait_tasks_visible(db_name, case_space, timeout=30)
         indexes = progress.get("indexes") or []
         # index_name 显式指定后,只能有 1 个 target。
         assert indexes == ["gamma_a"], (
             f"index_name 指定后 indexes 必须 == [gamma_a],got {indexes}")
-        for t in progress.get("tasks") or []:
+        tasks = progress.get("tasks") or []
+        assert tasks, f"expected tasks for pid/index intersection: {progress}"
+        for t in tasks:
             assert t.get("partition_id") == target_pid, (
                 f"task 泄漏到别的 pid: {t}")
             # tasks 里的 index_name 字段(如有)也应匹配。
@@ -3489,8 +2771,8 @@ class TestRebuildParameters:
                 assert name == "gamma_a", (
                     f"task 的 index_name 不匹配: got {name}")
 
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
-        _comp_wait_index_status_indexed(db_name, case_space)
+        _wait_rebuild_completed(db_name, case_space, timeout=600)
+        _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
 
     def test_partition_id_cancel_only_touches_target_record(self):
@@ -3501,27 +2783,27 @@ class TestRebuildParameters:
         case_space = space_name + "_comp_pid_cancel"
         batch_size, total = 100, 10000
         assert create_space(
-            router_url, db_name, _comp_hnsw_cfg(case_space, pn=3),
+            router_url, db_name, _hnsw_space_config(case_space, partition_num=3),
         ).json()["code"] == 0
         add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
-        partitions = _comp_get_space_detail(db_name, case_space).get("partitions", [])
+        partitions = _get_space_detail(db_name, case_space).get("partitions", [])
         assert len(partitions) == 3
         target_pid = partitions[2]["pid"]
 
-        resp = _comp_trigger_rebuild(db_name, case_space, partition_id=target_pid)
+        resp = _trigger_indexed_rebuild(db_name, case_space, partition_id=target_pid)
         assert resp.json().get("code") == 0
 
-        cancel_resp = _comp_cancel_rebuild(db_name, case_space)
+        cancel_resp = _cancel_rebuild(db_name, case_space)
         cbody = cancel_resp.json()
         logger.info("single-pid rebuild cancel body: %s", cbody)
         assert cbody.get("code") == 0, cbody
 
         # 等收敛(cancelled 是终态)。
-        _comp_wait_rebuild_completed(
+        _wait_rebuild_completed(
             db_name, case_space, timeout=300, allow_failed=True)
-        final = _comp_get_rebuild_progress(db_name, case_space)
+        final = _get_rebuild_progress(db_name, case_space)
         logger.info("single-pid rebuild final progress: %s", final)
         assert final.get("status") == "cancelled", (
             f"单 pid rebuild cancel 后必须收敛为 cancelled,got {final}")
@@ -3530,40 +2812,36 @@ class TestRebuildParameters:
             assert t.get("partition_id") == target_pid, (
                 f"cancel 后仍看到别 pid 的 task 残留: {t}")
 
-        _comp_wait_index_status_indexed(db_name, case_space)
+        _wait_index_status_indexed(db_name, case_space)
         drop_space(router_url, db_name, case_space)
 
-    def test_drop_before_purges_deleted(self):
-        """7.6: drop_before=true + delete-half + IVFFLAT.
-        After rebuild index_num should be ≤ doc_num (no resurrected deletes).
-        """
+    def test_drop_before_rebuild_does_not_restore_deleted_documents(self):
+        """Deleted IVFFLAT documents stay deleted after a drop-first rebuild."""
         case_space = space_name + "_comp_drop_del"
         batch_size, total = 100, 10000
-        assert create_space(router_url, db_name, _comp_ivfflat_cfg(case_space, pn=1)).json()["code"] == 0
+        assert create_space(router_url, db_name, _ivfflat_space_config(case_space, partition_num=1)).json()["code"] == 0
         add(total // batch_size, batch_size, xb[:total], True, False, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
-        _comp_delete_documents(db_name, case_space, list(range(5000, total)))
+        _delete_documents(db_name, case_space, list(range(5000, total)))
         time.sleep(2)
 
-        resp = _comp_trigger_rebuild(db_name, case_space, drop_before_rebuild=True)
+        resp = _trigger_indexed_rebuild(db_name, case_space, drop_before_rebuild=True)
         assert resp.json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=600)
-        _comp_wait_index_status_indexed(db_name, case_space)
+        _wait_rebuild_completed(db_name, case_space, timeout=600)
+        _wait_index_status_indexed(db_name, case_space)
 
-        detail = _comp_get_space_detail(db_name, case_space)
+        detail = _get_space_detail(db_name, case_space)
         assert detail.get("doc_num") == 5000
-        # index_num is high-water mark, not actual count, so we only sanity-check ≥ doc_num
-        # and assert doc_num is correct.
         for did in [5000, 7500, 9999]:
-            r = _comp_query_document(db_name, case_space, str(did))
+            r = _query_document(db_name, case_space, str(did))
             docs = r.get("data", {}).get("documents", []) or []
             for d in docs:
                 if d:
                     assert not d.get("_found", True), f"deleted id {did} resurrected after drop=true rebuild"
         drop_space(router_url, db_name, case_space)
 
-    def test_destroy_db_7(self):
+    def teardown_class(self):
         drop_db(router_url, db_name)
 
 
@@ -3575,65 +2853,31 @@ class TestRebuildParameters:
 class TestRebuildStateMachineEdges:
 
     def setup_class(self):
-        _comp_ensure_clean_db()
-
-    def test_prepare_db(self):
-        _comp_ensure_clean_db()
+        _ensure_clean_db()
 
     def test_cancel_pending_then_immediate_new_rebuild(self):
         """8.1"""
         case_space = space_name + "_comp_cancel_re"
         batch_size, total = 100, 5000
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=2)).json()["code"] == 0
+        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=2)).json()["code"] == 0
         add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
-        _comp_trigger_rebuild(db_name, case_space)
-        _comp_cancel_rebuild(db_name, case_space)
+        _trigger_indexed_rebuild(db_name, case_space)
+        _cancel_rebuild(db_name, case_space)
 
-        progress = _comp_get_rebuild_progress(db_name, case_space)
+        progress = _get_rebuild_progress(db_name, case_space)
         if progress["status"] == "running":
             # Already admitted; wait it out before reissuing.
-            _comp_wait_rebuild_completed(db_name, case_space, timeout=300, allow_failed=True)
+            _wait_rebuild_completed(db_name, case_space, timeout=300, allow_failed=True)
 
         time.sleep(0.5)
-        resp = _comp_trigger_rebuild(db_name, case_space)
+        resp = _trigger_indexed_rebuild(db_name, case_space)
         assert resp.json().get("code") == 0, resp.text
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
+        _wait_rebuild_completed(db_name, case_space, timeout=300)
         drop_space(router_url, db_name, case_space)
 
-    def test_completed_record_overwrite(self):
-        """8.3: A completed record can be overwritten by a new request."""
-        case_space = space_name + "_comp_re_complete"
-        batch_size, total = 100, 5000
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=1)).json()["code"] == 0
-        add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
-        waiting_index_finish(total, space_name=case_space)
-
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        snapshots = _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        first_enq = snapshots[-1].get("enqueued_at", "")
-
-        time.sleep(1)
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        snapshots2 = _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
-        second_enq = snapshots2[-1].get("enqueued_at", "")
-
-        assert first_enq != second_enq, "enqueued_at not refreshed on second rebuild"
-        drop_space(router_url, db_name, case_space)
-
-    # def test_failed_record_overwrite(self):
-    #     """8.2: Failed records can be overwritten — requires fault
-    #     injection to deterministically produce a failed state.
-
-    #     Real implementation lives in test_module_rebuild_chaos.py
-    #     (TestRebuildPSFailureExtras.
-    #      test_failed_record_can_be_overwritten_by_new_request)
-    #     because it needs PS-kill fault injection. Skipping here.
-    #     """
-    #     pytest.skip("see chaos: test_failed_record_can_be_overwritten_by_new_request")
-
-    def test_destroy_db_8(self):
+    def teardown_class(self):
         drop_db(router_url, db_name)
 
 
@@ -3645,10 +2889,7 @@ class TestRebuildStateMachineEdges:
 class TestRebuildLifecycle:
 
     def setup_class(self):
-        _comp_ensure_clean_db()
-
-    def test_prepare_db(self):
-        _comp_ensure_clean_db()
+        _ensure_clean_db()
 
     def test_drop_space_during_running_rebuild(self):
         """9.1: DROP SPACE while rebuild is running must succeed AND clean
@@ -3656,28 +2897,83 @@ class TestRebuildLifecycle:
         """
         case_space = space_name + "_comp_drop_during"
         batch_size, total = 100, 10000
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=2)).json()["code"] == 0
+        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=2)).json()["code"] == 0
         add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        # Wait for running state.
+        assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
+        # Prove that this is a running-record cleanup test, rather than a
+        # drop-before-admission or drop-after-completion test.
+        observed_running = False
         for _ in range(30):
-            if _comp_get_rebuild_progress(db_name, case_space)["status"] == "running":
+            if _get_rebuild_progress(db_name, case_space)["status"] == "running":
+                observed_running = True
                 break
             time.sleep(0.5)
+        assert observed_running, "rebuild never entered running before DROP SPACE"
 
         # DROP SPACE.
         drop_resp = drop_space(router_url, db_name, case_space)
         assert drop_resp is None or drop_resp.json().get("code") == 0,\
             f"drop_space failed: {drop_resp.json() if drop_resp else 'no response'}"
 
-        # The progress endpoint must still respond (not 5xx). The record
-        # may persist briefly but ideally transitions to failed/not_found.
-        time.sleep(5)
-        url = f"{router_url}/index/rebuild/dbs/{db_name}/spaces/{case_space}/progress"
-        rs = requests.get(url, auth=(username, password))
-        assert rs.status_code == 200, f"progress endpoint 5xx after drop: {rs.text}"
+        # Space metadata deletion is asynchronous from the HTTP caller's
+        # point of view. Wait until the space itself is no longer readable.
+        space_url = f"{router_url}/dbs/{db_name}/spaces/{case_space}"
+        deadline = time.time() + 30
+        last_space_response = None
+        while time.time() < deadline:
+            last_space_response = requests.get(
+                space_url, auth=(username, password)
+            )
+            if last_space_response.status_code == 404:
+                break
+            body = last_space_response.json()
+            if body.get("code") != 0:
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail(
+                "space still exists after DROP SPACE: "
+                f"{last_space_response.text if last_space_response else ''}"
+            )
+
+        # DropSpace must delete /rebuild/<db>/<space>, not merely leave a
+        # Running record for the scheduler to discover later.
+        progress_url = (
+            f"{router_url}/index/rebuild/dbs/{db_name}/spaces/"
+            f"{case_space}/progress"
+        )
+        deadline = time.time() + 30
+        last_progress_response = None
+        record_gone = False
+        while time.time() < deadline:
+            last_progress_response = requests.get(
+                progress_url, auth=(username, password)
+            )
+            if last_progress_response.status_code == 404:
+                record_gone = True
+                break
+            body = last_progress_response.json()
+            if body.get("code") != 0:
+                record_gone = True
+                break
+            time.sleep(0.5)
+        assert record_gone, (
+            "rebuild record still queryable after DROP SPACE: "
+            f"{last_progress_response.text if last_progress_response else ''}"
+        )
+
+        summary = _list_rebuild_progress()
+        dropped_key = f"{db_name}-{case_space}"
+        remaining_keys = {
+            item.get("space_key")
+            for item in (summary.get("results") or [])
+        }
+        assert dropped_key not in remaining_keys, (
+            f"dropped space rebuild record remains in global progress: "
+            f"{remaining_keys}"
+        )
 
         # Sanity: master/router still healthy.
         rs = requests.get(f"{router_url}/dbs", auth=(username, password))
@@ -3713,7 +3009,7 @@ class TestRebuildLifecycle:
 
         batch_size, total = 100, 5000
         for sp in (case_a, case_b):
-            cfg = _comp_hnsw_cfg(sp, pn=1)
+            cfg = _hnsw_space_config(sp, partition_num=1)
             cfg["name"] = sp
             r = requests.post(
                 f"{router_url}/dbs/{local_db}/spaces",
@@ -3731,9 +3027,9 @@ class TestRebuildLifecycle:
                 requests.post(url_upsert, auth=(username, password),
                                json={"db_name": local_db, "space_name": sp, "documents": docs})
             waiting_index_finish(total, space_name=sp, db_name=local_db)
-            # Same per-partition INDEXED gate as _trigger_rebuild; this test
+            # Same per-partition INDEXED gate as _trigger_indexed_rebuild; this test
             # POSTs the DB-level rebuild directly so it can't piggyback on it.
-            _comp_wait_index_status_indexed(local_db, sp)
+            _wait_index_status_indexed(local_db, sp)
 
         # Trigger DB-level rebuild.
         rs = requests.post(f"{router_url}/index/rebuild/dbs/{local_db}",
@@ -3764,20 +3060,20 @@ class TestRebuildLifecycle:
         """
         case_space = space_name + "_comp_retention"
         batch_size, total = 100, 5000
-        assert create_space(router_url, db_name, _comp_hnsw_cfg(case_space, pn=1)).json()["code"] == 0
+        assert create_space(router_url, db_name, _hnsw_space_config(case_space, partition_num=1)).json()["code"] == 0
         add(total // batch_size, batch_size, xb[:total], True, True, space_name=case_space)
         waiting_index_finish(total, space_name=case_space)
 
-        assert _comp_trigger_rebuild(db_name, case_space).json().get("code") == 0
-        _comp_wait_rebuild_completed(db_name, case_space, timeout=300)
+        assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
+        _wait_rebuild_completed(db_name, case_space, timeout=300)
 
         # 5s after completion, record must still be queryable as completed.
         time.sleep(5)
-        progress = _comp_get_rebuild_progress(db_name, case_space)
+        progress = _get_rebuild_progress(db_name, case_space)
         assert progress["status"] == "completed"
         drop_space(router_url, db_name, case_space)
 
-    def test_destroy_db_9(self):
+    def teardown_class(self):
         try:
             drop_db(router_url, db_name)
         except Exception:
