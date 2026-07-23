@@ -70,7 +70,7 @@ type Server struct {
 	rpcTimeOut               int
 	backupStatus             map[uint32]int
 	backupManager            BackupManager
-	rebuildManager           RebuildManager
+	rebuildManager           RebuildTaskManager
 	rebuildOnce              sync.Once
 }
 
