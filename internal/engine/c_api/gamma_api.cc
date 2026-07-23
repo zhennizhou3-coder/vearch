@@ -262,13 +262,6 @@ int BuildIndex(void *engine) {
   return ret;
 }
 
-int RebuildIndex(void *engine, int drop_before_rebuild, int limit_cpu,
-                 int describe) {
-  int ret = static_cast<vearch::Engine *>(engine)->RebuildIndex(
-      drop_before_rebuild, limit_cpu, describe);
-  return ret;
-}
-
 int RebuildFieldIndex(void *engine, const char *index_name,
                       const char *field_name, const char *index_type,
                       int drop_before_rebuild, int limit_cpu, int describe) {

@@ -16,7 +16,6 @@ package config
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -26,6 +25,7 @@ import (
 	"sync"
 
 	"github.com/BurntSushi/toml"
+	"github.com/pkg/errors"
 	"github.com/spf13/cast"
 	"github.com/vearch/vearch/v3/internal/entity"
 	"github.com/vearch/vearch/v3/internal/pkg/log"

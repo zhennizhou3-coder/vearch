@@ -96,14 +96,6 @@ int GetDocByDocID(void *engine, int docid, char next, char **doc_str, int *len);
 int BuildIndex(void *engine);
 
 /**
- * @brief rebuild index
- * @param engine  search engine pointer
- * @return 0 successed, 1 failed
- */
-int RebuildIndex(void *engine, int drop_before_rebuild, int limit_cpu,
-                 int describe);
-
-/**
  * @brief rebuild index for a specific (field_name, index_type) pair
  *
  * When field_name is empty, falls back to whole-partition RebuildIndex.
