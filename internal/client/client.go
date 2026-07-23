@@ -1349,21 +1349,6 @@ func isRebuildingIndex(partition *entity.Partition, nodeID entity.NodeID) bool {
 	return partition.ReStatusMap[nodeID] == entity.ReplicasRebuildingIndex
 }
 
-// skippedRebuildingLogged dedups the "skipped rebuilding replica" log
-// per (partitionID, nodeID) per router lifetime
-var skippedRebuildingLogged sync.Map // key: uint64(pid)<<32 | uint64(nid)
-
-// logSkipRebuildingReplica records that the router skipped a specific
-// replica because its index is rebuilding
-func logSkipRebuildingReplica(partition *entity.Partition, nodeID entity.NodeID, clientType string) {
-	k := uint64(partition.Id)<<32 | uint64(nodeID)
-	if _, loaded := skippedRebuildingLogged.LoadOrStore(k, struct{}{}); loaded {
-		return
-	}
-	log.Warn("partition %d skipped nodeID=%d rebuilding, client_type=%s",
-		partition.Id, nodeID, clientType)
-}
-
 // rebuildBusyNodeID names the single PS node currently running an index
 // rebuild, or 0 when none is active. Rebuilds are globally serialized by the
 // master scheduler, so at most one PS is busy at any time
@@ -1384,7 +1369,7 @@ func SetRebuildBusyNode(nodeID entity.NodeID) {
 }
 
 // preferredIdleLogged dedups the "prefer idle host over rebuild-busy node"
-// log per (partitionID, busyNodeID). Key layout mirrors skippedRebuildingLogged.
+// log per (partitionID, busyNodeID).
 var preferredIdleLogged sync.Map // key: uint64(pid)<<32 | uint64(busyNid)
 
 // preferIdleHosts filters the rebuild-busy PS node out of the candidate set
@@ -1451,7 +1436,6 @@ func pickHealthyNonRebuildingReplica(partition *entity.Partition,
 			continue
 		}
 		if isRebuildingIndex(partition, nodeID) {
-			logSkipRebuildingReplica(partition, nodeID, "fallback")
 			continue
 		}
 		if config.Conf().Global.RaftConsistent &&
@@ -1497,7 +1481,6 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if isRebuildingIndex(partition, nodeID) {
-				logSkipRebuildingReplica(partition, nodeID, request.NotLeader)
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1522,7 +1505,6 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if isRebuildingIndex(partition, nodeID) {
-				logSkipRebuildingReplica(partition, nodeID, request.Random)
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1548,7 +1530,6 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if isRebuildingIndex(partition, nodeID) {
-				logSkipRebuildingReplica(partition, nodeID, request.LeastConnection)
 				continue
 			}
 			// Collect the candidate here regardless of rebuild-busy state;

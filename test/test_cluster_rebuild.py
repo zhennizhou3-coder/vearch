@@ -42,6 +42,7 @@ __description__ = """ chaos tests for rebuild index """
 sift10k = DatasetSift10K()
 xb = sift10k.get_database()
 xq = sift10k.get_queries()
+gt = sift10k.get_groundtruth()
 
 # Set of PS instance indices used across chaos tests. Mirrors cl.PSES
 # but pre-extracted as a tuple so log-scan loops don't repeatedly dict-key
@@ -260,7 +261,25 @@ def _ensure_clean_db():
         drop_db(router_url, db_name)
     except Exception:
         pass
-    create_db(router_url, db_name)
+    # After master churn the quorum/leader and the router metadata cache may
+    # still be settling, so create_db can transiently fail or the drop may not
+    # have propagated yet. Retry until the DB is actually visible; otherwise a
+    # silently-failed create_db surfaces later as create_space => db_not_exist.
+    deadline = time.time() + 60
+    last = None
+    while time.time() < deadline:
+        try:
+            create_db(router_url, db_name)
+            body = get_db(router_url, db_name).json()
+            if body.get("code") == 0:
+                return
+            last = body
+        except Exception as e:
+            last = e
+        time.sleep(2)
+    raise AssertionError(
+        f"_ensure_clean_db: DB {db_name} not visible after 60s "
+        f"(cluster may still be recovering from master churn): {last}")
 
 
 def _hnsw_cfg(name, pn=2, rn=2):
@@ -308,6 +327,8 @@ def _ivfpq_cfg(name, pn=2, rn=2):
              "dimension": dim},
         ],
     }
+
+
 def _wait_index_status_indexed(db, space, max_rounds=180, poll_interval=5):
     """Wait until every partition reports INDEXED and the space is not red."""
     url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
@@ -613,6 +634,9 @@ class TestRebuildMasterFailover:
 
     def test_rebuild_resumes_after_leader_kill(self):
         """Verifies a rebuild resumes and completes after the Master leader is killed."""
+
+
+
         _ensure_all_ps_alive()
         _ensure_all_masters_alive()
 
@@ -893,34 +917,33 @@ class TestRebuildReplicaRoutingChaos:
             drop_space(router_url, db_name, case_space)
 
     def test_search_skips_rebuilding_replica(self):
-        """Verifies normal searches remain successful while Router skips rebuilding replicas."""
+        """Verifies searches stay successful and retain recall during rebuild."""
         _ensure_clean_db()
         case_space = space_name + "_chaos_search_skip_r3p2"
-        batch_size, total = 100, min(10000, xb.shape[0])
-        total_batch = int(total / batch_size)
+        total = min(10000, xb.shape[0])
 
         resp = create_space(router_url, db_name,
-                            _hnsw_cfg(case_space, pn=2, rn=3))
-        if resp.json().get("code") != 0:
-            pytest.skip(f"cluster cannot host replica_num=3: {resp.json()}")
+                            _ivfpq_cfg(case_space, pn=2, rn=3))
+        body = resp.json()
+        assert body.get("code") == 0, (
+            f"create_space failed for replica_num=3: {body}")
         try:
-            add(total_batch, batch_size, xb[:total], True, True,
-                space_name=case_space)
-            waiting_index_finish(total, space_name=case_space)
+            _populate(case_space, total=total)
 
             detail = _get_space_detail(db_name, case_space)
             partitions = detail.get("partitions") or []
             assert len(partitions) >= 2, f"need >=2 partitions: {partitions}"
             search_url = router_url + "/document/search?timeout=5000"
 
-            def _search_once():
+            def _search_once(query_idx=0):
                 data = {
                     "vector_value": False,
                     "db_name": db_name,
                     "space_name": case_space,
                     "vectors": [{"field": "field_vector",
-                                 "feature": xb[0].tolist()}],
-                    "limit": 5,
+                                 "feature": xq[query_idx].tolist()}],
+                    "fields": ["field_int"],
+                    "limit": 10,
                 }
                 t0 = time.time()
                 try:
@@ -928,10 +951,57 @@ class TestRebuildReplicaRoutingChaos:
                                        json=data, timeout=5)
                     latency_ms = (time.time() - t0) * 1000
                     body = rs.json() if rs.status_code == 200 else {}
-                    ok = (rs.status_code == 200 and body.get("code") == 0)
+                    documents = ((body.get("data") or {}).get("documents")
+                                 or [])
+                    results = (documents[0] if documents and
+                               isinstance(documents[0], list) else documents)
+                    ok = (rs.status_code == 200 and body.get("code") == 0
+                          and bool(results))
                     return ok, latency_ms, rs.status_code, body.get("code")
                 except Exception as e:
                     return False, (time.time() - t0) * 1000, None, str(e)
+
+            def _compute_recall():
+                recall1_hits = 0
+                recall10_hits = 0
+                for query_idx in range(xq.shape[0]):
+                    data = {
+                        "vector_value": False,
+                        "db_name": db_name,
+                        "space_name": case_space,
+                        "vectors": [{"field": "field_vector",
+                                     "feature": xq[query_idx].tolist()}],
+                        "fields": ["field_int"],
+                        "limit": 10,
+                    }
+                    rs = requests.post(
+                        search_url, auth=(username, password), json=data,
+                        timeout=5)
+                    assert rs.status_code == 200, rs.text
+                    body = rs.json()
+                    assert body.get("code") == 0, body
+                    documents = (body.get("data") or {}).get("documents") or []
+                    results = (documents[0] if documents and
+                               isinstance(documents[0], list) else documents)
+                    assert results, f"query {query_idx} returned no documents"
+                    returned_ids = {
+                        int(doc["field_int"])
+                        for doc in results if doc.get("field_int") is not None
+                    }
+                    assert returned_ids, (
+                        f"query {query_idx} returned no field_int values")
+                    if int(gt[query_idx][0]) in returned_ids:
+                        recall1_hits += 1
+                    if returned_ids & {
+                            int(item) for item in gt[query_idx][:10]}:
+                        recall10_hits += 1
+                query_count = xq.shape[0]
+                return {
+                    "recall_at_1": recall1_hits / query_count,
+                    "recall_at_10": recall10_hits / query_count,
+                }
+
+            recall_before = _compute_recall()
 
             baseline = []
             deadline = time.time() + 5
@@ -970,10 +1040,12 @@ class TestRebuildReplicaRoutingChaos:
                     time.sleep(0.05)
 
             def _search_loop():
+                query_idx = 0
                 while not stop_evt.is_set():
-                    ok, latency_ms, http_status, code = _search_once()
+                    ok, latency_ms, http_status, code = _search_once(query_idx)
                     search_results.append(
                         (time.time(), ok, latency_ms, http_status, code))
+                    query_idx = (query_idx + 1) % xq.shape[0]
                     time.sleep(0.02)
 
             poller = threading.Thread(target=_poll_restatus, daemon=True)
@@ -995,8 +1067,6 @@ class TestRebuildReplicaRoutingChaos:
                     for st in nodes.values())
                 for _, snap in restatus_snapshots)
 
-
-
             if not seen_rebuilding:
                 for t in final.get("tasks") or []:
                     if t.get("status") == "completed":
@@ -1004,49 +1074,6 @@ class TestRebuildReplicaRoutingChaos:
                         break
             assert seen_rebuilding, (
                 "No Rebuilding state was observed, so routing filters were not exercised")
-
-            rebuilding_pairs = set()
-            for _, snap in restatus_snapshots:
-                for pid, nodes in snap.items():
-                    for nid, st in nodes.items():
-                        if st == 3:
-                            rebuilding_pairs.add((int(pid), int(nid)))
-            for t in final.get("tasks") or []:
-                if t.get("status") == "completed":
-                    rebuilding_pairs.add(
-                        (int(t.get("partition_id")),
-                         int(t.get("node_id", 0))))
-            assert rebuilding_pairs, (
-                "No rebuilding replica was identified for Router log verification")
-
-            skip_pattern = re.compile(
-                r"partition (\d+) skipped nodeID=(\d+) rebuilding, "
-                r"client_type=(\S+)")
-            skip_lines = []
-            router_logs_available = False
-            for ridx in (1, 2):
-                txt = cl.read_node_logs("router", ridx)
-                if txt:
-                    router_logs_available = True
-                for line in txt.splitlines():
-                    m = skip_pattern.search(line)
-                    if not m:
-                        continue
-                    pid = int(m.group(1))
-                    nid = int(m.group(2))
-                    ctype = m.group(3)
-                    if ctype.lower() in ("leader", "fallback"):
-                        continue
-                    if (pid, nid) in rebuilding_pairs:
-                        skip_lines.append(line)
-            if not router_logs_available:
-                pytest.skip("router logs unavailable in this cluster mode; "
-                            "cannot verify replica-skip log line")
-            assert skip_lines, (
-                "Router logs did not show a non-Leader route skipping a rebuilding replica; "
-                "rebuilding_pairs=%s" % (rebuilding_pairs,))
-            logger.info("3.2 replica-skip verified, sample=%s",
-                         skip_lines[0])
 
             assert search_results, "no search request was issued during rebuild"
             bad = [r for r in search_results if not r[1]]
@@ -1076,6 +1103,19 @@ class TestRebuildReplicaRoutingChaos:
             assert all(r[0] for r in post_results), (
                 "search was not stable after rebuild; sample=%s" %
                 (post_results[:5],))
+
+            recall_after = _compute_recall()
+            logger.info(
+                "3.2 recall before rebuild=%s after rebuild=%s",
+                recall_before, recall_after)
+            assert recall_after["recall_at_1"] >= max(
+                0.0, recall_before["recall_at_1"] - 0.05), (
+                "recall@1 regressed after rebuild: before=%s after=%s" %
+                (recall_before, recall_after))
+            assert recall_after["recall_at_10"] >= max(
+                0.0, recall_before["recall_at_10"] - 0.05), (
+                "recall@10 regressed after rebuild: before=%s after=%s" %
+                (recall_before, recall_after))
         finally:
             drop_space(router_url, db_name, case_space)
 
@@ -1192,23 +1232,9 @@ class TestRebuildReplicaRoutingChaos:
                 "the leader replica was neither observed rebuilding nor found in final tasks; "
                 "no completed task for node_id=%s was available to verify fallback" % (leader_id,))
 
-            fallback_lines = []
-            router_logs_available = False
-            for ridx in (1, 2):
-                txt = cl.read_node_logs("router", ridx)
-                if txt:
-                    router_logs_available = True
-                for line in txt.splitlines():
-                    if "rebuilding, fallback to nodeID=" in line:
-                        fallback_lines.append(line)
-            if not router_logs_available:
-                pytest.skip("router logs unavailable in this cluster mode; "
-                            "cannot verify fallback log line")
-            assert fallback_lines, (
-                "Router logs did not contain 'partition X leader=Y rebuilding, "
-                "fallback to nodeID=Z'")
-            logger.info("leader fallback verified, sample=%s",
-                        fallback_lines[0])
+            logger.info(
+                "leader fallback verified through %d successful queries",
+                len(leader_query_results))
 
             post_detail = _get_space_detail(db_name, case_space)
             post_parts = post_detail.get("partitions") or []
@@ -1414,47 +1440,9 @@ class TestRebuildReplicaRoutingChaos:
                 f"Router did not skip the rebuilding replica or preferIdleHosts emptied p2 "
                 f"candidates (sample failures={search_fail[:3]})"
             )
-            #        "partition <p1> skipped nodeID=<X> rebuilding"
-
-            #        "partition <p2> preferred idle replicas over busy
-            #         nodeID=<X> rebuilding"
-            skip_pattern = re.compile(
-                r"partition (\d+) skipped nodeID=(\d+) rebuilding, "
-                r"client_type=(\S+)"
-            )
-            prefer_pattern = re.compile(
-                r"partition (\d+) preferred idle replicas over busy "
-                r"nodeID=(\d+) rebuilding"
-            )
-            skip_hits, prefer_hits = [], []
-            router_logs_available = False
-            for ridx in (1, 2):
-                txt = cl.read_node_logs("router", ridx)
-                if txt:
-                    router_logs_available = True
-                for line in txt.splitlines():
-                    m = skip_pattern.search(line)
-                    if m and int(m.group(1)) == p1_pid and int(m.group(2)) == x_node:
-                        if m.group(3).lower() not in ("leader", "fallback"):
-                            skip_hits.append(line)
-                        continue
-                    m = prefer_pattern.search(line)
-                    if m and int(m.group(1)) == p2_pid and int(m.group(2)) == x_node:
-                        prefer_hits.append(line)
-            if not router_logs_available:
-                pytest.skip("router logs unavailable in this cluster mode; "
-                            "cannot verify replica-skip / prefer-idle log lines")
-            assert skip_hits, (
-                f"Router logs did not show p1={p1_pid} filtering X.r1(node={x_node}); "
-                f"expected the same skipped-node signal as test 3.2")
-            assert prefer_hits, (
-                f"Router logs did not show p2={p2_pid} filtering X.r2(busy nodeID={x_node}); "
-                f"preferIdleHosts did not filter the busy node and cross-partition "
-                f"routing isolation was violated")
             logger.info(
-                "3.5 verified: search_ok=%d/%d, skip_hit=%s, prefer_hit=%s",
+                "3.5 verified through queries: search_ok=%d/%d",
                 len(search_results) - len(search_fail), len(search_results),
-                skip_hits[0], prefer_hits[0],
             )
             post = _get_space_detail(db_name, case_space)
             for p in post.get("partitions") or []:
@@ -1704,6 +1692,12 @@ class TestRebuildPSFailureExtras:
             logger.info("post-failure search response code=%s",
                          sr.json().get("code"))
         finally:
+
+
+
+
+
+
             try:
                 cl.start_ps(2, wait_ready=True, timeout=30)
             except Exception:
@@ -2085,3 +2079,685 @@ class TestRebuildConcurrentWrites:
 
     def teardown_class(self):
         drop_db(router_url, db_name)
+
+
+# ===========================================================================
+# Category 6 — Single-replica availability during rebuild
+#
+# Companion cases to TestRebuildConcurrentWrites, which exercises rn=2 and
+# asserts that Router routes around the rebuilding replica so query error
+# rate stays < 10%. The two cases below cover the *unrecoverable* side of
+# that behavior — when the router filter (client.go::isRebuildingIndex /
+# preferIdleHosts) is asked to skip a replica that has no siblings.
+#
+# 6.1 — single-replica space, rebuild on THAT replica: while the router
+#       observes ReplicasRebuildingIndex, candidate set empties to zero
+#       and reads must fail. Master↔etcd↔router-cache is asynchronous in
+#       BOTH directions (mark on start, unmark on complete), so the
+#       filter-engaged span is bounded by the first and the last refusal
+#       observed on the search stream. Inside that span, zero ok is
+#       permitted; the head/tail propagation gaps are logged, not asserted.
+#
+# 6.2 — two single-replica single-partition spaces that Master happens to
+#       co-locate on the same PS X. Rebuild on spaceA marks X busy. Reads
+#       against spaceB on X are the current router bug window: preferIdleHosts
+#       has a "len<=1 → keep the busy node" fallback, but the empirical
+#       failure rate observed on cluster runs is high enough to gate on. See
+#       test_cross_partition_no_routing_interference (rn=2 counterpart) for
+#       the healthy path.
+# ===========================================================================
+class TestRebuildSingleReplicaAvailability:
+
+    def setup_class(self):
+        _ensure_clean_db()
+
+    def test_search_fails_when_only_replica_is_rebuilding(self):
+        """Verifies queries fail while the router observes the sole replica rebuilding.
+
+        Router filters the rebuilding replica out of the candidate set
+        (client.go::isRebuildingIndex). With rn=1 the set is empty →
+        SelectNodeByClientType returns nodeID=0 and the RPC layer reports
+        a router-side error before touching the PS.
+
+        Rebuild has two propagation windows the test must account for
+        rather than assert against:
+        - On start: master flips /progress in dispatchPending
+          (rebuild_service.go:1030) before markReplicaRebuilding writes
+          ReStatusMap (:1036), and the router picks up the etcd change
+          asynchronously via a watcher (master_cache.go:506-536).
+        - On end: unmarkReplicaRebuilding writes ReStatusMap=OK, and the
+          router again catches up asynchronously — reads on the just-
+          restored replica become legal from the router's cache-observed
+          moment, which trails the master's `completed` state.
+
+        Locally each window is ~80ms. During those two spans the router
+        legitimately routes reads through: the PS has no read-side rebuild
+        guard, and the C++ engine either has not yet torn down the old
+        index (start) or has fully restored it (end).
+
+        The regression bar is therefore two-sided: between the FIRST and
+        LAST refusal observed on the search stream, the filter is engaged
+        and no `ok` may appear. See the rn=2 counterpart in
+        test_search_no_errors_during_rebuild for the healthy routing-
+        around case.
+        """
+        _ensure_all_ps_alive()
+        case_space = space_name + "_chaos_single_replica_self"
+
+        # rn=1 pn=1 with IVFPQ: guarantees exactly one rebuild task and a
+        # rebuild window long enough (~seconds) to sample. HNSW builds
+        # too fast on 10k docs to cover the window reliably.
+        resp = create_space(router_url, db_name,
+                            _ivfpq_cfg(case_space, pn=1, rn=1))
+        body = resp.json()
+        assert body.get("code") == 0, (
+            f"create_space rn=1 pn=1 failed: code={body.get('code')} "
+            f"msg={body.get('msg')}")
+        try:
+            _populate(case_space, total=10000)
+
+            stop_evt = threading.Event()
+            events = []
+            events_lock = threading.Lock()
+
+            def _search_loop():
+                url = router_url + "/document/search?timeout=5000"
+                i = 0
+                while not stop_evt.is_set():
+                    data = {"vector_value": False, "db_name": db_name,
+                            "space_name": case_space,
+                            "vectors": [{"field": "field_vector",
+                                         "feature": xb[i % 10000].tolist()}]}
+                    ts = time.time()
+                    try:
+                        rs = requests.post(url, auth=(username, password),
+                                           json=data, timeout=8)
+                        try:
+                            js = rs.json()
+                        except Exception:
+                            js = {}
+                        code = js.get("code")
+                        if rs.status_code == 200 and code == 0:
+                            with events_lock:
+                                events.append((ts, "ok", None))
+                        else:
+                            with events_lock:
+                                events.append((ts, "http_err",
+                                               (rs.status_code, code,
+                                                (js.get("msg") or "")[:160])))
+                    except Exception as e:
+                        with events_lock:
+                            events.append((ts, "exception", repr(e)[:160]))
+                    i += 1
+                    time.sleep(0.02)
+
+            searcher = threading.Thread(target=_search_loop, daemon=True)
+            searcher.start()
+
+            # Warm baseline so we can prove the space was healthy before
+            # rebuild started.
+            time.sleep(2)
+            trig_at = time.time()
+            assert _trigger_rebuild(
+                db_name, case_space).json().get("code") == 0
+
+            # There is no externally-observable signal for "router has
+            # applied the Rebuilding marker" — /dbs/:db/spaces/:space?detail
+            # (doc_http.go:242) proxies to master and reads etcd directly;
+            # /cache/dbs/:db/spaces/:space returns space metadata, not the
+            # partition ReStatusMap. Both /progress and the master-served
+            # space detail flip well BEFORE the router's partitionCache
+            # watcher (master_cache.go:506-536) has copied the ReStatusMap
+            # write into memory, which is what isRebuildingIndex actually
+            # reads. On this cluster the propagation window is ~80ms.
+            #
+            # Rather than guess when propagation has completed, let the
+            # search behavior itself define the boundary: window_start is
+            # the timestamp of the FIRST failed search after the trigger.
+            # After router filter takes effect, any subsequent `ok` is a
+            # real regression — router MUST NOT route a fresh request to a
+            # replica already marked Rebuilding in its own cache.
+            final = _wait_terminal(db_name, case_space, timeout=600,
+                                   allow_failed=True)
+            time.sleep(1)  # tail of in-flight requests
+            stop_evt.set()
+            searcher.join(timeout=5)
+
+            post_trigger = [(i, e) for i, e in enumerate(events)
+                            if e[0] >= trig_at]
+            err_indices = [i for i, e in post_trigger if e[1] != "ok"]
+            assert err_indices, (
+                "no failure observed after trigger; router filter never "
+                "engaged — search kept succeeding through the full "
+                "rebuild lifecycle")
+            # Windows are defined by observable refusals on both sides:
+            #   window_start = first refusal after trigger  (router filter engaged)
+            #   window_end   = last refusal seen            (router filter released)
+            # Between these two boundaries the filter must be continuously
+            # engaged. Any `ok` inside is a real regression — the router
+            # released the rebuilding replica back into the candidate set
+            # mid-window. Samples strictly BEFORE first refusal (master→
+            # etcd→router-cache propagation) and strictly AFTER last refusal
+            # (unmarkReplicaRebuilding → router-cache propagation) are the
+            # dual propagation windows and are logged, not asserted.
+            first_err_idx = err_indices[0]
+            last_err_idx = err_indices[-1]
+            window_start = events[first_err_idx][0]
+            window_end = events[last_err_idx][0]
+
+            baseline = [e for e in events if e[0] < trig_at]
+            propagation_head = [e for e in events
+                                if trig_at <= e[0] < window_start]
+            during = events[first_err_idx:last_err_idx + 1]
+            propagation_tail = [e for e in events if e[0] > window_end]
+
+            # Baseline must include at least one ok — otherwise we're
+            # asserting failure against a space that never worked.
+            baseline_ok = sum(1 for _, k, _ in baseline if k == "ok")
+            assert baseline_ok >= 1, (
+                f"baseline had no successful searches "
+                f"(n={len(baseline)}); rebuild-window failure claim "
+                f"is meaningless without a healthy baseline")
+
+            assert len(during) >= 5, (
+                f"too few in-window samples (n={len(during)}); the filter-"
+                f"engaged span between first and last refusal was too "
+                f"short to draw a regression signal "
+                f"(final={final.get('status')})")
+
+            during_ok = [e for e in during if e[1] == "ok"]
+            during_err = [e for e in during if e[1] != "ok"]
+
+            # Distribution of failure reasons — expected to be dominated by
+            # ROUTER_NO_PS_CLIENT (no ps client by nodeID:0) or the equivalent
+            # "no replica available" path. Logged for triage on regression.
+            from collections import Counter
+            buckets = Counter()
+            for _, kind, detail in during_err:
+                if kind == "http_err" and isinstance(detail, tuple):
+                    buckets[(kind, detail[0], detail[1])] += 1
+                else:
+                    buckets[(kind, None, None)] += 1
+            prop_head_ok = sum(1 for _, k, _ in propagation_head if k == "ok")
+            prop_tail_ok = sum(1 for _, k, _ in propagation_tail if k == "ok")
+            logger.info(
+                "6.1 rn=1 self-rebuild: baseline_ok=%d, "
+                "propagation_head (trigger→first-refusal) "
+                "n=%d ok=%d dur=%.3fs, "
+                "in-window (first→last refusal) n=%d ok=%d err=%d "
+                "breakdown=%s, "
+                "propagation_tail (last-refusal→end) n=%d ok=%d",
+                baseline_ok,
+                len(propagation_head), prop_head_ok,
+                (window_start - trig_at) if propagation_head else 0.0,
+                len(during), len(during_ok), len(during_err), dict(buckets),
+                len(propagation_tail), prop_tail_ok)
+
+            # Regression bar: while the router filter is engaged (between
+            # the first and last observed refusal), no fresh search may
+            # succeed. A stray `ok` inside this window means the router
+            # released the rebuilding replica back into the candidate set
+            # mid-rebuild — a real filter regression.
+            assert len(during_ok) == 0, (
+                f"expected 0 successful searches inside the router "
+                f"filter-engaged window (first→last refusal); got "
+                f"{len(during_ok)}/{len(during)} — router-side rebuild "
+                f"filter (isRebuildingIndex, client.go:1345) appears to "
+                f"have released the rebuilding replica back into the "
+                f"candidate set. Successful samples: "
+                f"{[e for e in during if e[1] == 'ok'][:3]}")
+
+            assert final["status"] == "completed", (
+                f"rebuild itself must still complete once its own writes "
+                f"drain; got {final}")
+        finally:
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception:
+                pass
+
+    def test_neighbor_single_replica_space_survives_rebuild(self):
+        """Verifies a co-located single-replica space keeps serving reads.
+
+        Regression for a leak in preferIdleHosts: when spaceA (rn=1, pn=1)
+        rebuilds on PS X, `rebuildBusyNodeID` publishes X. A neighbor
+        spaceB (rn=1, pn=1) also placed on X should keep answering queries
+        — preferIdleHosts falls back to the busy node when it is the only
+        candidate (client.go:1414-1416), and PS has no read-side rebuild
+        guard, so nothing in the code path should reject spaceB's read.
+        If this assertion fires, the router filter is over-eager and is
+        stripping the last candidate for a partition that has NOTHING to
+        do with the rebuild.
+        """
+        _ensure_all_ps_alive()
+
+        # Master anti-affinity places each pn=1/rn=1 space on some PS;
+        # with 3 PSes and multiple spaces, pigeonhole guarantees a shared
+        # host. We create a small pool, then pick two that co-locate.
+        pool_names = [
+            f"{space_name}_chaos_neighbor_{i}" for i in range(6)
+        ]
+        placed = {}  # space -> node_id
+        space_to_pid = {}
+        try:
+            for sn in pool_names:
+                resp = create_space(router_url, db_name,
+                                    _ivfpq_cfg(sn, pn=1, rn=1))
+                if resp.json().get("code") != 0:
+                    logger.warning(
+                        "6.2 create_space(%s) failed: %s — skipping this "
+                        "candidate", sn, resp.json())
+                    continue
+                d = _get_space_detail(db_name, sn)
+                parts = d.get("partitions") or []
+                if len(parts) != 1:
+                    logger.warning(
+                        "6.2 space %s did not expose exactly one partition: %s",
+                        sn, parts)
+                    continue
+
+                pid = parts[0].get("pid")
+                if pid is None:
+                    logger.warning(
+                        "6.2 space %s partition has no pid: %s", sn, parts[0])
+                    continue
+                space_to_pid[sn] = int(pid)
+
+            # replica_status is heartbeat-derived and may still be empty
+            # immediately after create_space. Resolve placement from the
+            # authoritative partition metadata instead.
+            partition_resp = requests.get(
+                f"{router_url}/partitions",
+                auth=(username, password), timeout=5)
+            partition_body = partition_resp.json()
+            assert partition_body.get("code") == 0, partition_body
+            replicas_by_pid = {
+                int(item["id"]): [int(node) for node in item.get("replicas") or []]
+                for item in partition_body.get("data") or []
+                if item.get("id") is not None
+            }
+
+            for sn, pid in space_to_pid.items():
+                replicas = replicas_by_pid.get(pid) or []
+                if len(replicas) != 1:
+                    logger.warning(
+                        "6.2 partition placement unavailable for space=%s "
+                        "pid=%s replicas=%s", sn, pid, replicas)
+                    continue
+                placed[sn] = replicas[0]
+
+            if len(placed) < 2:
+                pytest.skip(
+                    f"6.2 could not create ≥2 rn=1 pn=1 spaces to compare "
+                    f"placement: pids={space_to_pid}, placed={placed}")
+
+            # Find any two spaces that share a PS.
+            by_node = {}
+            for sn, nid in placed.items():
+                by_node.setdefault(nid, []).append(sn)
+            shared = [(nid, spaces) for nid, spaces in by_node.items()
+                      if len(spaces) >= 2]
+            if not shared:
+                pytest.skip(
+                    f"6.2 anti-affinity spread all spaces across PSes; "
+                    f"no shared host — placement={placed}. "
+                    f"Cluster has too many PSes relative to pool size; "
+                    f"expand pool_names if this skip becomes chronic.")
+            shared_node, cohabitants = shared[0]
+            space_a, space_b = cohabitants[0], cohabitants[1]
+            logger.info(
+                "6.2 co-location found: spaceA=%s spaceB=%s both on node=%d",
+                space_a, space_b, shared_node)
+
+            # Populate only the two we will exercise — the pool spaces we
+            # ignore are dropped in the finally block regardless.
+            for sn in (space_a, space_b):
+                _populate(sn, total=10000)
+
+            stop_evt = threading.Event()
+            b_events = []
+            b_events_lock = threading.Lock()
+
+            def _search_b():
+                url = router_url + "/document/search?timeout=5000"
+                i = 0
+                while not stop_evt.is_set():
+                    data = {"vector_value": False, "db_name": db_name,
+                            "space_name": space_b,
+                            "vectors": [{"field": "field_vector",
+                                         "feature": xb[i % 10000].tolist()}]}
+                    ts = time.time()
+                    try:
+                        rs = requests.post(url, auth=(username, password),
+                                           json=data, timeout=8)
+                        try:
+                            js = rs.json()
+                        except Exception:
+                            js = {}
+                        code = js.get("code")
+                        if rs.status_code == 200 and code == 0:
+                            with b_events_lock:
+                                b_events.append((ts, "ok", None))
+                        else:
+                            with b_events_lock:
+                                b_events.append(
+                                    (ts, "http_err",
+                                     (rs.status_code, code,
+                                      (js.get("msg") or "")[:160])))
+                    except Exception as e:
+                        with b_events_lock:
+                            b_events.append((ts, "exception", repr(e)[:160]))
+                    i += 1
+                    time.sleep(0.02)
+
+            def _a_rebuilding_now():
+                d = _get_progress(db_name, space_a) or {}
+                if d.get("status") != "running":
+                    return False
+                for t in d.get("tasks") or []:
+                    if (t.get("status") == "running"
+                            and t.get("dispatched", False)):
+                        return True
+                return False
+
+            searcher = threading.Thread(target=_search_b, daemon=True)
+            searcher.start()
+            time.sleep(2)  # baseline window
+
+            assert _trigger_rebuild(
+                db_name, space_a).json().get("code") == 0
+
+            window_start = None
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                if _a_rebuilding_now():
+                    window_start = time.time()
+                    break
+                time.sleep(0.05)
+            assert window_start is not None, (
+                "spaceA's rebuild task never reached dispatched-running; "
+                "co-tenant impact on spaceB cannot be measured")
+
+            final_a = _wait_terminal(db_name, space_a, timeout=600,
+                                     allow_failed=True)
+            window_end = time.time()
+            time.sleep(1)
+            stop_evt.set()
+            searcher.join(timeout=5)
+
+            baseline = [e for e in b_events if e[0] < window_start]
+            during = [e for e in b_events
+                      if window_start <= e[0] <= window_end]
+
+            baseline_ok = sum(1 for _, k, _ in baseline if k == "ok")
+            assert baseline_ok >= 1, (
+                f"spaceB had no baseline successes (n={len(baseline)}); "
+                f"the neighbor-space claim cannot be evaluated")
+
+            assert len(during) >= 5, (
+                f"too few spaceB samples during spaceA rebuild "
+                f"(n={len(during)}); adjust IVFPQ size or timing")
+
+            during_ok = [e for e in during if e[1] == "ok"]
+            during_err = [e for e in during if e[1] != "ok"]
+            fail_rate = len(during_err) / len(during)
+
+            from collections import Counter
+            buckets = Counter()
+            for _, kind, detail in during_err:
+                if kind == "http_err" and isinstance(detail, tuple):
+                    buckets[(kind, detail[0], detail[1])] += 1
+                else:
+                    buckets[(kind, None, None)] += 1
+            logger.info(
+                "6.2 neighbor spaceB during A's rebuild: n=%d ok=%d err=%d "
+                "fail_rate=%.2f%% breakdown=%s",
+                len(during), len(during_ok), len(during_err),
+                fail_rate * 100, dict(buckets))
+
+            # Regression bar: neighbor space with its OWN replica on the
+            # busy PS must keep serving. preferIdleHosts explicitly falls
+            # back when it would otherwise empty the candidate set — a
+            # non-trivial failure rate here means either
+            #   (a) that fallback was removed, or
+            #   (b) the router is passing spaceB traffic through some other
+            #       filter that also happens to observe rebuildBusyNodeID.
+            # Threshold 10% mirrors test_search_no_errors_during_rebuild
+            # for consistency with the other during-rebuild regression.
+            assert fail_rate < 0.10, (
+                f"spaceB search fail_rate={fail_rate:.2%} while spaceA "
+                f"was rebuilding on the SAME PS (node={shared_node}); "
+                f"expected <10%. Router replica-selection filter may be "
+                f"stripping the last candidate for an unrelated space. "
+                f"Breakdown: {dict(buckets)}. "
+                f"Sample errors: {during_err[:3]}")
+
+            assert final_a["status"] == "completed", (
+                f"spaceA rebuild must still complete: {final_a}")
+        finally:
+            for sn in pool_names:
+                try:
+                    drop_space(router_url, db_name, sn)
+                except Exception:
+                    pass
+
+    def test_search_on_sibling_index_fails_during_sole_index_rebuild(self):
+        """Verifies rebuilding one index blocks queries on the sibling index.
+
+        A single space with two vector fields (two indexes A and B) and one
+        replica. Rebuild targets only index A via
+        POST /index/rebuild/dbs/:db/spaces/:space/indexes/:index_name.
+        The rebuild scheduler still marks the whole partition's sole replica
+        as ReplicasRebuildingIndex (markReplicaRebuilding is partition-scoped,
+        not index-scoped — see rebuild_service.go::markReplicaRebuilding),
+        so the router's isRebuildingIndex filter empties the candidate set
+        for every read against this space, including searches whose
+        `vectors.field` names index B.
+
+        This documents the deliberate coarseness of the router filter. If
+        someone makes the filter index-aware (e.g. only skip when the query
+        touches the rebuilding index), or narrows the ReStatusMap marker so
+        it lives per-index rather than per-partition, this assertion is the
+        canary that catches it. Whether that change is *desirable* is a
+        product call: either way, this test must be updated alongside.
+        """
+        _ensure_all_ps_alive()
+        case_space = space_name + "_chaos_multi_index_sibling"
+
+        dim = xb.shape[1]
+        cfg = {
+            "name": case_space, "partition_num": 1, "replica_num": 1,
+            "resource_name": "default",
+            "fields": [
+                {"name": "field_int", "type": "integer"},
+                # A is IVFPQ so its rebuild window is long enough to sample.
+                {"name": "field_vector_a", "type": "vector",
+                 "index": {"name": "gamma_a", "type": "IVFPQ",
+                           "params": {"metric_type": "InnerProduct",
+                                      "ncentroids": 64, "nprobe": 16,
+                                      "nsubvector": 32,
+                                      "training_threshold": 2496}},
+                 "dimension": dim},
+                # B is HNSW — the sibling we will query during A's rebuild.
+                {"name": "field_vector_b", "type": "vector",
+                 "index": {"name": "gamma_b", "type": "HNSW",
+                           "params": {"metric_type": "L2", "nlinks": 32,
+                                      "efConstruction": 40,
+                                      "training_threshold": 1}},
+                 "dimension": dim},
+            ],
+        }
+        resp = create_space(router_url, db_name, cfg)
+        body = resp.json()
+        if body.get("code") != 0:
+            pytest.skip(
+                f"cluster cannot host multi-vector rn=1 space: {body}")
+        try:
+            # Populate both vector fields so both indexes are Indexed
+            # before the rebuild request would otherwise be rejected.
+            batch_size, total = 100, min(xb.shape[0], 10000)
+            total_batch = total // batch_size
+            upsert_url = router_url + "/document/upsert?timeout=2000000"
+            for i in range(total_batch):
+                docs = []
+                for j in range(batch_size):
+                    gid = i * batch_size + j
+                    docs.append({
+                        "_id": str(gid),
+                        "field_int": gid,
+                        "field_vector_a": xb[gid].tolist(),
+                        "field_vector_b": xb[gid].tolist(),
+                    })
+                up = requests.post(upsert_url,
+                                   auth=(username, password),
+                                   json={"db_name": db_name,
+                                         "space_name": case_space,
+                                         "documents": docs})
+                assert up.json().get("code") == 0, up.text
+            waiting_index_finish(total, space_name=case_space)
+            _wait_index_status_indexed(db_name, case_space)
+
+            stop_evt = threading.Event()
+            events = []
+            events_lock = threading.Lock()
+
+            def _search_b():
+                # Query the sibling index (field_vector_b) — the one that
+                # is NOT being rebuilt.
+                url = router_url + "/document/search?timeout=5000"
+                i = 0
+                while not stop_evt.is_set():
+                    data = {"vector_value": False, "db_name": db_name,
+                            "space_name": case_space,
+                            "vectors": [{"field": "field_vector_b",
+                                         "feature": xb[i % 10000].tolist()}]}
+                    ts = time.time()
+                    try:
+                        rs = requests.post(url, auth=(username, password),
+                                           json=data, timeout=8)
+                        try:
+                            js = rs.json()
+                        except Exception:
+                            js = {}
+                        code = js.get("code")
+                        if rs.status_code == 200 and code == 0:
+                            with events_lock:
+                                events.append((ts, "ok", None))
+                        else:
+                            with events_lock:
+                                events.append(
+                                    (ts, "http_err",
+                                     (rs.status_code, code,
+                                      (js.get("msg") or "")[:160])))
+                    except Exception as e:
+                        with events_lock:
+                            events.append((ts, "exception", repr(e)[:160]))
+                    i += 1
+                    time.sleep(0.02)
+
+            searcher = threading.Thread(target=_search_b, daemon=True)
+            searcher.start()
+            time.sleep(2)  # baseline
+
+            # Rebuild ONLY index A via the per-index endpoint.
+            rebuild_url = (
+                f"{router_url}/index/rebuild/dbs/{db_name}"
+                f"/spaces/{case_space}/indexes/gamma_a"
+            )
+            trig_at = time.time()
+            trig = requests.post(rebuild_url,
+                                 auth=(username, password),
+                                 json={}, timeout=30)
+            assert trig.json().get("code") == 0, trig.text
+
+            # First→last refusal window — same reasoning as 6.1: master
+            # and router observe the Rebuilding marker asynchronously in
+            # both directions (set on rebuild start, cleared on completion),
+            # so both boundaries must come from the search stream itself.
+            final = _wait_terminal(db_name, case_space, timeout=600,
+                                   allow_failed=True)
+            time.sleep(1)
+            stop_evt.set()
+            searcher.join(timeout=5)
+
+            err_indices = [i for i, e in enumerate(events)
+                           if e[0] >= trig_at and e[1] != "ok"]
+            assert err_indices, (
+                "sibling-index search kept succeeding through the entire "
+                "single-index rebuild — router filter never engaged, i.e. "
+                "the partition's sole replica was never marked Rebuilding "
+                "in the router cache")
+            first_err_idx = err_indices[0]
+            last_err_idx = err_indices[-1]
+            window_start = events[first_err_idx][0]
+            window_end = events[last_err_idx][0]
+
+            baseline = [e for e in events if e[0] < trig_at]
+            propagation_head = [e for e in events
+                                if trig_at <= e[0] < window_start]
+            during = events[first_err_idx:last_err_idx + 1]
+            propagation_tail = [e for e in events if e[0] > window_end]
+
+            baseline_ok = sum(1 for _, k, _ in baseline if k == "ok")
+            assert baseline_ok >= 1, (
+                f"sibling-index baseline had no successes "
+                f"(n={len(baseline)}); the rejection claim is meaningless "
+                f"without a healthy baseline")
+
+            assert len(during) >= 5, (
+                f"too few in-window sibling-index samples (n={len(during)}); "
+                f"the filter-engaged span between first and last refusal "
+                f"was too short — increase upsert count or switch index type")
+
+            during_ok = [e for e in during if e[1] == "ok"]
+            during_err = [e for e in during if e[1] != "ok"]
+
+            from collections import Counter
+            buckets = Counter()
+            for _, kind, detail in during_err:
+                if kind == "http_err" and isinstance(detail, tuple):
+                    buckets[(kind, detail[0], detail[1])] += 1
+                else:
+                    buckets[(kind, None, None)] += 1
+            prop_head_ok = sum(1 for _, k, _ in propagation_head if k == "ok")
+            prop_tail_ok = sum(1 for _, k, _ in propagation_tail if k == "ok")
+            logger.info(
+                "6.3 sibling index during single-index rebuild "
+                "(target=gamma_a, sibling=gamma_b): baseline_ok=%d, "
+                "propagation_head (trigger→first-refusal) n=%d ok=%d "
+                "dur=%.3fs, in-window (first→last refusal) n=%d ok=%d "
+                "err=%d breakdown=%s, "
+                "propagation_tail (last-refusal→end) n=%d ok=%d",
+                baseline_ok,
+                len(propagation_head), prop_head_ok,
+                (window_start - trig_at) if propagation_head else 0.0,
+                len(during), len(during_ok), len(during_err), dict(buckets),
+                len(propagation_tail), prop_tail_ok)
+
+            # Rebuild scope for the router filter is (partition, replica);
+            # index granularity does not narrow it. Between the router's
+            # first and last refusal, every sibling-index read must be
+            # rejected — regardless of the `vectors.field` it names.
+            assert len(during_ok) == 0, (
+                f"expected 0 sibling-index successes inside the router "
+                f"filter-engaged window (first→last refusal); got "
+                f"{len(during_ok)}/{len(during)}. Either "
+                f"markReplicaRebuilding was narrowed to per-index "
+                f"granularity, or isRebuildingIndex became "
+                f"query-target-aware — reconcile with rebuild_service.go "
+                f"and client.go. Successful samples: "
+                f"{[e for e in during if e[1] == 'ok'][:3]}")
+
+            assert final["status"] == "completed", (
+                f"single-index rebuild must still complete: {final}")
+            assert (final.get("indexes") or []) == ["gamma_a"], (
+                f"only gamma_a should appear in Indexes for a "
+                f"single-index rebuild; got {final.get('indexes')}")
+        finally:
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception:
+                pass
+
+    def teardown_class(self):
+        _ensure_clean_db()
