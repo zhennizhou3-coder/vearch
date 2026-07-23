@@ -34,16 +34,15 @@ enum class VectorIndexStatus : int {
   FAILED    = 3,   // rebuild path hit an error; monitor treats this as terminal
 };
 
-// Snapshot of one vector index's state, returned by
-// VectorManager::IndexStatuses. Callers get a copy so they don't need to
-// hold VectorManager's rwlock while reading.
-struct IndexStatusSnapshot {
-  std::string name;
-  VectorIndexStatus status;
-};
-
 class VectorManager {
  public:
+  // State of one vector index. Callers receive a copy and do not need to
+  // hold VectorManager's rwlock while reading it.
+  struct IndexStatus {
+    std::string name;
+    VectorIndexStatus status;
+  };
+
   VectorManager(const VectorStorageType &store_type,
                 bitmap::BitmapManager *docids_bitmap,
                 const std::string &root_path, std::string &desc);
@@ -171,7 +170,7 @@ class VectorManager {
   // rdlock and return by value, so EngineStatus() / the rebuild monitor
   // can read without holding the lock themselves. Consumers (rebuild
   // manager) key by index_name.
-  std::vector<IndexStatusSnapshot> IndexStatuses();
+  std::vector<IndexStatus> IndexStatuses();
 
   // Set the status of one specific index
   void SetIndexStatus(const std::string &index_name, VectorIndexStatus st);
@@ -262,7 +261,7 @@ class VectorManager {
   // Per-index status keyed by the same index_name. Written under
   // index_rwmutex_ wrlock alongside vector_indexes_ so the key set stays
   // consistent between the two structures. Read (IndexStatuses) under
-  // rdlock. This is what powers EngineStatus.per_index_status and lets
+  // rdlock. This powers EngineStatus.IndexStatuses and lets
   // the rebuild monitor track the specific index it triggered instead of
   // the coarse engine-wide index_status_.
   std::unordered_map<std::string, VectorIndexStatus> vector_index_status_;

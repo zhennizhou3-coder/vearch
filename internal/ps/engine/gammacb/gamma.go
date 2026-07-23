@@ -360,7 +360,7 @@ func (ge *gammaEngine) IndexStatusOf(indexName string) (int, error) {
 	if err := ge.GetEngineStatus(status); err != nil {
 		return 0, err
 	}
-	for _, p := range status.PerIndexStatus {
+	for _, p := range status.IndexStatuses {
 		if p.IndexName == indexName {
 			return int(p.Status), nil
 		}

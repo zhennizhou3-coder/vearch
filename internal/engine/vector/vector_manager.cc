@@ -1705,8 +1705,8 @@ int VectorManager::MinIndexedNum() {
   return min;
 }
 
-std::vector<IndexStatusSnapshot> VectorManager::IndexStatuses() {
-  std::vector<IndexStatusSnapshot> out;
+std::vector<VectorManager::IndexStatus> VectorManager::IndexStatuses() {
+  std::vector<IndexStatus> out;
   pthread_rwlock_rdlock(&index_rwmutex_);
   out.reserve(vector_index_status_.size());
   for (const auto &[name, st] : vector_index_status_) {

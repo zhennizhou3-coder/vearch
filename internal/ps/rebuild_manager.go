@@ -30,7 +30,7 @@ const (
 	engineIndexStatusUnindexed = 0
 	engineIndexStatusIndexing  = 1
 	engineIndexStatusIndexed   = 2
-	// Per-index-only terminal state introduced with per_index_status; the
+	// Per-index-only terminal state reported through EngineStatus.IndexStatuses; the
 	// engine-wide IndexStatus never reports this value.
 	engineIndexStatusFailed = 3
 )
@@ -50,22 +50,22 @@ const (
 // struct with each side populating its own fields (see entity.RebuildTask).
 type RebuildTask = entity.RebuildTask
 
-// RebuildManager registers PS tasks and exposes their status.
-type RebuildManager interface {
+// RebuildTaskManager registers PS tasks and exposes their status.
+type RebuildTaskManager interface {
 	StartRebuildTask(spaceKey, indexName, fieldName, indexType string, partitionID uint32,
 		dropBefore int, limitCPU int, describe int) error
 	GetRebuildTaskStatus(spaceKey, indexName string, partitionID uint32) (
 		status entity.RebuildStatus, errorMsg string, exists bool, progress int)
 }
 
-type PSRebuildManager struct {
+type RebuildManager struct {
 	mu     sync.RWMutex
 	tasks  map[string]*RebuildTask
 	server *Server
 }
 
-func NewPSRebuildManager(server *Server) *PSRebuildManager {
-	return &PSRebuildManager{
+func NewRebuildManager(server *Server) *RebuildManager {
+	return &RebuildManager{
 		tasks:  make(map[string]*RebuildTask),
 		server: server,
 	}
@@ -74,12 +74,12 @@ func NewPSRebuildManager(server *Server) *PSRebuildManager {
 // getTaskKey returns the in-memory task identity key.
 // IndexName is globally unique within a space, so (spaceKey, partitionID,
 // indexName) is sufficient — FieldName / IndexType are not part of the key.
-func (r *PSRebuildManager) getTaskKey(spaceKey, indexName string, partitionID uint32) string {
+func (r *RebuildManager) getTaskKey(spaceKey, indexName string, partitionID uint32) string {
 	return fmt.Sprintf("%s|%d|%s", spaceKey, partitionID, indexName)
 }
 
 // StartRebuildTask registers a task and starts its monitor goroutine.
-func (r *PSRebuildManager) StartRebuildTask(spaceKey, indexName, fieldName, indexType string,
+func (r *RebuildManager) StartRebuildTask(spaceKey, indexName, fieldName, indexType string,
 	partitionID uint32, dropBefore int, limitCPU int, describe int) error {
 	taskKey := r.getTaskKey(spaceKey, indexName, partitionID)
 
@@ -113,7 +113,7 @@ func (r *PSRebuildManager) StartRebuildTask(spaceKey, indexName, fieldName, inde
 }
 
 // executeRebuild triggers the engine rebuild and monitors it to terminal state.
-func (r *PSRebuildManager) executeRebuild(task *RebuildTask, dropBefore int, limitCPU int, describe int) {
+func (r *RebuildManager) executeRebuild(task *RebuildTask, dropBefore int, limitCPU int, describe int) {
 	defer func() {
 		if p := recover(); p != nil {
 			r.markFailed(task, fmt.Sprintf("panic: %v", p))
@@ -183,7 +183,7 @@ func (r *PSRebuildManager) executeRebuild(task *RebuildTask, dropBefore int, lim
 }
 
 // monitorRebuild polls engine per-index status until the rebuild is terminal.
-func (r *PSRebuildManager) monitorRebuild(task *RebuildTask, store PartitionStore,
+func (r *RebuildManager) monitorRebuild(task *RebuildTask, store PartitionStore,
 	doneCh <-chan error) {
 	var serverCtx context.Context
 	if r.server != nil {
@@ -261,7 +261,7 @@ func (r *PSRebuildManager) monitorRebuild(task *RebuildTask, store PartitionStor
 	}
 }
 
-func (r *PSRebuildManager) pollStatus(task *RebuildTask, engine engine.Engine) (int, int, int, error) {
+func (r *RebuildManager) pollStatus(task *RebuildTask, engine engine.Engine) (int, int, int, error) {
 	if task.FieldName == "" {
 		return engine.IndexInfoWithErr()
 	}
@@ -301,7 +301,7 @@ func ctxDone(ctx context.Context) <-chan struct{} {
 	return ctx.Done()
 }
 
-func (r *PSRebuildManager) updateProgress(task *RebuildTask, progress int) {
+func (r *RebuildManager) updateProgress(task *RebuildTask, progress int) {
 	r.mu.Lock()
 	if progress > task.Progress {
 		task.Progress = progress
@@ -309,7 +309,7 @@ func (r *PSRebuildManager) updateProgress(task *RebuildTask, progress int) {
 	r.mu.Unlock()
 }
 
-func (r *PSRebuildManager) markCompleted(task *RebuildTask) {
+func (r *RebuildManager) markCompleted(task *RebuildTask) {
 	r.mu.Lock()
 	task.Status = entity.RebuildStatusCompleted
 	task.Progress = 100
@@ -318,7 +318,7 @@ func (r *PSRebuildManager) markCompleted(task *RebuildTask) {
 	r.mu.Unlock()
 }
 
-func (r *PSRebuildManager) markFailed(task *RebuildTask, msg string) {
+func (r *RebuildManager) markFailed(task *RebuildTask, msg string) {
 	r.mu.Lock()
 	task.Status = entity.RebuildStatusFailed
 	task.ErrorMessage = msg
@@ -344,7 +344,7 @@ func terminalExpired(task *RebuildTask) bool {
 	return time.Since(task.CompleteTime) > terminalRetentionPeriod
 }
 
-func (r *PSRebuildManager) GetRebuildTaskStatus(spaceKey, indexName string,
+func (r *RebuildManager) GetRebuildTaskStatus(spaceKey, indexName string,
 	partitionID uint32) (status entity.RebuildStatus, errorMsg string, exists bool, progress int) {
 	taskKey := r.getTaskKey(spaceKey, indexName, partitionID)
 
@@ -365,15 +365,15 @@ func (r *PSRebuildManager) GetRebuildTaskStatus(spaceKey, indexName string,
 }
 
 // SetRebuildManager injects a custom manager for tests or alternate wiring.
-func (s *Server) SetRebuildManager(manager RebuildManager) {
+func (s *Server) SetRebuildManager(manager RebuildTaskManager) {
 	s.rebuildManager = manager
 }
 
 // GetRebuildManager lazily creates the PS-side rebuild manager once.
-func (s *Server) GetRebuildManager() RebuildManager {
+func (s *Server) GetRebuildManager() RebuildTaskManager {
 	s.rebuildOnce.Do(func() {
 		if s.rebuildManager == nil {
-			s.rebuildManager = NewPSRebuildManager(s)
+			s.rebuildManager = NewRebuildManager(s)
 		}
 	})
 	return s.rebuildManager
