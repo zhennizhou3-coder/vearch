@@ -175,26 +175,26 @@ type RebuildSummaryResponse struct {
 	SuccessRatio   float64 `json:"success_ratio"` // (completed) / (completed + failed + cancelled + running + pending), 0 if no records
 }
 
-// PSRebuildStatusQuery is the master-to-PS status poll payload.
-type PSRebuildStatusQuery struct {
+// RebuildStatusQuery is the rebuild status poll payload.
+type RebuildStatusQuery struct {
 	SpaceKey  string `json:"space_key"`
 	IndexName string `json:"index_name"`
 }
 
-// PSRebuildStatusResponse rebuild status response.
+// RebuildStatusResponse describes the status of one rebuild task.
 //
 // When Exists=false the task has no in-memory record on PS (never registered,
 // or already evicted after terminalRetentionPeriod); Status/ErrorMessage/
 // Progress are then their zero values ("", "", 0).
-type PSRebuildStatusResponse struct {
+type RebuildStatusResponse struct {
 	Exists       bool          `json:"exists"`
 	Status       RebuildStatus `json:"status"` // running|completed|failed; empty when Exists=false
 	ErrorMessage string        `json:"error_message"`
 	Progress     int           `json:"progress"` // 0-100
 }
 
-// PSRebuildParam is the master-to-PS rebuild start payload.
-type PSRebuildParam struct {
+// RebuildParam is the rebuild start payload.
+type RebuildParam struct {
 	SpaceKey   string `json:"space_key"`
 	IndexName  string `json:"index_name"`
 	DropBefore int    `json:"drop_before"`

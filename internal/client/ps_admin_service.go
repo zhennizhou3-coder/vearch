@@ -346,7 +346,7 @@ func UpdateMemoryLimitCfg(addr string, cfg *entity.MemoryLimitCfg) error {
 // ExecuteRebuildIndex starts a rebuild task on PS.
 func ExecuteRebuildIndex(addr string, spaceKey, indexName string,
 	pid entity.PartitionID, dropBefore int, limitCPU int, describe int) error {
-	param := &entity.PSRebuildParam{
+	param := &entity.RebuildParam{
 		SpaceKey:   spaceKey,
 		IndexName:  indexName,
 		DropBefore: dropBefore,
@@ -377,8 +377,8 @@ func ExecuteRebuildIndex(addr string, spaceKey, indexName string,
 
 // GetRebuildStatus queries one PS rebuild task.
 func GetRebuildStatus(addr string, spaceKey, indexName string,
-	pid entity.PartitionID) (*entity.PSRebuildStatusResponse, error) {
-	query := &entity.PSRebuildStatusQuery{
+	pid entity.PartitionID) (*entity.RebuildStatusResponse, error) {
+	query := &entity.RebuildStatusQuery{
 		SpaceKey:  spaceKey,
 		IndexName: indexName,
 	}
@@ -401,7 +401,7 @@ func GetRebuildStatus(addr string, spaceKey, indexName string,
 		return nil, vearchpb.NewError(reply.Err.Code, nil)
 	}
 
-	response := &entity.PSRebuildStatusResponse{}
+	response := &entity.RebuildStatusResponse{}
 	if err := vjson.Unmarshal(reply.Data, response); err != nil {
 		log.Error("GetRebuildStatus unmarshal error: %v", err)
 		return nil, err

@@ -1285,7 +1285,7 @@ type RebuildIndexHandler struct {
 func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.PartitionData, reply *vearchpb.PartitionData) (err error) {
 	reply.Err = &vearchpb.Error{Code: vearchpb.ErrorEnum_SUCCESS}
 
-	param := new(entity.PSRebuildParam)
+	param := new(entity.RebuildParam)
 	if err := json.Unmarshal(req.Data, param); err != nil {
 		log.Error("Failed to unmarshal rebuild index param: %v", err)
 		return vearchpb.NewError(vearchpb.ErrorEnum_RPC_PARAM_ERROR, err)
@@ -1355,7 +1355,7 @@ type RebuildStatusHandler struct {
 func (rsh *RebuildStatusHandler) Execute(ctx context.Context, req *vearchpb.PartitionData, reply *vearchpb.PartitionData) (err error) {
 	reply.Err = &vearchpb.Error{Code: vearchpb.ErrorEnum_SUCCESS}
 
-	query := new(entity.PSRebuildStatusQuery)
+	query := new(entity.RebuildStatusQuery)
 	if err := json.Unmarshal(req.Data, query); err != nil {
 		log.Error("Failed to unmarshal rebuild status query: %v", err)
 		return vearchpb.NewError(vearchpb.ErrorEnum_RPC_PARAM_ERROR, err)
@@ -1372,7 +1372,7 @@ func (rsh *RebuildStatusHandler) Execute(ctx context.Context, req *vearchpb.Part
 	log.Info("RebuildTaskStatus result: spaceKey=%s, indexName=%s, partitionID=%d, status=%s, exists=%v, errorMsg=%s, progress=%d%%",
 		query.SpaceKey, query.IndexName, pid, status, exists, errorMsg, progress)
 
-	response := &entity.PSRebuildStatusResponse{
+	response := &entity.RebuildStatusResponse{
 		Exists:       exists,
 		Status:       status,
 		ErrorMessage: errorMsg,
