@@ -1,17 +1,18 @@
 name: CI Rebuild Index
 
 # ---------------------------------------------------------------------------
-# 触发条件 + 测试分组
+# Triggers + test grouping
 # ---------------------------------------------------------------------------
-# 1) push / pull_request / workflow_dispatch 时触发整条 pipeline。
-# 2) rebuild-fast 在 standalone 环境运行非集群测试。
-# 3) rebuild-chaos 在 3-master / 3-ps / 2-router 环境运行集群测试。
+# 1) push / pull_request / workflow_dispatch triggers the full pipeline.
+# 2) rebuild-fast runs non-cluster tests in a standalone environment.
+# 3) rebuild-chaos runs cluster tests in a 3-master / 3-ps / 2-router env.
 #
-# 设计权衡:
-#   - test_module_rebuild.py 不依赖多节点、节点启停或故障注入，使用
-#     standalone 环境即可。
-#   - test_cluster_rebuild.py 依赖多副本和集群故障注入，使用 docker-compose
-#     集群；cluster_helpers.py 在 docker 模式下负责节点启停和日志读取。
+# Design tradeoffs:
+#   - test_module_rebuild.py does not depend on multiple nodes, node
+#     start/stop, or fault injection, so a standalone environment is enough.
+#   - test_cluster_rebuild.py depends on multi-replica and cluster fault
+#     injection, so it uses the docker-compose cluster; cluster_helpers.py
+#     handles node start/stop and log reads in docker mode.
 # ---------------------------------------------------------------------------
 
 on:
@@ -37,7 +38,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    # 构建镜像并以 `all` 模式启动单节点 Vearch，再安装 pytest 依赖。
+    # Build the image, start a single-node Vearch in `all` mode, and install
+    # pytest dependencies.
     - uses: ./.github/actions/set_standalone_env
       with:
         build-type: github
@@ -58,13 +60,15 @@ jobs:
         retention-days: 7
 
   # ===========================================================================
-  # Job B:chaos 测试 — kill PS / master 故障注入
+  # Job B: chaos tests — kill PS / master fault injection
   # ===========================================================================
-  # chaos 测试通过 test/utils/cluster_helpers.py 注入故障。该 helper 是双模式
-  # 的(bare / docker),docker 模式下 kill_ps→`docker kill vearch-psN`、
-  # start_ps→`docker start`、日志走 `docker exec ... cat /vearch/logs/*.log`。
-  # 所以这个 job 直接使用 set_cluster_env 构建并启动 docker-compose 集群，
-  # 不再单独 build 裸二进制 + cluster.sh。
+  # Chaos tests inject failures through test/utils/cluster_helpers.py. That
+  # helper is dual-mode (bare / docker); in docker mode kill_ps runs
+  # `docker kill vearch-psN`, start_ps runs `docker start`, and logs are read
+  # via `docker exec ... cat /vearch/logs/*.log`. So this job uses
+  # set_cluster_env directly to build the image and bring up the
+  # docker-compose cluster, instead of building the bare binary + cluster.sh
+  # separately.
   # ---------------------------------------------------------------------------
   rebuild-chaos:
     name: 'Rebuild cluster tests'
@@ -81,23 +85,26 @@ jobs:
             docker-arch: '--platform linux/arm64'
     env:
       TARGET_PLATFORM: ${{ matrix.platform }}
-      # cluster_helpers 也会自动探测,显式声明更稳。
+      # cluster_helpers auto-detects this too, but declaring it explicitly is
+      # more robust.
       VEARCH_CLUSTER_MODE: docker
 
     steps:
     - uses: actions/checkout@v4
 
-    # 复用同一套 cluster setup:build 镜像 + docker-compose up 3M/2R/3PS + 装 pytest 依赖。
+    # Reuse the same cluster setup: build image + docker-compose up 3M/2R/3PS
+    # + install pytest dependencies.
     - uses: ./.github/actions/set_cluster_env
       with:
         build-type: github
 
     - name: Run cluster rebuild tests
-      # --maxfail=3 收齐多个 failing case 的日志,而不是首发 fail 就退。
-      # -p no:cacheprovider 避免 .pytest_cache 堆在 runner 上。
-      # --timeout=600 + thread method:单条测试 hang 600s 后强制 fail,
-      # 防止某条 chaos 测试 hang 让整个 90min job 被 GitHub 强制取消、
-      # 后续测试全部得不到执行机会。
+      # --maxfail=3 collects logs for multiple failing cases instead of
+      # exiting on the first failure.
+      # -p no:cacheprovider avoids accumulating .pytest_cache on the runner.
+      # --timeout=600 + thread method: a single test hanging for 600s is
+      # forced to fail, so one hung chaos test cannot let GitHub cancel the
+      # whole 90-min job and starve the rest of the suite.
       run: |
         cd test
         pip install pytest-timeout
@@ -111,8 +118,10 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: rebuild-chaos-logs
-        # docker mode 下集群日志在容器内 /vearch/logs/,host 上没有目录;
-        # 这里只收 pytest 自身产物。需要容器日志时测试会按需 `docker exec` 拉取。
+        # In docker mode cluster logs live inside the container at
+        # /vearch/logs/, with no directory on the host; this step only
+        # collects pytest's own artifacts. Container logs are pulled on
+        # demand by tests via `docker exec`.
         path: |
           test/*.log
         retention-days: 14
