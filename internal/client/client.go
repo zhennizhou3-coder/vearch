@@ -690,11 +690,6 @@ func (r *routerRequest) searchFromPartition(ctx context.Context, partitionID ent
 		log.Error("nodeID %v partitionID: %d rpc err [%v], retryTime: %d, len(partition.Replicas)=%d, faultyNodeNum: %d", nodeID, partitionID, retry_err, retryTime, len(partition.Replicas), faultyNodeNum)
 		if strings.Contains(retry_err.Error(), "connect: connection refused") {
 			r.client.PS().AddFaulty(nodeID, time.Second*30)
-		} else if clientType == request.Leader && isPartitionNotLeaderError(retry_err) {
-			// Retry leader-read failure on a non-leader replica.
-			log.Warn("partition %d leader-typed read got PARTITION_NOT_LEADER from nodeID=%d, downgrading to non-leader and retrying", partitionID, nodeID)
-			clientType = request.NotLeader
-			pd.SearchRequest.Head.ClientType = ""
 		} else {
 			break
 		}
@@ -1047,10 +1042,6 @@ func (r *routerRequest) queryFromPartition(ctx context.Context, partitionID enti
 		log.Error("nodeID %v partitionID: %d rpc err [%v], retryTime: %d, len(partition.Replicas)=%d, faultyNodeNum: %d", nodeID, partitionID, retry_err, retryTime, len(partition.Replicas), faultyNodeNum)
 		if strings.Contains(retry_err.Error(), "connect: connection refused") {
 			r.client.PS().AddFaulty(nodeID, time.Second*30)
-		} else if clientType == request.Leader && isPartitionNotLeaderError(retry_err) {
-			log.Warn("partition %d leader-typed read got PARTITION_NOT_LEADER from nodeID=%d, downgrading to non-leader and retrying", partitionID, nodeID)
-			clientType = request.NotLeader
-			pd.QueryRequest.Head.ClientType = ""
 		} else {
 			break
 		}
@@ -1374,31 +1365,13 @@ func SetRebuildBusyNode(nodeID entity.NodeID) {
 	rebuildBusyNodeID.Store(uint64(nodeID))
 }
 
-// isPartitionNotLeaderError reports whether err is a PARTITION_NOT_LEADER error.
-func isPartitionNotLeaderError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if vErr, ok := err.(*vearchpb.VearchErr); ok {
-		return vErr.GetError().Code == vearchpb.ErrorEnum_PARTITION_NOT_LEADER
-	}
-	return strings.Contains(err.Error(), vearchpb.ErrMsg(vearchpb.ErrorEnum_PARTITION_NOT_LEADER))
-}
-
-// SelectNodeByClientType chooses one target node to serve a read for the given
-// client type (leader / not-leader / random / least-connection), skipping
-// faulty and rebuilding replicas. A leader read is an explicit strong-
-// consistency request: if the leader's index is rebuilding it returns a
-// PARTITION_LEADER_REBUILDING error rather than silently downgrading to a
-// follower, so the caller learns the leader is temporarily unavailable instead
-// of unknowingly reading possibly-stale data.
+// SelectNodeByClientType selects a healthy, non-rebuilding replica.
+// Leader reads fail with PARTITION_LEADER_REBUILDING instead of using a follower.
 func SelectNodeByClientType(clientType string, partition *entity.Partition, servers *cache.Cache, client *Client) (entity.NodeID, error) {
 	nodeId := uint64(0)
 	switch clientType {
 	case request.Leader:
 		if partition.LeaderID == entity.NodeID(rebuildBusyNodeID.Load()) {
-			log.Warn("partition %d leader=%d rebuilding; rejecting leader-typed read",
-				partition.Id, partition.LeaderID)
 			return 0, vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_LEADER_REBUILDING,
 				fmt.Errorf("partition %d leader=%d is rebuilding index", partition.Id, partition.LeaderID))
 		}

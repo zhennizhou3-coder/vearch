@@ -2154,34 +2154,17 @@ class TestRebuildSingleReplicaAvailability:
         _ensure_clean_db()
 
     def test_search_fails_when_only_replica_is_rebuilding(self):
-        """Verifies queries fail while the router observes the sole replica rebuilding.
+        """Queries must fail while the sole replica (rn=1) is rebuilding.
 
-        Router filters the rebuilding replica out of the candidate set
-        (client.go::isRebuildingIndex). With rn=1 the set is empty →
-        SelectNodeByClientType returns nodeID=0 and the RPC layer reports
-        a router-side error before touching the PS.
+        The router filters the rebuilding replica out (client.go::
+        isRebuildingIndex); with rn=1 the candidate set is empty and the
+        RPC layer errors router-side before reaching the PS.
 
-        Rebuild has two propagation windows the test must account for
-        rather than assert against:
-        - On start: master flips /progress in dispatchPending
-          (rebuild_service.go:1030) before markReplicaRebuilding writes
-          ReStatusMap (:1036), and the router picks up the etcd change
-          asynchronously via a watcher (master_cache.go:506-536).
-        - On end: unmarkReplicaRebuilding writes ReStatusMap=OK, and the
-          router again catches up asynchronously — reads on the just-
-          restored replica become legal from the router's cache-observed
-          moment, which trails the master's `completed` state.
-
-        Locally each window is ~80ms. During those two spans the router
-        legitimately routes reads through: the PS has no read-side rebuild
-        guard, and the C++ engine either has not yet torn down the old
-        index (start) or has fully restored it (end).
-
-        The regression bar is therefore two-sided: between the FIRST and
-        LAST refusal observed on the search stream, the filter is engaged
-        and no `ok` may appear. See the rn=2 counterpart in
-        test_search_no_errors_during_rebuild for the healthy routing-
-        around case.
+        Start/end propagate to the router's cache asynchronously (~80ms
+        each locally), so reads are briefly legal at both edges. The bar
+        is two-sided: between the FIRST and LAST refusal on the stream,
+        no `ok` may appear. See test_search_no_errors_during_rebuild for
+        the rn=2 route-around counterpart.
         """
         _ensure_all_ps_alive()
         case_space = space_name + "_chaos_single_replica_self"

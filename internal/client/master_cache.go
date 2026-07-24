@@ -834,12 +834,8 @@ func (cliCache *clientCache) initPartition(ctx context.Context) error {
 	return nil
 }
 
-// refreshRebuildBusyNode scans the partition cache and publishes the node ID
-// that is currently running a rebuild (via ReplicasRebuildingIndex marker),
-// or 0 when none is active. Rebuilds are globally serialized by the master
-// scheduler, so at most one PS is expected to be busy; if the cache reflects
-// more than one, we still publish only the first — a soft routing hint does
-// not need to cover a transient inconsistency perfectly.
+// refreshRebuildBusyNode publishes the rebuilding node found in the partition
+// cache, or 0 when no rebuild is active.
 func refreshRebuildBusyNode(partitionCache *cache.Cache) {
 	var busyNodeID entity.NodeID
 	for _, item := range partitionCache.Items() {
