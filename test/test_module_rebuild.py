@@ -302,10 +302,15 @@ def _compute_recall(case_space_name: str, k: int = 100) -> dict:
         "recall_at_10": recall10_hits / nq if nq else 0.0,
     }
 
-def _ensure_clean_db():
-    """Drop all spaces then drop DB, then create a fresh DB."""
-    spaces_url = f"{router_url}/dbs/{db_name}/spaces"
-    db_url = f"{router_url}/dbs/{db_name}"
+def _ensure_clean_db(target_db: str = None):
+    """Drop all spaces then drop DB, then create a fresh DB.
+
+    Defaults to the module-level ``db_name`` but accepts any DB so tests that
+    also use a secondary DB can reuse the same drop-wait-recreate sequence.
+    """
+    target_db = target_db or db_name
+    spaces_url = f"{router_url}/dbs/{target_db}/spaces"
+    db_url = f"{router_url}/dbs/{target_db}"
 
     # Step 1: List existing spaces under the DB and drop each.
     rs = requests.get(spaces_url, auth=(username, password))
@@ -318,7 +323,7 @@ def _ensure_clean_db():
                 sp_name = sp.get("space_name") or sp.get("name") or ""
                 if sp_name:
                     logger.info("dropping residual space: %s", sp_name)
-                    drop_resp = drop_space(router_url, db_name, sp_name)
+                    drop_resp = drop_space(router_url, target_db, sp_name)
                     logger.info("drop_space %s result: status=%d body=%s",
                                 sp_name, drop_resp.status_code,
                                 drop_resp.text[:200])
@@ -352,19 +357,19 @@ def _ensure_clean_db():
         time.sleep(0.5)
     else:
         logger.warning("_ensure_clean_db: db %s still visible after drop within 15s",
-                       db_name)
+                       target_db)
 
     # Step 3: Create fresh DB — assert success so a silent failure cannot
     # cascade into "db_not_exist" on later create_space.
-    create_resp = create_db(router_url, db_name)
+    create_resp = create_db(router_url, target_db)
     logger.info("create_db result: status=%d body=%s",
                 create_resp.status_code, create_resp.text[:200])
     assert create_resp.status_code == 200, (
-        f"create_db {db_name} HTTP {create_resp.status_code}: "
+        f"create_db {target_db} HTTP {create_resp.status_code}: "
         f"{create_resp.text[:500]}")
     create_body = create_resp.json()
     assert create_body.get("code") == 0, (
-        f"create_db {db_name} business error: {create_resp.text[:500]}")
+        f"create_db {target_db} business error: {create_resp.text[:500]}")
 
 # ---------------------------------------------------------------------------
 # Space config factories
@@ -1078,22 +1083,8 @@ class TestRebuildProgressQuery:
         total_batch = int(total / batch_size)
 
         extra_db = db_name + "_mri_global"
-        # Clean up extra DB from prior runs.
-        for sp_data in (db_name, extra_db):
-            url = f"{router_url}/dbs/{sp_data}/spaces"
-            rs = requests.get(url, auth=(username, password))
-            if rs.status_code == 200:
-                body = rs.json()
-                if body.get("code") == 0 and body.get("data"):
-                    for sp in body["data"]:
-                        sp_name = sp.get("space_name") or sp.get("name") or ""
-                        if sp_name:
-                            drop_space(router_url, sp_data, sp_name)
-            drop_db(router_url, sp_data)
-
-        # Create both DBs.
-        create_db(router_url, db_name)
-        create_db(router_url, extra_db)
+        _ensure_clean_db(db_name)
+        _ensure_clean_db(extra_db)
 
         # Create 1 space in each DB.
         sp_main = space_name + "_mri_global_main"
@@ -1143,21 +1134,10 @@ class TestRebuildProgressQuery:
 
         extra_db = db_name + "_mri_prog_global_extra"
 
-        # Clean up extra DB from prior runs.
-        for db_to_clean in (db_name, extra_db):
-            url = f"{router_url}/dbs/{db_to_clean}/spaces"
-            rs = requests.get(url, auth=(username, password))
-            if rs.status_code == 200:
-                body = rs.json()
-                if body.get("code") == 0 and body.get("data"):
-                    for sp in body["data"]:
-                        sp_name = sp.get("space_name") or sp.get("name") or ""
-                        if sp_name:
-                            drop_space(router_url, db_to_clean, sp_name)
-            drop_db(router_url, db_to_clean)
-
-        create_db(router_url, db_name)
-        create_db(router_url, extra_db)
+        # Drop-wait-recreate both DBs so create_space can't hit a stale
+        # "db_not_exist" from an unfinished drop or unpropagated create.
+        _ensure_clean_db(db_name)
+        _ensure_clean_db(extra_db)
 
         # Create 2 spaces in the main DB and 1 space in the extra DB.
         sp_main_a = space_name + "_mri_prog_global_main_a"
