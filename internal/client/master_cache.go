@@ -838,12 +838,10 @@ func (cliCache *clientCache) initPartition(ctx context.Context) error {
 // that is currently running a rebuild (via ReplicasRebuildingIndex marker),
 // or 0 when none is active. Rebuilds are globally serialized by the master
 // scheduler, so at most one PS is expected to be busy; if the cache reflects
-// more than one during a transient inconsistency, we still publish only the
-// first — router routing has a last-resort fallback when the busy node is
-// the only remaining candidate, so an imperfectly-tracked busy set never
-// costs availability.
+// more than one, we still publish only the first — a soft routing hint does
+// not need to cover a transient inconsistency perfectly.
 func refreshRebuildBusyNode(partitionCache *cache.Cache) {
-	var busy entity.NodeID
+	var busyNodeID entity.NodeID
 	for _, item := range partitionCache.Items() {
 		p, ok := item.Object.(*entity.Partition)
 		if !ok || p == nil {
@@ -851,15 +849,15 @@ func refreshRebuildBusyNode(partitionCache *cache.Cache) {
 		}
 		for nid, st := range p.ReStatusMap {
 			if st == entity.ReplicasRebuildingIndex {
-				busy = entity.NodeID(nid)
+				busyNodeID = entity.NodeID(nid)
 				break
 			}
 		}
-		if busy != 0 {
+		if busyNodeID != 0 {
 			break
 		}
 	}
-	SetRebuildBusyNode(busy)
+	SetRebuildBusyNode(busyNodeID)
 }
 
 func (cliCache *clientCache) initServer(ctx context.Context) error {

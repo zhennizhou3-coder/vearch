@@ -569,13 +569,18 @@ func (r *routerRequest) searchFromPartition(ctx context.Context, partitionID ent
 	serverCache := r.client.Master().Cache().serverCache
 
 	rpcEnd, rpcStart := time.Now(), time.Now()
-	nodeID, fellBackToFollower := SelectNodeByClientType(clientType, partition, serverCache, r.client)
-	if fellBackToFollower {
-		// The leader's index is rebuilding, so the read was routed to a
-		// follower. Clear ClientType so the PS readable check treats it as a
-		// non-leader read and accepts it; otherwise the follower would reject
-		// it with PARTITION_NOT_LEADER.
-		pd.SearchRequest.Head.ClientType = ""
+	nodeID, selErr := SelectNodeByClientType(clientType, partition, serverCache, r.client)
+	if selErr != nil {
+		var err *vearchpb.Error
+		if vErr, ok := selErr.(*vearchpb.VearchErr); ok {
+			err = &vearchpb.Error{Code: vErr.GetError().Code, Msg: selErr.Error()}
+		} else {
+			err = &vearchpb.Error{Code: vearchpb.ErrorEnum_INTERNAL_ERROR, Msg: selErr.Error()}
+		}
+		pd.SearchResponse = &vearchpb.SearchResponse{Head: &vearchpb.ResponseHead{Err: err}}
+		responseDoc.PartitionData = pd
+		respChain <- responseDoc
+		return
 	}
 
 	faultyNodeNum := r.replicasFaultyNum(partition.Replicas)
@@ -693,9 +698,10 @@ func (r *routerRequest) searchFromPartition(ctx context.Context, partitionID ent
 		} else {
 			break
 		}
-		nodeID, fellBackToFollower = SelectNodeByClientType(clientType, partition, serverCache, r.client)
-		if fellBackToFollower {
-			pd.SearchRequest.Head.ClientType = ""
+		nodeID, selErr = SelectNodeByClientType(clientType, partition, serverCache, r.client)
+		if selErr != nil {
+			retry_err = selErr
+			break
 		}
 
 		faultyNodeNum = r.replicasFaultyNum(partition.Replicas)
@@ -995,9 +1001,18 @@ func (r *routerRequest) queryFromPartition(ctx context.Context, partitionID enti
 	// ensure node is alive
 	servers := r.client.Master().Cache().serverCache
 
-	nodeID, fellBackToFollower := SelectNodeByClientType(clientType, partition, servers, r.client)
-	if fellBackToFollower {
-		pd.QueryRequest.Head.ClientType = ""
+	nodeID, selErr := SelectNodeByClientType(clientType, partition, servers, r.client)
+	if selErr != nil {
+		var err *vearchpb.Error
+		if vErr, ok := selErr.(*vearchpb.VearchErr); ok {
+			err = &vearchpb.Error{Code: vErr.GetError().Code, Msg: selErr.Error()}
+		} else {
+			err = &vearchpb.Error{Code: vearchpb.ErrorEnum_INTERNAL_ERROR, Msg: selErr.Error()}
+		}
+		pd.SearchResponse = &vearchpb.SearchResponse{Head: &vearchpb.ResponseHead{Err: err}}
+		responseDoc.PartitionData = pd
+		respChain <- responseDoc
+		return
 	}
 
 	faultyNodeNum := r.replicasFaultyNum(partition.Replicas)
@@ -1039,9 +1054,10 @@ func (r *routerRequest) queryFromPartition(ctx context.Context, partitionID enti
 		} else {
 			break
 		}
-		nodeID, fellBackToFollower = SelectNodeByClientType(clientType, partition, servers, r.client)
-		if fellBackToFollower {
-			pd.QueryRequest.Head.ClientType = ""
+		nodeID, selErr = SelectNodeByClientType(clientType, partition, servers, r.client)
+		if selErr != nil {
+			retry_err = selErr
+			break
 		}
 
 		faultyNodeNum = r.replicasFaultyNum(partition.Replicas)
@@ -1339,16 +1355,6 @@ func (r *routerRequest) SearchByPartitions(searchReq *vearchpb.SearchRequest) *r
 
 var replicaRoundRobin = newRoundRobin[entity.PartitionID, entity.NodeID]()
 
-// isRebuildingIndex reports whether the partition status map marks the
-// replica on nodeID as rebuilding. The marker is maintained by the master
-// rebuild scheduler, so it reflects scheduled state and may lag the PS.
-func isRebuildingIndex(partition *entity.Partition, nodeID entity.NodeID) bool {
-	if partition == nil || partition.ReStatusMap == nil {
-		return false
-	}
-	return partition.ReStatusMap[nodeID] == entity.ReplicasRebuildingIndex
-}
-
 // rebuildBusyNodeID names the single PS node currently running an index
 // rebuild, or 0 when none is active. Rebuilds are globally serialized by the
 // master scheduler, so at most one PS is busy at any time
@@ -1368,48 +1374,6 @@ func SetRebuildBusyNode(nodeID entity.NodeID) {
 	rebuildBusyNodeID.Store(uint64(nodeID))
 }
 
-// preferredIdleLogged dedups the "prefer idle host over rebuild-busy node"
-// log per (partitionID, busyNodeID).
-var preferredIdleLogged sync.Map // key: uint64(pid)<<32 | uint64(busyNid)
-
-// preferIdleHosts filters the rebuild-busy PS node out of the candidate set
-// when at least one other candidate remains; otherwise it returns the
-// original slice so the last reachable replica is not stripped. This is a
-// hard filter with a last-resort fallback — NOT a weighted preference. When
-// idle candidates exist, the busy node receives zero traffic from that
-// call site; when it is the only one left, all traffic still lands on it.
-// The behavior mirrors isRebuildingIndex on the co-tenant path (partition
-// p2 on host X when p1 is rebuilding on X), and differs only in that
-// isRebuildingIndex has no fallback (a rebuilding replica is never a valid
-// target for its own partition). pid is used only for the dedup log key.
-func preferIdleHosts(pid entity.PartitionID, candidates []entity.NodeID) []entity.NodeID {
-	if len(candidates) <= 1 {
-		return candidates
-	}
-	busy := entity.NodeID(rebuildBusyNodeID.Load())
-	if busy == 0 {
-		return candidates
-	}
-	idle := make([]entity.NodeID, 0, len(candidates))
-	for _, nid := range candidates {
-		if nid != busy {
-			idle = append(idle, nid)
-		}
-	}
-	if len(idle) == 0 {
-		return candidates
-	}
-	// Log the first time we route around busyNode for this partition —
-	// this is the observable signal that "p2 on host X was diverted while
-	// p1 was rebuilding on X". Dedup per (pid, busy) keeps volume bounded.
-	k := uint64(pid)<<32 | uint64(busy)
-	if _, loaded := preferredIdleLogged.LoadOrStore(k, struct{}{}); !loaded {
-		log.Warn("partition %d preferred idle replicas over busy nodeID=%d rebuilding",
-			pid, busy)
-	}
-	return idle
-}
-
 // isPartitionNotLeaderError reports whether err is a PARTITION_NOT_LEADER error.
 func isPartitionNotLeaderError(err error) bool {
 	if err == nil {
@@ -1421,53 +1385,22 @@ func isPartitionNotLeaderError(err error) bool {
 	return strings.Contains(err.Error(), vearchpb.ErrMsg(vearchpb.ErrorEnum_PARTITION_NOT_LEADER))
 }
 
-// pickHealthyNonRebuildingReplica picks a live fallback replica.
-func pickHealthyNonRebuildingReplica(partition *entity.Partition,
-	servers *cache.Cache, client *Client, excludeNodeID entity.NodeID) entity.NodeID {
-	candidates := make([]entity.NodeID, 0)
-	for _, nodeID := range partition.Replicas {
-		if nodeID == excludeNodeID {
-			continue
-		}
-		if _, ok := servers.Get(cast.ToString(nodeID)); !ok {
-			continue
-		}
-		if client.PS().TestFaulty(nodeID) {
-			continue
-		}
-		if isRebuildingIndex(partition, nodeID) {
-			continue
-		}
-		if config.Conf().Global.RaftConsistent &&
-			partition.ReStatusMap[nodeID] != entity.ReplicasOK {
-			continue
-		}
-		candidates = append(candidates, nodeID)
-	}
-	return replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, candidates))
-}
-
 // SelectNodeByClientType chooses one target node to serve a read for the given
 // client type (leader / not-leader / random / least-connection), skipping
-// faulty and rebuilding replicas. The second return is true when a leader read
-// was rerouted to a follower because the leader's index is rebuilding; callers
-// must then clear Head.ClientType so the PS accepts the read on the follower.
-func SelectNodeByClientType(clientType string, partition *entity.Partition, servers *cache.Cache, client *Client) (entity.NodeID, bool) {
+// faulty and rebuilding replicas. A leader read is an explicit strong-
+// consistency request: if the leader's index is rebuilding it returns a
+// PARTITION_LEADER_REBUILDING error rather than silently downgrading to a
+// follower, so the caller learns the leader is temporarily unavailable instead
+// of unknowingly reading possibly-stale data.
+func SelectNodeByClientType(clientType string, partition *entity.Partition, servers *cache.Cache, client *Client) (entity.NodeID, error) {
 	nodeId := uint64(0)
-	fellBackToFollower := false
 	switch clientType {
 	case request.Leader:
-		// Avoid querying a leader while its index is rebuilding.
-		if isRebuildingIndex(partition, partition.LeaderID) {
-			if fb := pickHealthyNonRebuildingReplica(partition, servers, client, partition.LeaderID); fb != 0 {
-				log.Warn("partition %d leader=%d rebuilding, fallback to nodeID=%d",
-					partition.Id, partition.LeaderID, fb)
-				nodeId = fb
-				fellBackToFollower = true
-				break
-			}
-			log.Warn("partition %d leader=%d rebuilding and no fallback replica available; routing to leader anyway",
+		if partition.LeaderID == entity.NodeID(rebuildBusyNodeID.Load()) {
+			log.Warn("partition %d leader=%d rebuilding; rejecting leader-typed read",
 				partition.Id, partition.LeaderID)
+			return 0, vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_LEADER_REBUILDING,
+				fmt.Errorf("partition %d leader=%d is rebuilding index", partition.Id, partition.LeaderID))
 		}
 		nodeId = partition.LeaderID
 	case request.NotLeader:
@@ -1480,7 +1413,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			if client.PS().TestFaulty(nodeID) {
 				continue
 			}
-			if isRebuildingIndex(partition, nodeID) {
+			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1493,7 +1426,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				}
 			}
 		}
-		nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, noLeaderIDs))
+		nodeId = replicaRoundRobin.Next(partition.Id, noLeaderIDs)
 	case request.Random, "":
 		randIDs := make([]entity.NodeID, 0)
 		for _, nodeID := range partition.Replicas {
@@ -1504,7 +1437,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			if client.PS().TestFaulty(nodeID) {
 				continue
 			}
-			if isRebuildingIndex(partition, nodeID) {
+			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1515,7 +1448,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				randIDs = append(randIDs, nodeID)
 			}
 		}
-		nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, randIDs))
+		nodeId = replicaRoundRobin.Next(partition.Id, randIDs)
 	case request.LeastConnection:
 		leastId := uint64(0)
 		most := 1<<32 - 1
@@ -1529,13 +1462,9 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			if client.PS().TestFaulty(nodeID) {
 				continue
 			}
-			if isRebuildingIndex(partition, nodeID) {
+			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
 				continue
 			}
-			// Collect the candidate here regardless of rebuild-busy state;
-			// the post-loop preferIdleHosts filter drops the busy node
-			// (with a last-resort fallback) once the full randIDs set and
-			// its GetConcurrent readings are known.
 			if config.Conf().Global.RaftConsistent {
 				if partition.ReStatusMap[nodeID] == entity.ReplicasOK {
 					randIDs = append(randIDs, nodeID)
@@ -1562,23 +1491,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				}
 			}
 		}
-		// Drop the rebuild-busy node from the candidate pool when there
-		// is at least one other candidate; if the least-connection winner
-		// was the busy node, redirect it to an idle one. Falls through to
-		// the original all-candidates decision when no rebuild is running
-		// or when the busy node is the only remaining candidate — that
-		// last case preserves availability at the cost of routing to X.
-		if idle := preferIdleHosts(partition.Id, randIDs); len(idle) > 0 && len(idle) < len(randIDs) {
-			busy := entity.NodeID(rebuildBusyNodeID.Load())
-			if leastId == busy {
-				leastId = idle[0]
-			}
-			if least > 10 {
-				nodeId = leastId
-			} else {
-				nodeId = replicaRoundRobin.Next(partition.Id, idle)
-			}
-		} else if least > 10 {
+		if least > 10 {
 			nodeId = leastId
 		} else {
 			nodeId = replicaRoundRobin.Next(partition.Id, randIDs)
@@ -1597,7 +1510,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			if client.PS().TestFaulty(nodeID) {
 				continue
 			}
-			if isRebuildingIndex(partition, nodeID) {
+			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1617,9 +1530,9 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			}
 		}
 		if len(nearestId[entity.HostZone]) > 0 {
-			nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, nearestId[entity.HostZone]))
+			nodeId = replicaRoundRobin.Next(partition.Id, nearestId[entity.HostZone])
 		} else {
-			nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, nearestId[OTHER]))
+			nodeId = replicaRoundRobin.Next(partition.Id, nearestId[OTHER])
 		}
 	default:
 		randIDs := make([]entity.NodeID, 0)
@@ -1631,7 +1544,7 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			if client.PS().TestFaulty(nodeID) {
 				continue
 			}
-			if isRebuildingIndex(partition, nodeID) {
+			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1642,9 +1555,9 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				randIDs = append(randIDs, nodeID)
 			}
 		}
-		nodeId = replicaRoundRobin.Next(partition.Id, preferIdleHosts(partition.Id, randIDs))
+		nodeId = replicaRoundRobin.Next(partition.Id, randIDs)
 	}
-	return nodeId, fellBackToFollower
+	return nodeId, nil
 }
 
 func AddMergeResultArr(dest []*vearchpb.SearchResult, src []*vearchpb.SearchResult) error {
@@ -1867,10 +1780,6 @@ func (r *routerRequest) ForceMergeExecute() *vearchpb.ForceMergeResponse {
 	forceMergeResponse.Shards = respShards
 	return forceMergeResponse
 }
-
-// RebuildIndexExecute / ReplicaRebuildIndexExecute were removed with the
-// migration of /index/rebuild to the master-orchestrated path (router
-// proxies to master; master dispatches to PS via ExecuteRebuildIndex).
 
 // FlushExecute Execute request
 func (r *routerRequest) FlushExecute() *vearchpb.FlushResponse {

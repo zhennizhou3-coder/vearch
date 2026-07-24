@@ -1636,8 +1636,6 @@ class TestRebuildPSFailureExtras:
                     if r.status_code == 200:
                         partitions = (r.json().get("data") or {}).get("partitions")
                 except requests.exceptions.RequestException:
-
-
                     partitions = None
                 if partitions:
                     break
@@ -1665,8 +1663,6 @@ class TestRebuildPSFailureExtras:
 
             # Bonus: search must still respond 200 (not stuck due to a
             # stale Rebuilding marker preventing replica from receiving
-
-
             search_url = router_url + "/document/search?timeout=5000"
             search_data = {
                 "vector_value": False,
@@ -1692,12 +1688,6 @@ class TestRebuildPSFailureExtras:
             logger.info("post-failure search response code=%s",
                          sr.json().get("code"))
         finally:
-
-
-
-
-
-
             try:
                 cl.start_ps(2, wait_ready=True, timeout=30)
             except Exception:
