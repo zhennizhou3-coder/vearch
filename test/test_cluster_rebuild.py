@@ -1119,21 +1119,39 @@ class TestRebuildReplicaRoutingChaos:
         finally:
             drop_space(router_url, db_name, case_space)
 
-    def test_leader_rebuild_falls_back_to_follower(self):
-        """Verifies leader-directed searches fall back to a follower while the leader replica rebuilds."""
+    # Router error code returned when a leader-typed read hits a leader whose
+    # index is rebuilding (vearchpb.ErrorEnum_PARTITION_LEADER_REBUILDING).
+    PARTITION_LEADER_REBUILDING = 147
+
+    def test_leader_read_rejected_while_leader_rebuilding(self):
+        """Verifies leader-directed searches are REJECTED, not downgraded, while the leader rebuilds.
+
+        A `load_balance: "leader"` read is an explicit strong-consistency
+        (read-your-writes) request. When the leader replica's index is
+        rebuilding, the router (client.go::SelectNodeByClientType) must return
+        PARTITION_LEADER_REBUILDING (147) rather than silently route to a
+        follower that could serve stale data.
+
+        Like the single-replica case, rebuild has two async propagation windows
+        (the router cache trails master state on both start and completion).
+        Inside those gaps the router does not yet / no longer observes the
+        leader rebuilding, so leader reads legitimately succeed. The regression
+        bar is therefore two-sided: between the FIRST and LAST observed 147
+        rejection the reject path is engaged and no success (code==0) may slip
+        through.
+
+        Uses IVFPQ rather than HNSW: HNSW builds too fast on 10k docs to cover
+        the reject window reliably (see TestRebuildSingleReplicaAvailability).
+        """
         _ensure_clean_db()
-        case_space = space_name + "_chaos_leader_fb_r3"
-        batch_size, total = 100, min(10000, xb.shape[0])
-        total_batch = int(total / batch_size)
+        case_space = space_name + "_chaos_leader_reject_r3"
 
         resp = create_space(router_url, db_name,
-                            _hnsw_cfg(case_space, pn=1, rn=3))
+                            _ivfpq_cfg(case_space, pn=1, rn=3))
         if resp.json().get("code") != 0:
             pytest.skip(f"cluster cannot host replica_num=3: {resp.json()}")
         try:
-            add(total_batch, batch_size, xb[:total], True, True,
-                space_name=case_space)
-            waiting_index_finish(total, space_name=case_space)
+            _populate(case_space, total=min(10000, xb.shape[0]))
 
             detail = _get_space_detail(db_name, case_space)
             partitions = detail.get("partitions") or []
@@ -1162,25 +1180,21 @@ class TestRebuildReplicaRoutingChaos:
                 }
                 rs = requests.post(search_url, auth=(username, password),
                                    json=data, timeout=5)
-
                 code = None
-                detail = None
-                if rs.status_code == 200:
-                    try:
-                        code = rs.json().get("code")
-                    except Exception:
-                        detail = rs.text[:200]
-                else:
-                    detail = rs.text[:200]
-                return rs.status_code, code, detail
+                try:
+                    code = rs.json().get("code")
+                except Exception:
+                    code = None
+                return rs.status_code, code
 
             def _leader_query_loop():
                 while not stop_evt.is_set():
+                    ts = time.time()
                     try:
-                        status, code, detail = _leader_query_once()
-                        leader_query_results.append((status, code, detail))
+                        status, code = _leader_query_once()
+                        leader_query_results.append((ts, status, code))
                     except Exception as e:
-                        leader_query_results.append((None, str(e), None))
+                        leader_query_results.append((ts, None, str(e)))
                     time.sleep(0.05)
 
             def _poll_leader_restatus():
@@ -1216,11 +1230,9 @@ class TestRebuildReplicaRoutingChaos:
             poller.join(timeout=5)
 
             assert leader_query_results, "no Leader-type queries issued"
-            bad = [r for r in leader_query_results
-                   if not (r[0] == 200 and r[1] == 0)]
-            assert not bad, (
-                "Leader-directed queries failed; sample=%s" % (bad[:5],))
 
+            # The leader replica must actually have rebuilt, else the test
+            # proves nothing about the reject path.
             if not leader_seen_rebuilding[0]:
                 lid_int = int(leader_id)
                 for t in final.get("tasks") or []:
@@ -1229,13 +1241,39 @@ class TestRebuildReplicaRoutingChaos:
                         leader_seen_rebuilding[0] = True
                         break
             assert leader_seen_rebuilding[0], (
-                "the leader replica was neither observed rebuilding nor found in final tasks; "
-                "no completed task for node_id=%s was available to verify fallback" % (leader_id,))
+                "the leader replica was neither observed rebuilding nor found "
+                "in final tasks; cannot verify the reject path for node_id=%s"
+                % (leader_id,))
+
+            # The reject path must have fired: at least one leader read got
+            # PARTITION_LEADER_REBUILDING (147) instead of a follower fallback.
+            rejects = [r for r in leader_query_results
+                       if r[2] == self.PARTITION_LEADER_REBUILDING]
+            assert rejects, (
+                "no leader read was rejected with code %d during rebuild; "
+                "codes seen=%s" % (self.PARTITION_LEADER_REBUILDING,
+                                   sorted({r[2] for r in leader_query_results
+                                           if isinstance(r[2], int)})))
+
+            # Two-sided bound: between the first and last observed rejection the
+            # reject path is engaged; no leader read may succeed in that span.
+            first_reject = min(r[0] for r in rejects)
+            last_reject = max(r[0] for r in rejects)
+            leaked = [r for r in leader_query_results
+                      if first_reject <= r[0] <= last_reject
+                      and r[1] == 200 and r[2] == 0]
+            assert not leaked, (
+                "leader read succeeded while the leader was rebuilding "
+                "(reject window %.3f..%.3f); leaked=%s"
+                % (first_reject, last_reject, leaked[:5]))
 
             logger.info(
-                "leader fallback verified through %d successful queries",
-                len(leader_query_results))
+                "leader-read reject verified: %d/%d queries returned code %d",
+                len(rejects), len(leader_query_results),
+                self.PARTITION_LEADER_REBUILDING)
 
+            # After rebuild completes and the router cache catches up, leader
+            # reads must succeed again and the leader must be unchanged.
             post_detail = _get_space_detail(db_name, case_space)
             post_parts = post_detail.get("partitions") or []
             assert post_parts, "space details returned no partition after rebuild"
@@ -1246,9 +1284,18 @@ class TestRebuildReplicaRoutingChaos:
             assert post_leader_id == leader_id, (
                 "leader changed after rebuild: before=%s after=%s" %
                 (leader_id, post_leader_id))
+
+            # Router cache convergence may trail completion; poll briefly for
+            # the first post-rebuild success before asserting stability.
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                status, code = _leader_query_once()
+                if status == 200 and code == 0:
+                    break
+                time.sleep(0.2)
             post_results = [_leader_query_once() for _ in range(20)]
             assert all(status == 200 and code == 0
-                       for status, code, _ in post_results), (
+                       for status, code in post_results), (
                 "Leader-directed queries were not stable after rebuild; sample=%s" %
                 (post_results[:5],))
         finally:
@@ -1343,7 +1390,8 @@ class TestRebuildReplicaRoutingChaos:
             if not (p2_reps - {x_node}):
                 pytest.skip(
                     f"p2({p2_pid}) has no idle replica besides X={x_node}; "
-                    "only last-resort fallback is testable, not preferIdleHosts filtering")
+                    "its sole candidate would be stripped as the busy host "
+                    "(the 6.2 fail-fast case), not the route-around path 3.5 checks")
             logger.info(
                 "3.5 chosen layout: p1=pid:%s replicas=%s, "
                 "p2=pid:%s replicas=%s, X=%d",
@@ -1437,8 +1485,8 @@ class TestRebuildReplicaRoutingChaos:
             assert fail_rate <= 0.05, (
                 f"search failure rate during rebuild was {fail_rate:.2%} "
                 f"({len(search_fail)}/{len(search_results)}), which is too high: "
-                f"Router did not skip the rebuilding replica or preferIdleHosts emptied p2 "
-                f"candidates (sample failures={search_fail[:3]})"
+                f"Router did not skip the rebuilding replica / busy host, or "
+                f"emptied p2's candidates (sample failures={search_fail[:3]})"
             )
             logger.info(
                 "3.5 verified through queries: search_ok=%d/%d",
@@ -2077,8 +2125,9 @@ class TestRebuildConcurrentWrites:
 # Companion cases to TestRebuildConcurrentWrites, which exercises rn=2 and
 # asserts that Router routes around the rebuilding replica so query error
 # rate stays < 10%. The two cases below cover the *unrecoverable* side of
-# that behavior — when the router filter (client.go::isRebuildingIndex /
-# preferIdleHosts) is asked to skip a replica that has no siblings.
+# that behavior — when the router filter (client.go::isRebuildingIndex,
+# which rejects both the partition's own rebuilding replica and the global
+# rebuild-busy host) is asked to skip a replica that has no siblings.
 #
 # 6.1 — single-replica space, rebuild on THAT replica: while the router
 #       observes ReplicasRebuildingIndex, candidate set empties to zero
@@ -2089,12 +2138,15 @@ class TestRebuildConcurrentWrites:
 #       permitted; the head/tail propagation gaps are logged, not asserted.
 #
 # 6.2 — two single-replica single-partition spaces that Master happens to
-#       co-locate on the same PS X. Rebuild on spaceA marks X busy. Reads
-#       against spaceB on X are the current router bug window: preferIdleHosts
-#       has a "len<=1 → keep the busy node" fallback, but the empirical
-#       failure rate observed on cluster runs is high enough to gate on. See
-#       test_cross_partition_no_routing_interference (rn=2 counterpart) for
-#       the healthy path.
+#       co-locate on the same PS X. Rebuild on spaceA marks X busy. spaceB's
+#       ONLY replica is on X, so once the router observes rebuildBusyNodeID it
+#       strips X from the candidate set (isRebuildingIndex, no fallback), the
+#       set goes empty and spaceB's reads fail for as long as the busy flag is
+#       engaged. This is the deliberate fail-fast policy for co-tenant single-
+#       replica spaces: serving a read on a rebuild-saturated host risks
+#       blocking until timeout, so a fast failure is preferred. See
+#       test_cross_partition_no_routing_interference (rn=2 counterpart), where
+#       the second replica keeps serving and reads route around X unaffected.
 # ===========================================================================
 class TestRebuildSingleReplicaAvailability:
 
@@ -2306,18 +2358,25 @@ class TestRebuildSingleReplicaAvailability:
             except Exception:
                 pass
 
-    def test_neighbor_single_replica_space_survives_rebuild(self):
-        """Verifies a co-located single-replica space keeps serving reads.
+    def test_neighbor_single_replica_space_fails_during_rebuild(self):
+        """Verifies a co-located single-replica neighbor fails fast during rebuild.
 
-        Regression for a leak in preferIdleHosts: when spaceA (rn=1, pn=1)
-        rebuilds on PS X, `rebuildBusyNodeID` publishes X. A neighbor
-        spaceB (rn=1, pn=1) also placed on X should keep answering queries
-        — preferIdleHosts falls back to the busy node when it is the only
-        candidate (client.go:1414-1416), and PS has no read-side rebuild
-        guard, so nothing in the code path should reject spaceB's read.
-        If this assertion fires, the router filter is over-eager and is
-        stripping the last candidate for a partition that has NOTHING to
-        do with the rebuild.
+        When spaceA (rn=1, pn=1) rebuilds on PS X, `rebuildBusyNodeID`
+        publishes X. A neighbor spaceB (rn=1, pn=1) whose ONLY replica is
+        also on X shares the rebuild-saturated host, so the router must
+        keep it off reads: isRebuildingIndex now rejects the busy host as
+        well as the partition's own rebuilding replica, with NO fallback
+        (client.go::isRebuildingIndex). With rn=1 the candidate set goes
+        empty → SelectNodeByClientType returns nodeID=0 → the read fails
+        router-side. This is the deliberate fail-fast policy: a read routed
+        to a rebuild-saturated host risks blocking until timeout, so a fast
+        failure is preferred over a slow-or-hanging success.
+
+        The busy flag is set/cleared with etcd-watcher propagation lag
+        (~80ms on each edge), so the test asserts on the span between the
+        first and last observed failure — where the filter is fully
+        engaged — rather than the whole window, mirroring the two-sided
+        approach in test_search_fails_when_only_replica_is_rebuilding.
         """
         _ensure_all_ps_alive()
 
@@ -2505,22 +2564,36 @@ class TestRebuildSingleReplicaAvailability:
                 len(during), len(during_ok), len(during_err),
                 fail_rate * 100, dict(buckets))
 
-            # Regression bar: neighbor space with its OWN replica on the
-            # busy PS must keep serving. preferIdleHosts explicitly falls
-            # back when it would otherwise empty the candidate set — a
-            # non-trivial failure rate here means either
-            #   (a) that fallback was removed, or
-            #   (b) the router is passing spaceB traffic through some other
-            #       filter that also happens to observe rebuildBusyNodeID.
-            # Threshold 10% mirrors test_search_no_errors_during_rebuild
-            # for consistency with the other during-rebuild regression.
-            assert fail_rate < 0.10, (
-                f"spaceB search fail_rate={fail_rate:.2%} while spaceA "
-                f"was rebuilding on the SAME PS (node={shared_node}); "
-                f"expected <10%. Router replica-selection filter may be "
-                f"stripping the last candidate for an unrelated space. "
-                f"Breakdown: {dict(buckets)}. "
-                f"Sample errors: {during_err[:3]}")
+            # Product decision: a co-tenant single-replica space shares its
+            # ONLY host with the rebuild, so once the router observes
+            # rebuildBusyNodeID it strips that host (isRebuildingIndex, no
+            # fallback) and the candidate set is empty → nodeId=0 → the read
+            # fails router-side. spaceB is EXPECTED to fail for as long as the
+            # busy flag is engaged. Edge propagation lag (busy set/cleared
+            # trails window_start/window_end by ~80ms) is tolerated by
+            # asserting on the span between the first and last failure rather
+            # than the whole window — the same two-sided approach as
+            # test_search_fails_when_only_replica_is_rebuilding.
+            during_err_idx = [i for i, e in enumerate(during) if e[1] != "ok"]
+            assert during_err_idx, (
+                f"spaceB never failed while spaceA rebuilt on the SAME PS "
+                f"(node={shared_node}); the router should have stripped the "
+                f"last candidate. fail_rate={fail_rate:.2%} "
+                f"breakdown={dict(buckets)}")
+
+            first_err, last_err = during_err_idx[0], during_err_idx[-1]
+            engaged = during[first_err:last_err + 1]
+            assert len(engaged) >= 3, (
+                f"too few spaceB samples inside the busy-filter span "
+                f"(n={len(engaged)}); adjust IVFPQ size or timing")
+
+            engaged_ok = [e for e in engaged if e[1] == "ok"]
+            assert not engaged_ok, (
+                f"spaceB unexpectedly succeeded while the busy filter was "
+                f"engaged (node={shared_node}): {len(engaged_ok)} ok between "
+                f"the first and last failure. With rn=1 the sole candidate is "
+                f"the busy host and must be stripped with no fallback. "
+                f"Sample ok: {engaged_ok[:3]}")
 
             assert final_a["status"] == "completed", (
                 f"spaceA rebuild must still complete: {final_a}")
