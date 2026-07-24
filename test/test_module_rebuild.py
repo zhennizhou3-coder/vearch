@@ -343,7 +343,7 @@ def _ensure_clean_db(target_db: str = None):
                        "last list: %s", rs.text[:500])
 
     # Step 2: Drop DB (ignore "not found"; we created it ourselves anyway).
-    drop_resp = drop_db(router_url, db_name)
+    drop_resp = drop_db(router_url, target_db)
     logger.info("drop_db result: status=%d body=%s",
                 drop_resp.status_code, drop_resp.text[:200])
 
@@ -1083,6 +1083,8 @@ class TestRebuildProgressQuery:
         total_batch = int(total / batch_size)
 
         extra_db = db_name + "_mri_global"
+        # Drop-wait-recreate both DBs so create_space can't hit a stale
+        # "db_not_exist" from an unfinished drop or unpropagated create.
         _ensure_clean_db(db_name)
         _ensure_clean_db(extra_db)
 
