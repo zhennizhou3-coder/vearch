@@ -31,6 +31,10 @@ import requests
 
 AUTH = ("root", "secret")
 
+# This module only supports the docker-compose cluster. Kept as a module
+# constant so callers that branch on `cl.CLUSTER_MODE == "docker"` still work.
+CLUSTER_MODE = "docker"
+
 # Only master1 / router1 expose a port to the host; the others are reachable
 # only inside the container network. `api`/`http` = host port, or None when
 # not exposed. PS rpc (8081) is never exposed, so PSES carries no rpc field.
