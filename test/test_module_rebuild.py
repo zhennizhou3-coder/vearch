@@ -224,7 +224,7 @@ def _wait_index_status_indexed(
         body = rs.json()
         assert body.get("code") == 0, body
         data = body.get("data", {})
-        partitions = data.get("partitions", [])
+        partitions = data.get("partitions") or []
         idx_statuses = [p.get("index_status", -1) for p in partitions]
         logger.info(
             "index_status round=%d status=%s partitions=%s",
