@@ -1166,7 +1166,7 @@ std::string Engine::EngineStatus() {
   } else {
     j["min_indexed_num"] = 0;
   }
-  j["per_index_status"] = arr;
+  j["index_statuses"] = arr;
   return j.dump();
 }
 

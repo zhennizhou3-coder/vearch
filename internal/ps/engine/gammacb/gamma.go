@@ -365,7 +365,7 @@ func (ge *gammaEngine) IndexStatusOf(indexName string) (int, error) {
 			return int(p.Status), nil
 		}
 	}
-	return 0, fmt.Errorf("index %q not found in per_index_status", indexName)
+	return 0, fmt.Errorf("index %q not found in index_statuses", indexName)
 }
 
 func (ge *gammaEngine) BuildIndex() error {

@@ -26,5 +26,5 @@ type EngineStatus struct {
 	DocNum        int32         `json:"doc_num,omitempty"`
 	MinIndexedNum int32         `json:"min_indexed_num,omitempty"`
 	MaxDocid      int32         `json:"max_docid,omitempty"`
-	IndexStatuses []IndexStatus `json:"per_index_status,omitempty"`
+	IndexStatuses []IndexStatus `json:"index_statuses,omitempty"`
 }
