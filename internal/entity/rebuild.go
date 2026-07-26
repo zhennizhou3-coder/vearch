@@ -87,8 +87,8 @@ type CancelRebuildResponse struct {
 //     contract between master (etcd record + status polls) and PS
 //     (in-memory task + status responses).
 //   - Master-only scheduling metadata (NodeID, ReplicaIndex, PSNodeAddr,
-//     Dispatched, DispatchAt, DispatchAttempts, PollFailureStreak,
-//     RetryCount) is zero on PS.
+//     DispatchAt, DispatchAttempts, PollFailureStreak, RetryCount) is zero
+//     on PS.
 //   - PS-only CGo parameters (FieldName, IndexType) are zero on master.
 type RebuildTask struct {
 	// Identity — both sides.
@@ -112,7 +112,6 @@ type RebuildTask struct {
 	NodeID            NodeID    `json:"node_id,omitempty"`
 	ReplicaIndex      int       `json:"replica_index,omitempty"`
 	PSNodeAddr        string    `json:"ps_node_addr,omitempty"`
-	Dispatched        bool      `json:"dispatched,omitempty"`
 	DispatchAt        time.Time `json:"dispatch_at,omitempty"`
 	DispatchAttempts  int       `json:"dispatch_attempts,omitempty"`
 	PollFailureStreak int       `json:"poll_failure_streak,omitempty"`
@@ -227,10 +226,10 @@ type SpaceRebuildRecord struct {
 	CompletedTasks int `json:"completed_replicas"`
 	FailedTasks    int `json:"failed_replicas"`
 
-	// Retry control is partition-scoped; per-task retry counts live on
-	// RebuildTask.RetryCount and are aggregated at the API boundary.
-	MaxRetries       int                 `json:"max_retries,omitempty"`
-	PartitionRetries map[PartitionID]int `json:"partition_retries,omitempty"`
+	// MaxRetries is the per-task retry budget: each replica task may be
+	// retried up to MaxRetries times before it is marked failed. Per-task
+	// retry counts live on RebuildTask.RetryCount.
+	MaxRetries int `json:"max_retries,omitempty"`
 
 	// Tasks is the per-replica plan for the current target.
 	Tasks []*RebuildTask `json:"tasks,omitempty"`
@@ -294,7 +293,7 @@ func (r *SpaceRebuildRecord) MergeCancelledFrom(current *SpaceRebuildRecord) int
 		if !ok {
 			continue
 		}
-		if rt.Dispatched || rt.Status.IsTerminal() {
+		if rt.Status != RebuildStatusPending {
 			continue
 		}
 		rt.Status = RebuildStatusCancelled

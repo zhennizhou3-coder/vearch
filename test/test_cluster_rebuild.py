@@ -419,8 +419,7 @@ class TestRebuildPSFailure:
             while time.time() < deadline:
                 last_progress = _get_progress(db_name, case_space)
                 for task in (last_progress or {}).get("tasks") or []:
-                    if (task.get("status") == "running"
-                            and task.get("dispatched", False)):
+                    if task.get("status") == "running":
                         victim_task = task
                         break
                 if victim_task is not None:
@@ -481,8 +480,7 @@ class TestRebuildPSFailure:
             while time.time() < deadline:
                 last_progress = _get_progress(db_name, case_space)
                 for task in (last_progress or {}).get("tasks") or []:
-                    if (task.get("status") == "running"
-                            and task.get("dispatched", False)):
+                    if task.get("status") == "running":
                         victim_task = task
                         break
                 if victim_task is not None:
@@ -824,10 +822,9 @@ class TestRebuildReplicaRoutingChaos:
                         if p:
                             running = []
                             for t in p.get("tasks") or []:
-                                # status="running" + dispatched=true means the task
-                                # was actually sent to PS and is Running.
-                                if t.get("status") == "running" and \
-                                   t.get("dispatched", False):
+                                # status="running" means the task was sent to
+                                # PS and is in flight.
+                                if t.get("status") == "running":
                                     running.append({
                                         "partition_id": t.get("partition_id"),
                                         "replica_index": t.get("replica_index"),
@@ -1025,8 +1022,6 @@ class TestRebuildReplicaRoutingChaos:
                         p = _get_progress(db_name, case_space)
                         snap = {}
                         for t in (p.get("tasks") if p else None) or []:
-                            if not t.get("dispatched", False):
-                                continue
                             if t.get("status") != "running":
                                 continue
                             pid = t.get("partition_id")
@@ -1205,8 +1200,7 @@ class TestRebuildReplicaRoutingChaos:
                         for t in (p.get("tasks") if p else None) or []:
                             if int(t.get("node_id", -1)) != lid_int:
                                 continue
-                            if t.get("status") == "running" and \
-                               t.get("dispatched", False):
+                            if t.get("status") == "running":
                                 leader_seen_rebuilding[0] = True
                                 break
                     except Exception:
@@ -1445,8 +1439,7 @@ class TestRebuildReplicaRoutingChaos:
                             for t in p.get("tasks") or []:
                                 if (int(t.get("partition_id", -1)) == p1_pid
                                         and int(t.get("node_id", -1)) == lid
-                                        and t.get("status") == "running"
-                                        and t.get("dispatched", False)):
+                                        and t.get("status") == "running"):
                                     in_window = True
                                     x_running_seen[0] = True
                                     break
@@ -2487,8 +2480,7 @@ class TestRebuildSingleReplicaAvailability:
                 if d.get("status") != "running":
                     return False
                 for t in d.get("tasks") or []:
-                    if (t.get("status") == "running"
-                            and t.get("dispatched", False)):
+                    if t.get("status") == "running":
                         return True
                 return False
 
