@@ -21,24 +21,12 @@ namespace gpu {
  */
 class IVFFlatGPURetrievalParameters : public GPURetrievalParametersBase {
  public:
-  IVFFlatGPURetrievalParameters() : GPURetrievalParametersBase() {
-    parallel_on_queries_ = true;
-  }
+  IVFFlatGPURetrievalParameters() : GPURetrievalParametersBase() {}
 
-  IVFFlatGPURetrievalParameters(int nprobe, bool parallel_on_queries,
-                                DistanceComputeType type)
-      : GPURetrievalParametersBase(nprobe, type),
-        parallel_on_queries_(parallel_on_queries) {}
+  IVFFlatGPURetrievalParameters(int nprobe, DistanceComputeType type)
+      : GPURetrievalParametersBase(nprobe, type) {}
 
   virtual ~IVFFlatGPURetrievalParameters() = default;
-
-  bool ParallelOnQueries() const { return parallel_on_queries_; }
-  void SetParallelOnQueries(bool parallel_on_queries) {
-    parallel_on_queries_ = parallel_on_queries;
-  }
-
- private:
-  bool parallel_on_queries_;
 };
 
 /**

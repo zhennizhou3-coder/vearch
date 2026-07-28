@@ -140,4 +140,3 @@ if [ $BUILD_GAMMA == "ON" ]; then
   build_engine
 fi
 build_vearch
-

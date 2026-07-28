@@ -52,9 +52,10 @@ int IndexModel::GetTrainingVectors(size_t threshold,
     LOG(ERROR) << "Fail to sample training vectors, ret=" << ret;
     return ret;
   }
-  if (valid_count < threshold){
-    LOG(WARNING) << "valid vector count [" << valid_count
-                 << "] less than training threshold [" << threshold << "]. So select all valid";
+  if (valid_count < threshold) {
+    LOG(ERROR) << "valid vector count [" << valid_count
+               << "] less than training threshold [" << threshold << "]";
+    return -1;
   }
   // SampleTrainingVectors must return the whole sample as one contiguous
   // block (a single Add) so that train_data owns all num_got vectors.

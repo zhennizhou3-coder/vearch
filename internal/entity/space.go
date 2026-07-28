@@ -29,7 +29,20 @@ import (
 const (
 	IdField    = "_id"
 	ScoreField = "_score"
+	// AutoIndexNamePrefix is used to synthesize a deterministic Index.Name
+	// for legacy spaces that didn't carry a per-index name. Format:
+	//   <AutoIndexNamePrefix><field_name>_<index_type>
+	// Must stay in sync with the C++ constant kAutoIndexNamePrefix in
+	// internal/engine/table/scalar_index_manager.cc.
+	AutoIndexNamePrefix = "__idx__"
 )
+
+// MakeAutoIndexName composes the synthesized index name for legacy schemas
+// that didn't carry a per-index name. Must stay in sync with
+// MakeAutoIndexName in internal/engine/table/scalar_index_manager.cc.
+func MakeAutoIndexName(fieldName, indexType string) string {
+	return AutoIndexNamePrefix + fieldName + "_" + indexType
+}
 
 type Index struct {
 	Name       string          `json:"name"`
@@ -69,6 +82,50 @@ type IndexParams struct {
 	Nprobe            int    `json:"nprobe,omitempty"`
 	Nsubvector        int    `json:"nsubvector,omitempty"`
 	TrainingThreshold int    `json:"training_threshold,omitempty"`
+}
+
+// AddIndexesRequest is the request body for the dynamic index management API
+// (POST /dbs/:db_name/spaces/:space_name/indexes).
+//
+// Multiple indexes can be appended in a single request via the `indexes` field.
+type AddIndexesRequest struct {
+	Indexes []*Index `json:"indexes"`
+}
+
+// IndexesInfo is the response body of the index listing API
+// (GET /dbs/:db_name/spaces/:space_name/indexes).
+type IndexesInfo struct {
+	DbName    string   `json:"db_name"`
+	SpaceName string   `json:"space_name"`
+	Indexes   []*Index `json:"indexes"`
+	// BuildState holds the per-replica index build state of every partition,
+	// collected by fanning out to each replica. Populated only when the list
+	// request asks for detail (?detail=true); omitted otherwise so the default
+	// response stays a pure-metadata, zero-RPC read.
+	BuildState []*PartitionIndexBuildState `json:"build_state,omitempty"`
+}
+
+// PartitionIndexBuildState groups one partition's per-replica index build
+// states. index build state is per-replica local (each PS applies the index
+// change and builds independently, persisting its own BUILDING marker), so a
+// leader can be READY while a follower is still BUILDING or FAILED — this
+// surfaces that divergence.
+type PartitionIndexBuildState struct {
+	PartitionID PartitionID               `json:"pid"`
+	Replicas    []*ReplicaIndexBuildState `json:"replicas"`
+}
+
+// ReplicaIndexBuildState is one replica's index build state, as reported by
+// that replica's own engine. Error is set (and the status fields left zero)
+// when the replica could not be reached, so an unreachable node — the very
+// thing an operator wants to see — does not fail the whole request.
+type ReplicaIndexBuildState struct {
+	NodeID      uint64            `json:"node_id"`
+	Ip          string            `json:"ip,omitempty"`
+	IsLeader    bool              `json:"is_leader"`
+	IndexStatus int               `json:"index_status"`                // 0=UNINDEXED,1=INDEXING,2=INDEXED
+	States      map[string]string `json:"index_build_state,omitempty"` // index name -> BUILDING/READY/FAILED
+	Error       string            `json:"error,omitempty"`             // set when this replica is unreachable / RPC failed
 }
 
 // space/[dbId]/[spaceId]:[spaceBody]
@@ -229,11 +286,11 @@ func (s *Space) IsVectorField(fieldName string) bool {
 	return false
 }
 
-// AllIndexTargets returns the rebuildable index names for this space.
+// AllVectorIndexes returns the rebuildable vector index names for this space.
 // Only single-field vector indexes are rebuildable in the current
 // engine. Composite (scalar) indexes are out of rebuild scope; future
 // multi-field vector indexes would need explicit support here.
-func (s *Space) AllIndexTargets() []string {
+func (s *Space) AllVectorIndexes() []string {
 	out := make([]string, 0, len(s.Indexes))
 	for _, idx := range s.Indexes {
 		if idx == nil || idx.Name == "" {
@@ -354,6 +411,9 @@ func (index *Index) UnmarshalJSON(bs []byte) error {
 
 			// training_threshold >= ncentroids * min_points_per_centroid (=39)
 			if indexParams.TrainingThreshold != 0 {
+				if indexParams.TrainingThreshold < indexParams.Ncentroids {
+					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than ncentroids:[%d]", indexParams.TrainingThreshold, indexParams.Ncentroids))
+				}
 				if indexParams.TrainingThreshold < MinTrainingThreshold {
 					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than [%d]", indexParams.TrainingThreshold, MinTrainingThreshold))
 				}
@@ -564,13 +624,13 @@ func IsScalarIndexType(indexType string) bool {
 	}
 }
 
-// validateIndexes checks structural constraints for each index definition.
+// ValidateIndexes checks structural constraints for each index definition.
 // Rules:
 //   - COMPOSITE: must have field_names with at least 2 fields, field_name must be empty
 //   - Single-field types (SCALAR/INVERTED/BITMAP/INVERTED_LIST): must have exactly one field_name, field_names must be empty
 //   - field_name and field_names cannot both be set
 //   - name cannot be empty
-func validateIndexes(indexes []*Index, props map[string]*SpaceProperties) error {
+func ValidateIndexes(indexes []*Index, props map[string]*SpaceProperties) error {
 	indexNames := make(map[string]bool)
 	for i, idx := range indexes {
 		if idx.Name == "" {
@@ -659,8 +719,16 @@ func MergeFieldIndexes(props map[string]*SpaceProperties, indexes *[]*Index) err
 						fmt.Errorf("field[%s] index duplicated", fieldName))
 				}
 			}
+			indexName := field.Index.Name
+			if indexName == "" {
+				// Backward-compat: spaces created before the dynamic-index
+				// feature didn't require a per-index Name. Synthesize a
+				// stable default so downstream layers (which now key on
+				// Name) can still address the index uniquely.
+				indexName = MakeAutoIndexName(fieldName, field.Index.Type)
+			}
 			index := &Index{
-				Name:      field.Index.Name,
+				Name:      indexName,
 				Type:      field.Index.Type,
 				FieldName: fieldName,
 				Params:    field.Index.Params,
@@ -668,7 +736,7 @@ func MergeFieldIndexes(props map[string]*SpaceProperties, indexes *[]*Index) err
 			*indexes = append(*indexes, index)
 		}
 	}
-	if err := validateIndexes(*indexes, props); err != nil {
+	if err := ValidateIndexes(*indexes, props); err != nil {
 		return err
 	}
 	return nil

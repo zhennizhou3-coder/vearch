@@ -98,7 +98,7 @@ int BuildIndex(void *engine);
 /**
  * @brief rebuild index for a specific (field_name, index_type) pair
  *
- * When field_name is empty, falls back to whole-partition RebuildIndex.
+ * When field_name is empty, falls back to a whole-partition rebuild.
  * For vector fields, destroys and re-creates only the specified index.
  * For scalar fields, rebuilds the bitmap index for the field.
  *
@@ -110,7 +110,7 @@ int BuildIndex(void *engine);
  * @param describe  describe level
  * @return 0 on success, non-zero on failure
  */
-int RebuildFieldIndex(void *engine, const char *index_name,
+int RebuildIndex(void *engine, const char *index_name,
                       const char *field_name, const char *index_type,
                       int drop_before_rebuild, int limit_cpu, int describe);
 
@@ -163,34 +163,44 @@ int GetConfig(void *engine, char **config_str, int *len);
 struct CStatus Backup(void *engine, int command);
 
 /**
- * @brief add index for a specific field with index parameters
+ * @brief add an index identified by a user-defined name. The index covers
+ *        one or more fields. A single vector field => vector index; a single
+ *        scalar field => scalar index; 2+ scalar fields => composite index.
  *
- * @param engine  search engine pointer
- * @param field_name  field name to add index
- * @param field_name_len  length of field name
- * @param index_type  index type (e.g., "HNSW", "FLAT", "SCALAR")
- * @param index_type_len  length of index type
- * @param index_params  JSON string of index parameters
- * @param index_params_len  length of index parameters
- * @return struct Status
+ * @param engine            search engine pointer
+ * @param index_name        user-defined index name (deletion handle)
+ * @param index_name_len    length of index_name
+ * @param field_names       array of C strings, one per covered field
+ * @param field_name_lens   array of lengths, one per entry in field_names
+ * @param field_name_count  number of entries in field_names / field_name_lens
+ * @param index_type        index type (e.g., "HNSW", "FLAT", "SCALAR")
+ * @param index_type_len    length of index_type
+ * @param index_params      JSON string of index parameters
+ * @param index_params_len  length of index_params
+ * @return struct CStatus
  */
-struct CStatus AddFieldIndexWithParams(void *engine, const char *field_name,
-                                       int field_name_len,
+struct CStatus AddFieldIndexWithParams(void *engine,
+                                       const char *index_name,
+                                       int index_name_len,
+                                       const char *const *field_names,
+                                       const int *field_name_lens,
+                                       int field_name_count,
                                        const char *index_type,
                                        int index_type_len,
                                        const char *index_params,
                                        int index_params_len);
 
 /**
- * @brief remove index for a specific field
+ * @brief remove an index by its user-defined name. Routes internally to
+ *        vector / scalar / composite removal based on engine bookkeeping.
  *
- * @param engine  search engine pointer
- * @param field_name  field name to remove index
- * @param field_name_len  length of field name
- * @return struct Status
+ * @param engine          search engine pointer
+ * @param index_name      user-defined index name to remove
+ * @param index_name_len  length of index_name
+ * @return struct CStatus
  */
-struct CStatus RemoveFieldIndex(void *engine, const char *field_name,
-                                int field_name_len);
+struct CStatus RemoveFieldIndex(void *engine, const char *index_name,
+                                int index_name_len);
 
 void SetMemoryLimitConfig(int memory_limit);
 

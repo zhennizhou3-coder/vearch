@@ -127,12 +127,6 @@ RetrievalParameters *GammaIVFFlatGPUIndex::Parse(
     }
   }
 
-  bool parallel_on_queries;
-  if (j.contains("parallel_on_queries")) {
-    parallel_on_queries = j.value("parallel_on_queries", true);
-    retrieval_params->SetParallelOnQueries(parallel_on_queries);
-  }
-
   return retrieval_params;
 }
 
@@ -391,7 +385,7 @@ int GammaIVFFlatGPUIndex::Search(RetrievalContext *retrieval_context, int n,
 
 IVFFlatGPURetrievalParameters *
 GammaIVFFlatGPUIndex::CreateDefaultRetrievalParams(int default_nprobe) {
-  return new IVFFlatGPURetrievalParameters(default_nprobe, true, metric_type_);
+  return new IVFFlatGPURetrievalParameters(default_nprobe, metric_type_);
 }
 
 int GammaIVFFlatGPUIndex::GetRecallNum(IVFFlatGPURetrievalParameters *params,

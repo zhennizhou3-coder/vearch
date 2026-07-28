@@ -313,7 +313,7 @@ func (config *Config) GetEmbed() (*embed.Config, error) {
 		if buf.Len() > 0 {
 			buf.WriteString(",")
 		}
-		buf.WriteString(fmt.Sprintf("%s=http://%s:%d", m.Name, m.Address, m.EtcdPeerPort))
+		buf.WriteString(fmt.Sprintf("%s=http://%s:%d", m.Name, m.Address, masterCfg.EtcdPeerPort))
 	}
 	cfg.InitialCluster = buf.String()
 
@@ -439,6 +439,8 @@ func DumpConfig(conf *Config) error {
 	return nil
 }
 
+// CurrentByMasterNameDomainIp find this machine domain.The main purpose of this function is to find the master from from multiple masters and set it‘s Field:self to true.
+// The only criterion for judging is: Is the IP address the same with one of the masters?
 func (config *Config) CurrentByMasterNameDomainIp(masterName string) error {
 	//find local all ip
 	addrMap := config.addrMap()

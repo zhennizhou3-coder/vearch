@@ -150,6 +150,24 @@ def _wait_terminal(db, space, timeout=600, allow_failed=False):
     pytest.fail(f"rebuild did not terminate in {timeout}s")
 
 
+def _wait_completed(db, space, timeout=600, poll=2.0):
+    """Wait for completion while tolerating transient self-heal states."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        p = _get_progress(db, space)
+        if p:
+            last = p
+            if p["status"] in ("completed", "cancelled"):
+                return p
+        time.sleep(poll)
+    pytest.fail(
+        f"rebuild did not reach a stable terminal state in {timeout}s "
+        f"(self-heal should have driven a transiently-failed record to "
+        f"completed); last={last}")
+
+
+
 def _ensure_all_ps_alive(timeout=30, expected_count=None, settle_timeout=30):
     """Start every PS and wait until Master reports the expected registrations."""
     expected = expected_count if expected_count is not None else len(cl.PSES)
@@ -403,7 +421,7 @@ class TestRebuildPSFailure:
 
         # Need replica_num=2 so killing 1 PS leaves another replica alive.
         resp = create_space(
-            router_url, db_name, _ivfpq_cfg(case_space, pn=2, rn=2))
+            router_url, db_name, _ivfpq_cfg(case_space, pn=3, rn=3))
         body = resp.json()
         assert body.get("code") == 0, (
             f"create_space failed for 1.1: code={body.get('code')} "
@@ -443,12 +461,28 @@ class TestRebuildPSFailure:
             # the original dispatched task as missing and retries it.
             cl.start_ps(victim_ps_idx, wait_ready=True, timeout=30)
 
-            # Allow generous time for retry + complete.
-            final = _wait_terminal(db_name, case_space, timeout=600,
-                                   allow_failed=True)
-            assert final["status"] == "completed", final
-            assert final.get("retry_count", 0) >= 1, (
-                f"in-flight PS restart did not exercise retry: {final}")
+            # Recovery may pass through transient failed/running states.
+            saw_disruption = False
+            deadline = time.time() + 600
+            final = None
+            while time.time() < deadline:
+                p = _get_progress(db_name, case_space)
+                if p:
+                    if (p.get("status") == "failed"
+                            or p.get("retry_count", 0) >= 1
+                            or p.get("failed_tasks", 0) >= 1):
+                        saw_disruption = True
+                    if p.get("status") == "completed":
+                        final = p
+                        break
+                time.sleep(2)
+            assert final is not None, (
+                "rebuild did not reach completed within 600s after PS "
+                f"kill+restart; last progress={_get_progress(db_name, case_space)}")
+            assert saw_disruption, (
+                "in-flight PS kill+restart did not visibly disrupt any task "
+                "(no failed status / retry / failed_task observed); the kill "
+                "may have missed the running task")
         finally:
             if victim_ps_idx is not None:
                 try:
@@ -459,12 +493,14 @@ class TestRebuildPSFailure:
         drop_space(router_url, db_name, case_space)
 
     def test_max_retries_exhausted_then_failed_record_overwritten(self):
-        """Verifies retry exhaustion produces a failed record that a later successful request can replace."""
+        """Verifies retry exhaustion produces a failed record that is driven to
+        completion once the cluster recovers — whether by the master's idle
+        self-heal reviving it or by an explicit re-trigger overwriting it."""
         _ensure_all_ps_alive()
 
         case_space = space_name + "_chaos_maxretry"
         resp = create_space(router_url, db_name,
-                            _ivfpq_cfg(case_space, pn=2, rn=2))
+                            _ivfpq_cfg(case_space, pn=3, rn=3))
         body = resp.json()
         assert body.get("code") == 0, (
             f"create_space failed for 1.4: code={body.get('code')} "
@@ -508,34 +544,43 @@ class TestRebuildPSFailure:
             failed_error = final.get("error_message") or final.get("error_msg")
             assert failed_error, \
                 f"failed record must carry an error message: {final}"
-            failed_enqueued_at = final.get("enqueued_at")
-            assert failed_enqueued_at, final
+            assert final.get("enqueued_at"), final
 
             # Restore the victim and wait until Master sees it and every
-            # partition has recovered before replacing the failed record.
+            # partition has recovered before the failed record resumes.
             cl.start_ps(victim_ps_idx, wait_ready=True, timeout=30)
             _ensure_all_ps_alive()
             _wait_index_status_indexed(db_name, case_space)
 
-            replacement = _trigger_rebuild(db_name, case_space)
-            replacement_body = replacement.json()
-            assert replacement_body.get("code") == 0, replacement.text
-            failures = (replacement_body.get("data") or {}).get("failures") or []
-            assert not failures, (
-                f"new rebuild against failed record was rejected: {failures}")
+            # Either this request replaces the failed record or self-heal has
+            # already revived it.
+            deadline = time.time() + 60
+            accepted = False
+            last_failures = None
+            while time.time() < deadline:
+                replacement_body = _trigger_rebuild(db_name, case_space).json()
+                last_failures = (
+                    replacement_body.get("data") or {}).get("failures") or []
+                if replacement_body.get("code") == 0 and not last_failures:
+                    accepted = True  # our request overwrote the terminal record
+                    break
+                if any("already running" in (f.get("error") or "")
+                       for f in last_failures):
+                    accepted = True  # self-heal already revived it — expected
+                    break
+                time.sleep(2)
+            assert accepted, (
+                "replacement rebuild was neither accepted nor auto-revived "
+                f"within the window: {last_failures}")
 
             replacement_progress = _get_progress(db_name, case_space)
             assert replacement_progress is not None, (
                 "replacement rebuild progress is not queryable")
             assert replacement_progress["status"] in (
                 "pending", "running", "completed"), replacement_progress
-            replacement_enqueued_at = replacement_progress.get("enqueued_at")
-            assert replacement_enqueued_at != failed_enqueued_at, (
-                "failed rebuild record was reused instead of replaced: "
-                f"old={failed_enqueued_at} new={replacement_enqueued_at}")
 
-            replacement_final = _wait_terminal(
-                db_name, case_space, timeout=600, allow_failed=False)
+            # Ignore intermediate failures while self-heal rotates tasks.
+            replacement_final = _wait_completed(db_name, case_space, timeout=600)
             assert replacement_final["status"] == "completed", replacement_final
             replacement_error = (
                 replacement_final.get("error_message")
@@ -582,9 +627,26 @@ class TestRebuildPSFailure:
                 replica_nodes = [int(n) for n in (it.get("replicas") or [])]
                 break
         assert len(replica_nodes) == rn, replica_nodes
-        # Kill the PS carrying the first replica.
-        victim_ps_idx = cl.ps_idx_for_node(replica_nodes[0])
-        assert victim_ps_idx is not None, replica_nodes
+        # Kill a follower so an undispatched sibling remains to be cancelled.
+        leader_id = 0
+        our_partition = None
+        for _ in range(15):
+            detail = _get_space_detail(db_name, case_space)
+            our_partition = next(
+                (p for p in detail.get("partitions") or []
+                 if p.get("pid") in our_pids), None)
+            leader_id = int(
+                ((our_partition or {}).get("raft_status") or {}).get("Leader")
+                or 0)
+            if leader_id:
+                break
+            time.sleep(1)
+        assert leader_id, f"partition has no elected leader: {our_partition}"
+        followers = [n for n in replica_nodes if n != leader_id]
+        assert followers, (
+            f"no follower replica besides leader {leader_id}: {replica_nodes}")
+        victim_ps_idx = cl.ps_idx_for_node(followers[0])
+        assert victim_ps_idx is not None, followers
 
         try:
             assert _trigger_rebuild(db_name, case_space, max_retries=1).json().get("code") == 0
@@ -664,8 +726,7 @@ class TestRebuildMasterFailover:
             # Restart the killed master so quorum is restored fully.
             cl.start_master(leader, wait_quorum=True, timeout=30)
 
-            final = _wait_terminal(db_name, case_space, timeout=600,
-                                   allow_failed=True)
+            final = _wait_completed(db_name, case_space, timeout=600)
             assert final["status"] == "completed", (
                 f"2.1 expected completion after leader change:\n"
                 f"  status={final.get('status')}\n"
@@ -716,8 +777,7 @@ class TestRebuildMasterFailover:
             cl.wait_for_master_quorum(timeout=30)
             # Allow generous time: new leader needs to scan etcd, admit,
             # dispatch RPCs.
-            final = _wait_terminal(db_name, case_space, timeout=600,
-                                   allow_failed=True)
+            final = _wait_completed(db_name, case_space, timeout=600)
             assert final["status"] == "completed", (
                 f"2.2 new leader failed to admit pending record:\n"
                 f"  status={final.get('status')}\n"
@@ -763,8 +823,7 @@ class TestRebuildMasterFailover:
             cl.start_master(leader, wait_quorum=True, timeout=30)
             time.sleep(2)
 
-        final = _wait_terminal(db_name, case_space, timeout=600,
-                               allow_failed=True)
+        final = _wait_completed(db_name, case_space, timeout=600)
 
         assert final["status"] == "completed", (
             f"rebuild did not complete under master churn:\n"
@@ -1114,32 +1173,13 @@ class TestRebuildReplicaRoutingChaos:
         finally:
             drop_space(router_url, db_name, case_space)
 
-    # Router error code returned when a leader-typed read hits a leader whose
-    # index is rebuilding (vearchpb.ErrorEnum_PARTITION_LEADER_REBUILDING).
+    # Leader reads must not hit a rebuilding leader.
     PARTITION_LEADER_REBUILDING = 147
 
-    def test_leader_read_rejected_while_leader_rebuilding(self):
-        """Verifies leader-directed searches are REJECTED, not downgraded, while the leader rebuilds.
-
-        A `load_balance: "leader"` read is an explicit strong-consistency
-        (read-your-writes) request. When the leader replica's index is
-        rebuilding, the router (client.go::SelectNodeByClientType) must return
-        PARTITION_LEADER_REBUILDING (147) rather than silently route to a
-        follower that could serve stale data.
-
-        Like the single-replica case, rebuild has two async propagation windows
-        (the router cache trails master state on both start and completion).
-        Inside those gaps the router does not yet / no longer observes the
-        leader rebuilding, so leader reads legitimately succeed. The regression
-        bar is therefore two-sided: between the FIRST and LAST observed 147
-        rejection the reject path is engaged and no success (code==0) may slip
-        through.
-
-        Uses IVFPQ rather than HNSW: HNSW builds too fast on 10k docs to cover
-        the reject window reliably (see TestRebuildSingleReplicaAvailability).
-        """
+    def test_leader_reads_stay_available_during_rebuild(self):
+        """Leader reads remain available while leadership moves for rebuild."""
         _ensure_clean_db()
-        case_space = space_name + "_chaos_leader_reject_r3"
+        case_space = space_name + "_chaos_leader_stays_r3"
 
         resp = create_space(router_url, db_name,
                             _ivfpq_cfg(case_space, pn=1, rn=3))
@@ -1158,7 +1198,6 @@ class TestRebuildReplicaRoutingChaos:
 
             search_url = router_url + "/document/search?timeout=5000"
             leader_query_results = []
-            leader_seen_rebuilding = [False]
             stop_evt = threading.Event()
 
             def _leader_query_once():
@@ -1192,27 +1231,8 @@ class TestRebuildReplicaRoutingChaos:
                         leader_query_results.append((ts, None, str(e)))
                     time.sleep(0.05)
 
-            def _poll_leader_restatus():
-                lid_int = int(leader_id)
-                while not stop_evt.is_set():
-                    try:
-                        p = _get_progress(db_name, case_space)
-                        for t in (p.get("tasks") if p else None) or []:
-                            if int(t.get("node_id", -1)) != lid_int:
-                                continue
-                            if t.get("status") == "running":
-                                leader_seen_rebuilding[0] = True
-                                break
-                    except Exception:
-                        pass
-                    time.sleep(0.05)
-
-            searcher = threading.Thread(target=_leader_query_loop,
-                                        daemon=True)
-            poller = threading.Thread(target=_poll_leader_restatus,
-                                      daemon=True)
+            searcher = threading.Thread(target=_leader_query_loop, daemon=True)
             searcher.start()
-            poller.start()
 
             assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
             final = _wait_terminal(db_name, case_space, timeout=600,
@@ -1221,77 +1241,52 @@ class TestRebuildReplicaRoutingChaos:
 
             stop_evt.set()
             searcher.join(timeout=5)
-            poller.join(timeout=5)
 
             assert leader_query_results, "no Leader-type queries issued"
 
-            # The leader replica must actually have rebuilt, else the test
-            # proves nothing about the reject path.
-            if not leader_seen_rebuilding[0]:
-                lid_int = int(leader_id)
-                for t in final.get("tasks") or []:
-                    if int(t.get("node_id", -1)) == lid_int and \
-                       t.get("status") == "completed":
-                        leader_seen_rebuilding[0] = True
-                        break
-            assert leader_seen_rebuilding[0], (
-                "the leader replica was neither observed rebuilding nor found "
-                "in final tasks; cannot verify the reject path for node_id=%s"
-                % (leader_id,))
-
-            # The reject path must have fired: at least one leader read got
-            # PARTITION_LEADER_REBUILDING (147) instead of a follower fallback.
+            # The rebuilding replica must no longer be the active leader.
             rejects = [r for r in leader_query_results
                        if r[2] == self.PARTITION_LEADER_REBUILDING]
-            assert rejects, (
-                "no leader read was rejected with code %d during rebuild; "
-                "codes seen=%s" % (self.PARTITION_LEADER_REBUILDING,
-                                   sorted({r[2] for r in leader_query_results
-                                           if isinstance(r[2], int)})))
+            assert not rejects, (
+                "leader reads were rejected with %d during rebuild; leadership "
+                "should have been transferred away first. sample=%s"
+                % (self.PARTITION_LEADER_REBUILDING, rejects[:5]))
 
-            # Two-sided bound: between the first and last observed rejection the
-            # reject path is engaged; no leader read may succeed in that span.
-            first_reject = min(r[0] for r in rejects)
-            last_reject = max(r[0] for r in rejects)
-            leaked = [r for r in leader_query_results
-                      if first_reject <= r[0] <= last_reject
-                      and r[1] == 200 and r[2] == 0]
-            assert not leaked, (
-                "leader read succeeded while the leader was rebuilding "
-                "(reject window %.3f..%.3f); leaked=%s"
-                % (first_reject, last_reject, leaked[:5]))
+            # Allow brief failures during leadership and cache propagation.
+            total = len(leader_query_results)
+            ok = sum(1 for r in leader_query_results
+                     if r[1] == 200 and r[2] == 0)
+            assert ok >= total * 0.8, (
+                "leader reads not available enough during rebuild: %d/%d ok; "
+                "codes=%s" % (ok, total, sorted({r[2] for r in leader_query_results
+                                                 if isinstance(r[2], int)})))
 
-            logger.info(
-                "leader-read reject verified: %d/%d queries returned code %d",
-                len(rejects), len(leader_query_results),
-                self.PARTITION_LEADER_REBUILDING)
+            # Every replica, including the original leader, must complete.
+            tasks = final.get("tasks") or []
+            assert tasks, "final record has no tasks"
+            completed = [t for t in tasks if t.get("status") == "completed"]
+            assert len(completed) == len(tasks), (
+                "not all replicas rebuilt: %s" % tasks)
+            lid_int = int(leader_id)
+            assert any(int(t.get("node_id", -1)) == lid_int and
+                       t.get("status") == "completed" for t in tasks), (
+                "original leader replica node_id=%s was not rebuilt: %s"
+                % (leader_id, tasks))
 
-            # After rebuild completes and the router cache catches up, leader
-            # reads must succeed again and the leader must be unchanged.
+            # Confirm leadership moved to a follower.
             post_detail = _get_space_detail(db_name, case_space)
             post_parts = post_detail.get("partitions") or []
             assert post_parts, "space details returned no partition after rebuild"
-            post_partition = post_parts[0]
-            post_leader_id = (post_partition.get("leader")
-                              or post_partition.get("LeaderID")
-                              or post_partition.get("raft_status", {}).get("Leader"))
-            assert post_leader_id == leader_id, (
-                "leader changed after rebuild: before=%s after=%s" %
-                (leader_id, post_leader_id))
+            post_leader_id = (post_parts[0].get("leader")
+                              or post_parts[0].get("LeaderID")
+                              or post_parts[0].get("raft_status", {}).get("Leader"))
+            assert post_leader_id and post_leader_id != leader_id, (
+                "leadership was not transferred away from the original leader: "
+                "before=%s after=%s" % (leader_id, post_leader_id))
 
-            # Router cache convergence may trail completion; poll briefly for
-            # the first post-rebuild success before asserting stability.
-            deadline = time.time() + 10
-            while time.time() < deadline:
-                status, code = _leader_query_once()
-                if status == 200 and code == 0:
-                    break
-                time.sleep(0.2)
-            post_results = [_leader_query_once() for _ in range(20)]
-            assert all(status == 200 and code == 0
-                       for status, code in post_results), (
-                "Leader-directed queries were not stable after rebuild; sample=%s" %
-                (post_results[:5],))
+            logger.info(
+                "leader-read availability verified: %d/%d ok, leader %s -> %s",
+                ok, total, leader_id, post_leader_id)
         finally:
             drop_space(router_url, db_name, case_space)
 
@@ -2114,32 +2109,7 @@ class TestRebuildConcurrentWrites:
 
 # ===========================================================================
 # Category 6 — Single-replica availability during rebuild
-#
-# Companion cases to TestRebuildConcurrentWrites, which exercises rn=2 and
-# asserts that Router routes around the rebuilding replica so query error
-# rate stays < 10%. The two cases below cover the *unrecoverable* side of
-# that behavior — when the router filter (client.go::isRebuildingIndex,
-# which rejects both the partition's own rebuilding replica and the global
-# rebuild-busy host) is asked to skip a replica that has no siblings.
-#
-# 6.1 — single-replica space, rebuild on THAT replica: while the router
-#       observes ReplicasRebuildingIndex, candidate set empties to zero
-#       and reads must fail. Master↔etcd↔router-cache is asynchronous in
-#       BOTH directions (mark on start, unmark on complete), so the
-#       filter-engaged span is bounded by the first and the last refusal
-#       observed on the search stream. Inside that span, zero ok is
-#       permitted; the head/tail propagation gaps are logged, not asserted.
-#
-# 6.2 — two single-replica single-partition spaces that Master happens to
-#       co-locate on the same PS X. Rebuild on spaceA marks X busy. spaceB's
-#       ONLY replica is on X, so once the router observes rebuildBusyNodeID it
-#       strips X from the candidate set (isRebuildingIndex, no fallback), the
-#       set goes empty and spaceB's reads fail for as long as the busy flag is
-#       engaged. This is the deliberate fail-fast policy for co-tenant single-
-#       replica spaces: serving a read on a rebuild-saturated host risks
-#       blocking until timeout, so a fast failure is preferred. See
-#       test_cross_partition_no_routing_interference (rn=2 counterpart), where
-#       the second replica keeps serving and reads route around X unaffected.
+# These cases verify fail-fast routing when no alternate replica exists.
 # ===========================================================================
 class TestRebuildSingleReplicaAvailability:
 
@@ -2147,18 +2117,7 @@ class TestRebuildSingleReplicaAvailability:
         _ensure_clean_db()
 
     def test_search_fails_when_only_replica_is_rebuilding(self):
-        """Queries must fail while the sole replica (rn=1) is rebuilding.
-
-        The router filters the rebuilding replica out (client.go::
-        isRebuildingIndex); with rn=1 the candidate set is empty and the
-        RPC layer errors router-side before reaching the PS.
-
-        Start/end propagate to the router's cache asynchronously (~80ms
-        each locally), so reads are briefly legal at both edges. The bar
-        is two-sided: between the FIRST and LAST refusal on the stream,
-        no `ok` may appear. See test_search_no_errors_during_rebuild for
-        the rn=2 route-around counterpart.
-        """
+        """Queries fail while the only replica is rebuilding."""
         _ensure_all_ps_alive()
         case_space = space_name + "_chaos_single_replica_self"
 
@@ -2219,22 +2178,7 @@ class TestRebuildSingleReplicaAvailability:
             assert _trigger_rebuild(
                 db_name, case_space).json().get("code") == 0
 
-            # There is no externally-observable signal for "router has
-            # applied the Rebuilding marker" — /dbs/:db/spaces/:space?detail
-            # (doc_http.go:242) proxies to master and reads etcd directly;
-            # /cache/dbs/:db/spaces/:space returns space metadata, not the
-            # partition ReStatusMap. Both /progress and the master-served
-            # space detail flip well BEFORE the router's partitionCache
-            # watcher (master_cache.go:506-536) has copied the ReStatusMap
-            # write into memory, which is what isRebuildingIndex actually
-            # reads. On this cluster the propagation window is ~80ms.
-            #
-            # Rather than guess when propagation has completed, let the
-            # search behavior itself define the boundary: window_start is
-            # the timestamp of the FIRST failed search after the trigger.
-            # After router filter takes effect, any subsequent `ok` is a
-            # real regression — router MUST NOT route a fresh request to a
-            # replica already marked Rebuilding in its own cache.
+            # Search failures define when the router cache observes rebuild.
             final = _wait_terminal(db_name, case_space, timeout=600,
                                    allow_failed=True)
             time.sleep(1)  # tail of in-flight requests
@@ -2248,16 +2192,7 @@ class TestRebuildSingleReplicaAvailability:
                 "no failure observed after trigger; router filter never "
                 "engaged — search kept succeeding through the full "
                 "rebuild lifecycle")
-            # Windows are defined by observable refusals on both sides:
-            #   window_start = first refusal after trigger  (router filter engaged)
-            #   window_end   = last refusal seen            (router filter released)
-            # Between these two boundaries the filter must be continuously
-            # engaged. Any `ok` inside is a real regression — the router
-            # released the rebuilding replica back into the candidate set
-            # mid-window. Samples strictly BEFORE first refusal (master→
-            # etcd→router-cache propagation) and strictly AFTER last refusal
-            # (unmarkReplicaRebuilding → router-cache propagation) are the
-            # dual propagation windows and are logged, not asserted.
+            # The first and last refusal bound the cache-observed rebuild.
             first_err_idx = err_indices[0]
             last_err_idx = err_indices[-1]
             window_start = events[first_err_idx][0]
@@ -2286,9 +2221,7 @@ class TestRebuildSingleReplicaAvailability:
             during_ok = [e for e in during if e[1] == "ok"]
             during_err = [e for e in during if e[1] != "ok"]
 
-            # Distribution of failure reasons — expected to be dominated by
-            # ROUTER_NO_PS_CLIENT (no ps client by nodeID:0) or the equivalent
-            # "no replica available" path. Logged for triage on regression.
+            # Log failure categories for diagnosis.
             from collections import Counter
             buckets = Counter()
             for _, kind, detail in during_err:
@@ -2311,11 +2244,7 @@ class TestRebuildSingleReplicaAvailability:
                 len(during), len(during_ok), len(during_err), dict(buckets),
                 len(propagation_tail), prop_tail_ok)
 
-            # Regression bar: while the router filter is engaged (between
-            # the first and last observed refusal), no fresh search may
-            # succeed. A stray `ok` inside this window means the router
-            # released the rebuilding replica back into the candidate set
-            # mid-rebuild — a real filter regression.
+            # No query may succeed while the filter is observably engaged.
             assert len(during_ok) == 0, (
                 f"expected 0 successful searches inside the router "
                 f"filter-engaged window (first→last refusal); got "
@@ -2335,25 +2264,7 @@ class TestRebuildSingleReplicaAvailability:
                 pass
 
     def test_neighbor_single_replica_space_fails_during_rebuild(self):
-        """Verifies a co-located single-replica neighbor fails fast during rebuild.
-
-        When spaceA (rn=1, pn=1) rebuilds on PS X, `rebuildBusyNodeID`
-        publishes X. A neighbor spaceB (rn=1, pn=1) whose ONLY replica is
-        also on X shares the rebuild-saturated host, so the router must
-        keep it off reads: isRebuildingIndex now rejects the busy host as
-        well as the partition's own rebuilding replica, with NO fallback
-        (client.go::isRebuildingIndex). With rn=1 the candidate set goes
-        empty → SelectNodeByClientType returns nodeID=0 → the read fails
-        router-side. This is the deliberate fail-fast policy: a read routed
-        to a rebuild-saturated host risks blocking until timeout, so a fast
-        failure is preferred over a slow-or-hanging success.
-
-        The busy flag is set/cleared with etcd-watcher propagation lag
-        (~80ms on each edge), so the test asserts on the span between the
-        first and last observed failure — where the filter is fully
-        engaged — rather than the whole window, mirroring the two-sided
-        approach in test_search_fails_when_only_replica_is_rebuilding.
-        """
+        """A co-located single-replica neighbor fails fast during rebuild."""
         _ensure_all_ps_alive()
 
         # Master anti-affinity places each pn=1/rn=1 space on some PS;
@@ -2539,16 +2450,7 @@ class TestRebuildSingleReplicaAvailability:
                 len(during), len(during_ok), len(during_err),
                 fail_rate * 100, dict(buckets))
 
-            # Product decision: a co-tenant single-replica space shares its
-            # ONLY host with the rebuild, so once the router observes
-            # rebuildBusyNodeID it strips that host (isRebuildingIndex, no
-            # fallback) and the candidate set is empty → nodeId=0 → the read
-            # fails router-side. spaceB is EXPECTED to fail for as long as the
-            # busy flag is engaged. Edge propagation lag (busy set/cleared
-            # trails window_start/window_end by ~80ms) is tolerated by
-            # asserting on the span between the first and last failure rather
-            # than the whole window — the same two-sided approach as
-            # test_search_fails_when_only_replica_is_rebuilding.
+            # Assert only within the cache-observed busy window.
             during_err_idx = [i for i, e in enumerate(during) if e[1] != "ok"]
             assert during_err_idx, (
                 f"spaceB never failed while spaceA rebuilt on the SAME PS "
@@ -2580,25 +2482,7 @@ class TestRebuildSingleReplicaAvailability:
                     pass
 
     def test_search_on_sibling_index_fails_during_sole_index_rebuild(self):
-        """Verifies rebuilding one index blocks queries on the sibling index.
-
-        A single space with two vector fields (two indexes A and B) and one
-        replica. Rebuild targets only index A via
-        POST /index/rebuild/dbs/:db/spaces/:space/indexes/:index_name.
-        The rebuild scheduler still marks the whole partition's sole replica
-        as ReplicasRebuildingIndex (markReplicaRebuilding is partition-scoped,
-        not index-scoped — see rebuild_service.go::markReplicaRebuilding),
-        so the router's isRebuildingIndex filter empties the candidate set
-        for every read against this space, including searches whose
-        `vectors.field` names index B.
-
-        This documents the deliberate coarseness of the router filter. If
-        someone makes the filter index-aware (e.g. only skip when the query
-        touches the rebuilding index), or narrows the ReStatusMap marker so
-        it lives per-index rather than per-partition, this assertion is the
-        canary that catches it. Whether that change is *desirable* is a
-        product call: either way, this test must be updated alongside.
-        """
+        """A partition-scoped rebuild marker also blocks sibling indexes."""
         _ensure_all_ps_alive()
         case_space = space_name + "_chaos_multi_index_sibling"
 
@@ -2708,10 +2592,7 @@ class TestRebuildSingleReplicaAvailability:
                                  json={}, timeout=30)
             assert trig.json().get("code") == 0, trig.text
 
-            # First→last refusal window — same reasoning as 6.1: master
-            # and router observe the Rebuilding marker asynchronously in
-            # both directions (set on rebuild start, cleared on completion),
-            # so both boundaries must come from the search stream itself.
+            # Bound the cache propagation window with observed refusals.
             final = _wait_terminal(db_name, case_space, timeout=600,
                                    allow_failed=True)
             time.sleep(1)
@@ -2772,10 +2653,7 @@ class TestRebuildSingleReplicaAvailability:
                 len(during), len(during_ok), len(during_err), dict(buckets),
                 len(propagation_tail), prop_tail_ok)
 
-            # Rebuild scope for the router filter is (partition, replica);
-            # index granularity does not narrow it. Between the router's
-            # first and last refusal, every sibling-index read must be
-            # rejected — regardless of the `vectors.field` it names.
+            # The partition-scoped filter must reject sibling-index reads.
             assert len(during_ok) == 0, (
                 f"expected 0 sibling-index successes inside the router "
                 f"filter-engaged window (first→last refusal); got "

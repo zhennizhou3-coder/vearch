@@ -10,12 +10,14 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "common/gamma_common_data.h"
 #include "index/index_model.h"
+#include "index/index_state.h"
 #include "util/bitmap_manager.h"
 #include "util/log.h"
 #include "util/status.h"
@@ -23,24 +25,25 @@
 
 namespace vearch {
 
-// Per-vector-index lifecycle state, keyed by index_name (matching the
-// vector_indexes_ map key). Field-level rebuild flips only the target
-// index's status; sibling indexes are untouched, which is the whole point
-// of the rebuild-without-stopping-the-indexing-thread refactor.
-enum class VectorIndexStatus : int {
-  UNINDEXED = 0,   // model created, training not yet started
-  INDEXING  = 1,   // training in flight (initial build or rebuild)
-  INDEXED   = 2,   // training finished; background loop consumes realtime vecs
-  FAILED    = 3,   // rebuild path hit an error; monitor treats this as terminal
-};
+// Subdirectory under the space's index root that holds dumped vector index
+// files: <index_root>/<kDumpSubdirName>/<timestamp>/<AbsoluteName>/<type>.index.
+// Single source of truth — Engine builds dump_path_ from it, and
+// RemoveVectorIndex uses it to purge a removed field's dumped files. Keeping
+// one definition avoids the two drifting apart (a mismatch would silently make
+// the removal-time cleanup a no-op and let stale index files resurface).
+constexpr const char *kDumpSubdirName = "retrieval_model_index";
 
 class VectorManager {
  public:
-  // State of one vector index. Callers receive a copy and do not need to
-  // hold VectorManager's rwlock while reading it.
-  struct IndexStatus {
+  // State of one vector index. Callers receive a copy and do not need to hold
+  // VectorManager's rwlock while reading it. Named IndexStatusEntry so it does
+  // not shadow the global `enum IndexStatus` (index_state.h) used for `status`.
+  // Per-index status is keyed by the same key as vector_indexes_
+  // (IndexName(field, index_type)); field-level rebuild flips only the target
+  // index's status and can reach the FAILED terminal state.
+  struct IndexStatusEntry {
     std::string name;
-    VectorIndexStatus status;
+    IndexStatus status;
   };
 
   VectorManager(const VectorStorageType &store_type,
@@ -58,6 +61,8 @@ class VectorManager {
 
   void DestroyRawVectors();
 
+  // index_name is the vector_indexes_ key (user-facing index name); callers
+  // that only know (field, type) resolve it via field_type_index_name_ first.
   Status CreateVectorIndex(const std::string &index_name,
                            const std::string &index_type,
                            const std::string &index_params, RawVector *vec,
@@ -76,46 +81,53 @@ class VectorManager {
 
   void DescribeVectorIndexes();
 
+  // Build (allocate + Init, no training/data — that is a separate step) an
+  // index object per field into `vector_indexes`, from field_index_params_.
+  // Set already_locked=true when the caller already holds vector_indexes_mutex_
+  // in write mode (e.g. ReCreateVectorIndexes): pthread_rwlock is not reentrant,
+  // so this must NOT take the rdlock again in that case.
   Status CreateVectorIndexes(
       int training_threshold,
-      std::map<std::string, IndexModel *> &vector_indexes);
+      std::map<std::string, IndexModel *> &vector_indexes,
+      bool already_locked = false);
 
   void ResetVectorIndexes(
       std::map<std::string, IndexModel *> &rebuild_vector_indexes);
 
   Status ReCreateVectorIndexes(int training_threshold);
 
-  /**
-   * @brief Re-create vector index for a specific (index_name, field_name,
-   * index_type) target. Per-index counterpart of ReCreateVectorIndexes.
-   *
-   * @param index_name  unique index name (map key in vector_indexes_)
-   * @param field_name  field the index is over
-   * @param index_type  index type (e.g. "HNSW", "IVFFLAT", "IVFPQ", "FLAT")
-   * @param training_threshold  training threshold for the new index
-   * @return Status
-   */
+  // Per-index rebuild (drop-before path): destroy the existing index for
+  // (field_name, index_type), re-create + train it, and swap in. The map key
+  // in vector_indexes_ is IndexName(field_name, index_type); index_name is the
+  // user-facing name used to publish build state to index_name_to_state_
+  // (describe API) in addition to the numeric vector_index_status_ the rebuild
+  // monitor polls.
   Status ReCreateVectorIndex(const std::string &index_name,
                              const std::string &field_name,
                              const std::string &index_type,
                              int training_threshold);
 
-  /**
-   * @brief Rebuild (in-place) vector index without dropping the old one.
-   * Creates a new IndexModel, optionally trains it, then swaps it in.
-   * Mirrors CreateVectorIndexes + TrainIndex + ResetVectorIndexes used by
-   * Engine::RebuildIndex(drop_before_rebuild=0), scoped to one index.
-   *
-   * @param index_name  unique index name (map key in vector_indexes_)
-   * @param field_name  field the index is over
-   * @param index_type  index type
-   * @param training_threshold  training threshold for the new index
-   * @param do_train   whether to train the new index before swapping in
-   */
+  // Per-index rebuild (in-place path): build a new index alongside the live
+  // one, optionally train it, then swap it in under the write lock. The old
+  // index stays queryable until the swap, so search never sees a missing
+  // index. index_name is used for build-state publishing (see
+  // ReCreateVectorIndex).
   Status RebuildVectorIndex(const std::string &index_name,
                             const std::string &field_name,
                             const std::string &index_type,
                             int training_threshold, bool do_train);
+
+  // Snapshot every vector index's rebuild status under vector_indexes_mutex_
+  // rdlock, returned by value. Powers EngineStatus.index_statuses and lets the
+  // rebuild monitor track the specific index it triggered.
+  std::vector<IndexStatusEntry> IndexStatuses();
+
+  // Set the rebuild status of one specific index (keyed by IndexName).
+  void SetIndexStatus(const std::string &index_name, IndexStatus st);
+
+  // Bulk variant that writes `st` for every key in `m`.
+  void SetAllStatuses(const std::map<std::string, IndexModel *> &m,
+                      IndexStatus st);
 
   Status CreateVectorTable(TableInfo &table, std::vector<int> &vector_cf_ids,
                            StorageManager *storage_mgr);
@@ -144,7 +156,22 @@ class VectorManager {
   int Dump(const std::string &path, int64_t dump_docid, int64_t max_docid);
   int Load(const std::vector<std::string> &path, int64_t &doc_num);
 
-  bool Contains(std::string &field_name);
+  bool Contains(const std::string &field_name) const;
+
+  bool RegisterIndexName(const std::string &name,
+                         const std::string &field_name);
+  void UnregisterIndexName(const std::string &name);
+  bool FindFieldByIndexName(const std::string &name,
+                            std::string *field_name) const;
+  bool HasIndexName(const std::string &name) const;
+
+  // Build state of a dynamically-added vector index, keyed by user-defined
+  // index name. Reported through EngineStatus alongside scalar states. Vector
+  // search does not gate on this (the index is swapped in atomically), so it is
+  // observability only. Guarded by index_name_map_mutex_, mutated only by the
+  // Engine-layer add/remove task.
+  void SetIndexState(const std::string &name, IndexState state);
+  std::map<std::string, std::string> GetAllIndexStates() const;
 
   bool SupportIncrement();
 
@@ -158,6 +185,17 @@ class VectorManager {
     return vector_indexes_;
   }
 
+  // Lock-safe check for any remaining vector index. Reads vector_indexes_ under
+  // the rdlock (unlike the VectorIndexes() accessor, which hands out a bare
+  // reference). Used after a removal to decide whether index_status_ should be
+  // reset once the last vector index is gone.
+  bool HasAnyVectorIndex() {
+    pthread_rwlock_rdlock(&vector_indexes_mutex_);
+    bool any = !vector_indexes_.empty();
+    pthread_rwlock_unlock(&vector_indexes_mutex_);
+    return any;
+  }
+
   int Delete(int64_t docid);
 
   std::map<std::string, RawVector *> &RawVectors() { return raw_vectors_; }
@@ -165,19 +203,6 @@ class VectorManager {
   std::map<std::string, IndexModel *> &IndexModels() { return vector_indexes_; }
 
   int MinIndexedNum();
-
-  // Snapshot every vector index's per-index status under index_rwmutex_
-  // rdlock and return by value, so EngineStatus() / the rebuild monitor
-  // can read without holding the lock themselves. Consumers (rebuild
-  // manager) key by index_name.
-  std::vector<IndexStatus> IndexStatuses();
-
-  // Set the status of one specific index
-  void SetIndexStatus(const std::string &index_name, VectorIndexStatus st);
-
-  // Bulk variant that writes `st` for every key in `m`
-  void SetAllStatuses(const std::map<std::string, IndexModel *> &m,
-                      VectorIndexStatus st);
 
   bitmap::BitmapManager *Bitmap() { return docids_bitmap_; };
 
@@ -191,21 +216,23 @@ class VectorManager {
   void ResetIndexTypesAndParams();
 
   /**
-   * @brief Add one index entry to the parallel config vectors.
-   * All four (index_names_ / index_types_ / index_params_ / and the
-   * field_to_index_name_ map) are kept in sync.
+   * @brief Add index type and index parameter, plus its user index_name so the
+   * forward field->type->index_name map stays consistent.
    *
-   * @param index_name  unique map key in vector_indexes_ (falls back to
-   *                    IndexName(field_name, index_type) when the caller
-   *                    has no user-supplied name)
+   * @param index_name  user-facing index name (vector_indexes_ key); empty ->
+   *                    synthesized IndexName(field, type) fallback
    * @param field_name  vector field this index is over
-   * @param index_type  index type
-   * @param index_param index parameter JSON string
+   * @param index_type  index type to add
+   * @param index_param index parameter to add
    */
   void AddIndexTypeAndParam(const std::string &index_name,
                             const std::string &field_name,
                             const std::string &index_type,
                             const std::string &index_param);
+
+  bool RemoveIndexTypeAndParam(const std::string &field_name,
+                               const std::string &index_type,
+                               const std::string &index_param);
 
   bool GetEnableRealtime() { return enable_realtime_; }
 
@@ -228,24 +255,22 @@ class VectorManager {
     index_type = index_name.substr(pos + 1);
   }
 
-  /**
-   * @brief Resolve (RawVector*, index_param) for a (field_name, index_type)
-   * rebuild target. Shared by ReCreateVectorIndex / RebuildVectorIndex.
-   *
-   * Looks up `raw_vectors_[field_name]`, then scans `index_types_` /
-   * `index_params_` for a matching index_type; falls back to the first
-   * index_param entry when no exact match exists (legacy behaviour).
-   *
-   * @param field_name   target field
-   * @param index_type   target index type
-   * @param vec          [out] RawVector pointer; set on success only
-   * @param index_param  [out] resolved index param string
-   * @return Status::OK() on success; ParamError when the field has no
-   *         RawVector entry.
-   */
+  // Directory that contains the space's index root, derived from a field's raw
+  // vector storage path: storage root is "<index_root>/data", so its parent is
+  // "<index_root>". Returns "" if the field has no raw vector / storage manager.
+  // Shared by the removal-time on-disk cleanups (DiskANN runtime dir and dumped
+  // index files), which both need <index_root>-relative paths but VectorManager
+  // does not hold the index root directly.
+  std::string StorageRootParent(const std::string &field_name);
+
+  // Resolve (RawVector*, index_param) for a (field_name, index_type) rebuild
+  // target from field_index_params_. Shared by ReCreateVectorIndex /
+  // RebuildVectorIndex. Caller must hold vector_indexes_mutex_ (the params map
+  // is read under it). Returns ParamError when the field has no RawVector or
+  // no index registered for the requested type.
   Status ResolveRebuildTarget(const std::string &field_name,
-                              const std::string &index_type,
-                              RawVector *&vec, std::string &index_param);
+                              const std::string &index_type, RawVector *&vec,
+                              std::string &index_param);
 
  private:
   VectorStorageType default_store_type_;
@@ -255,35 +280,41 @@ class VectorManager {
   std::string desc_;
 
   std::map<std::string, RawVector *> raw_vectors_;
-  // key = index_name (IndexInfo.name; falls back to IndexName(field, type)
-  // when the caller has no user-supplied name).
   std::map<std::string, IndexModel *> vector_indexes_;
-  // Per-index status keyed by the same index_name. Written under
-  // index_rwmutex_ wrlock alongside vector_indexes_ so the key set stays
-  // consistent between the two structures. Read (IndexStatuses) under
-  // rdlock. This powers EngineStatus.IndexStatuses and lets
-  // the rebuild monitor track the specific index it triggered instead of
-  // the coarse engine-wide index_status_.
-  std::unordered_map<std::string, VectorIndexStatus> vector_index_status_;
-  // vector memory buffer for realtime, key = field_name (1:1 with the field)
+  // Per-index rebuild status, keyed by the SAME key as vector_indexes_
+  // (IndexName(field, type)). Written under vector_indexes_mutex_ wrlock
+  // alongside vector_indexes_ so the two key sets stay consistent; read
+  // (IndexStatuses) under rdlock. Powers EngineStatus.index_statuses and lets
+  // the rebuild monitor track the specific index it triggered instead of the
+  // coarse engine-wide index_status_.
+  std::unordered_map<std::string, IndexStatus> vector_index_status_;
+  // vector memory buffer for realtime
   std::map<std::string, RawVector *> vector_memory_buffers_;
-  // Realtime FLAT index shadowing the main index. Key is the SAME index_name
-  // used in vector_indexes_ so search/update can locate both maps by one
-  // lookup through field_to_index_name_.
+  // FLAT index
   std::map<std::string, IndexModel *> vector_memory_buffer_indexes_;
-  // Route search/update from user-facing field_name to index_name.
-  // Populated on CreateVectorTable / AddIndexTypeAndParam; kept in sync with
-  // the parallel index_* vectors below.
-  std::map<std::string, std::string> field_to_index_name_;
   bool enable_realtime_;
 
-  // Parallel configuration vectors, aligned by position (entry i describes
-  // one index). Populated by CreateVectorTable / AddIndexTypeAndParam.
-  std::vector<std::string> index_names_;
-  std::vector<std::string> index_types_;
-  std::vector<std::string> index_params_;
-  pthread_rwlock_t index_rwmutex_;
+  // Per-field vector index types and their params: field_name -> (index_type ->
+  // params). Replaces the old parallel index_types_/index_params_ vectors,
+  // which conflated all fields' types into two positionally-paired flat lists
+  // (fragile on remove, and the "[0] is the default type" logic ignored which
+  // field a query targeted). Keyed by field so Search can resolve the default
+  // type for the queried field, and remove is an O(log) erase.
+  std::map<std::string, std::map<std::string, std::string>> field_index_params_;
+  // Forward map field_name -> (index_type -> index_name), so query / rebuild
+  // paths that only know (field, type) can resolve the vector_indexes_ key.
+  // Kept in lockstep with field_index_params_ under vector_indexes_mutex_.
+  std::map<std::string, std::map<std::string, std::string>> field_type_index_name_;
+  pthread_rwlock_t vector_indexes_mutex_;
   const std::string index_name_connector_ = "::";
+
+  // Maps user-defined index name -> the vector field the index covers.
+  // Engine layer is the only writer; protected by index_name_map_mutex_ so it stays
+  // independent of vector_indexes_mutex_ which guards vector_indexes_.
+  mutable std::mutex index_name_map_mutex_;
+  std::map<std::string, std::string> index_name_to_field_;
+  // Build state per index name, same lifetime/lock as index_name_to_field_.
+  std::map<std::string, IndexState> index_name_to_state_;
 };
 
 }  // namespace vearch

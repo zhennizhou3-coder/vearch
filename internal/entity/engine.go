@@ -17,7 +17,9 @@ package entity
 // IndexStatus describes the state of one named vector index.
 type IndexStatus struct {
 	IndexName string `json:"index_name"`
-	Status    int32  `json:"status"` // 0=UN, 1=ING, 2=ED, 3=FAILED
+	// Status is the engine's stringified IndexStatus:
+	// "UNINDEXED"/"INDEXING"/"INDEXED"/"FAILED".
+	Status string `json:"status"`
 }
 
 type EngineStatus struct {
@@ -27,4 +29,7 @@ type EngineStatus struct {
 	MinIndexedNum int32         `json:"min_indexed_num,omitempty"`
 	MaxDocid      int32         `json:"max_docid,omitempty"`
 	IndexStatuses []IndexStatus `json:"index_statuses,omitempty"`
+	// Per-index build state (index name → "BUILDING"/"READY"/"FAILED") for
+	// dynamically-added scalar/composite indexes. Absent for older engines.
+	IndexBuildState map[string]string `json:"index_build_state,omitempty"`
 }

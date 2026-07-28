@@ -62,24 +62,30 @@ type Engine interface {
 	ApplySnapshot(peers []proto.Peer, iter proto.SnapIterator) error
 	Optimize() error
 
-	// RebuildFieldIndex rebuilds the index identified by indexName. `field`
+	// RebuildIndex rebuilds the index identified by indexName. `field`
 	// and `indexType` are used engine-side to resolve the RawVector and
 	// index parameters.
-	RebuildFieldIndex(indexName, field, indexType string, dropBefore, limitCPU, describe int) error
+	RebuildIndex(indexName, field, indexType string, dropBefore, limitCPU, describe int) error
 	Load() error
 	IndexInfo() (int, int, int)
 
-	// IndexInfoWithErr returns index status, indexed count, max docid, and error.
-	IndexInfoWithErr() (int, int, int, error)
-	// IndexStatusOf returns the status of the specific vector index
-	// (matched by indexName in EngineStatus.IndexStatuses)
-	IndexStatusOf(indexName string) (status int, err error)
+	// IndexStatusOf returns the stringified status of the vector index whose
+	// physical name (field::type) matches indexName, from
+	// EngineStatus.IndexStatuses.
+	IndexStatusOf(indexName string) (status string, err error)
 	GetEngineStatus(status *entity.EngineStatus) error
 	Close()
 	HasClosed() bool
 
 	UpdateMapping(space *entity.Space) error
 	GetMapping() *mapping.IndexMapping
+
+	// Apply an explicit index change delivered by a raft INDEXCHANGE command.
+	// AddIndexes adds each index (scalar/composite/vector); RemoveIndex drops
+	// one by name. These replace the old "diff the whole space in UpdateMapping"
+	// path — the caller already knows the exact operation.
+	AddIndexes(indexes []*entity.Index) error
+	RemoveIndex(indexName string) error
 
 	GetSpace() *entity.Space
 	GetPartitionID() entity.PartitionID

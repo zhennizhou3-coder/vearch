@@ -1349,14 +1349,7 @@ var replicaRoundRobin = newRoundRobin[entity.PartitionID, entity.NodeID]()
 // rebuildBusyNodeID names the single PS node currently running an index
 // rebuild, or 0 when none is active. Rebuilds are globally serialized by the
 // master scheduler, so at most one PS is busy at any time
-var rebuildBusyNodeID atomicUint64
-
-// atomicUint64 is a tiny std-lib atomic wrapper so we don't drag the value
-// past a copy vet.
-type atomicUint64 struct{ v uint64 }
-
-func (a *atomicUint64) Load() uint64   { return stdatomic.LoadUint64(&a.v) }
-func (a *atomicUint64) Store(x uint64) { stdatomic.StoreUint64(&a.v, x) }
+var rebuildBusyNodeID stdatomic.Uint64
 
 // SetRebuildBusyNode publishes the node currently running a rebuild, or 0
 // to clear. Called by the partition cache watcher when a ReplicasRebuildingIndex

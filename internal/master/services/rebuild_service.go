@@ -49,8 +49,20 @@ const defaultMaxRetries = 3
 // maxDispatchAttempts caps per-task dispatch retries.
 const maxDispatchAttempts = 3
 
-// maxPollFailureStreak caps consecutive status poll failures per task.
-const maxPollFailureStreak = 15
+// maxPollRetries caps consecutive status poll failures per task.
+const maxPollRetries = 15
+
+// Leadership-transfer knobs: before rebuilding the replica that is currently
+// the partition leader, the scheduler transfers leadership to a healthy
+// follower so leader-typed reads stay served during the rebuild.
+const (
+	// leaderTransferTimeout caps how long we wait for a triggered transfer to
+	// take effect (LeaderID actually changes) before giving up.
+	leaderTransferTimeout = 10 * time.Second
+	// leaderTransferPollInterval is how often we poll the partition LeaderID
+	// while waiting for the transfer to complete.
+	leaderTransferPollInterval = 500 * time.Millisecond
+)
 
 // RebuildService is the public façade.
 type RebuildService struct {
@@ -114,7 +126,7 @@ func (s *RebuildService) StartRebuild(ctx context.Context, req *RebuildRequest) 
 		}
 		indexNames = []string{idx.Name}
 	} else {
-		indexNames = space.AllIndexTargets()
+		indexNames = space.AllVectorIndexes()
 		if len(indexNames) == 0 {
 			return nil, fmt.Errorf("space %s/%s has no rebuildable index targets",
 				req.DBName, req.SpaceName)
@@ -873,9 +885,10 @@ func (sc *RebuildScheduler) admitPending(ctx context.Context,
 	}
 }
 
-// retryFailedRecord retries one failed task when the scheduler is idle.
-// It resets the task's retry budget and picks the earliest failed task so
-// repeated recovery rounds rotate fairly.
+// retryFailedRecord retries one failed partition when the scheduler is idle.
+// It picks the failed task retried least recently and revives every
+// non-completed replica of that task's partition, so recovery rounds rotate
+// fairly across partitions.
 func (sc *RebuildScheduler) retryFailedRecord(ctx context.Context,
 	records []*SpaceRebuildRecord) {
 
@@ -891,42 +904,63 @@ func (sc *RebuildScheduler) retryFailedRecord(ctx context.Context,
 			continue // user abandoned this rebuild; do not resurrect it
 		}
 		// Pick the failed task retried least recently so rounds rotate.
-		var revived *RebuildTask
+		var seed *RebuildTask
 		for _, t := range rec.Tasks {
 			if t.Status != entity.RebuildStatusFailed {
-				continue // leave Completed/Cancelled tasks untouched
+				continue // completed stay; cancelled handled per-partition below
 			}
-			if revived == nil || t.CompleteTime.Before(revived.CompleteTime) {
-				revived = t
+			if seed == nil || t.CompleteTime.Before(seed.CompleteTime) {
+				seed = t
 			}
 		}
-		if revived == nil {
+		if seed == nil {
 			continue
 		}
 
-		revived.RetryCount = 0 // reset so the normal path regains MaxRetries retries
-		revived.Status = entity.RebuildStatusPending
-		revived.Progress = 0
-		revived.ErrorMessage = ""
-		revived.DispatchAttempts = 0
-		revived.PollFailureStreak = 0
-		revived.DropBefore = 0 // retries must never re-drop the index
-		revived.StartTime = time.Time{}
-		revived.CompleteTime = time.Time{}
+		// Revive the WHOLE partition, not just the failed task: reset every
+		// non-completed replica of seed's partition — the failed task plus any
+		// siblings R1 cancelled when it exhausted retries — back to Pending.
+		// A lone failed leader replica can never rebuild: leader-last defers it
+		// until a follower is rebuilt, but its only followers were cancelled and
+		// are ineligible leadership-transfer targets, so ensureLeaderMovedAway
+		// fails every round and self-heal spins forever. Rebuilding the
+		// followers first restores an eligible transfer target and lets the
+		// partition (and thus the record) converge. dispatchPending still sends
+		// at most one task, so INV-0 (single running task) holds;
+		// advanceRunningRecord drives the remaining replicas across later ticks.
+		revived := 0
+		for _, t := range rec.Tasks {
+			if t.PartitionID != seed.PartitionID {
+				continue
+			}
+			if t.Status == entity.RebuildStatusCompleted {
+				continue // already rebuilt this round; a valid transfer target
+			}
+			t.RetryCount = 0 // reset so the normal path regains MaxRetries retries
+			t.Status = entity.RebuildStatusPending
+			t.Progress = 0
+			t.ErrorMessage = ""
+			t.DispatchAttempts = 0
+			t.PollRetryCount = 0
+			t.DropBefore = 0 // retries must never re-drop the index
+			t.StartTime = time.Time{}
+			t.CompleteTime = time.Time{}
+			revived++
+		}
 
 		rec.Status = entity.RebuildStatusRunning
 		rec.ErrorMsg = ""
 		rec.FinishedAt = time.Time{}
 		sc.recountTaskCounters(rec)
 
-		// Reuse the normal dispatch path; it sends this one task.
+		// Reuse the normal dispatch path; it sends one task (leader-last).
 		sc.dispatchPending(ctx, rec)
 		if err := sc.persistRecord(ctx, rec); err != nil {
 			log.Error("persist idle retry %s: %v", rec.SpaceKey(), err)
 		}
-		log.Info("idle retry: space=%s pid=%d nodeID=%d",
-			rec.SpaceKey(), revived.PartitionID, revived.NodeID)
-		return // one task per idle tick keeps INV-0 (single running record)
+		log.Info("idle retry: space=%s pid=%d revived %d non-completed replica(s)",
+			rec.SpaceKey(), seed.PartitionID, revived)
+		return // one partition per idle tick keeps rotation fair
 	}
 }
 
@@ -945,26 +979,26 @@ func (sc *RebuildScheduler) advanceRunningRecord(ctx context.Context,
 		if t.Status != entity.RebuildStatusRunning {
 			continue
 		}
-		resp, err := client.GetRebuildStatus(t.PSNodeAddr, rec.SpaceKey(),
+		resp, err := client.GetRebuildStatus(t.PSNodeAddr, rec.DBName, rec.SpaceName,
 			t.IndexName, t.PartitionID)
 		if err != nil {
-			t.PollFailureStreak++
+			t.PollRetryCount++
 			// Persist every streak increment so restarts do not reset it.
 			dirty = true
 			log.Warn("GetRebuildStatus %s pid=%d nodeID=%d (streak=%d/%d): %v",
 				rec.SpaceKey(), t.PartitionID, t.NodeID,
-				t.PollFailureStreak, maxPollFailureStreak, err)
+				t.PollRetryCount, maxPollRetries, err)
 			// Stop polling forever once the failure streak crosses the budget.
-			if t.PollFailureStreak >= maxPollFailureStreak {
+			if t.PollRetryCount >= maxPollRetries {
 				sc.handleReplicaFailure(rec, t,
 					fmt.Sprintf("GetRebuildStatus failed %d consecutive times: %v",
-						t.PollFailureStreak, err))
+						t.PollRetryCount, err))
 			}
 			continue // will retry next tick (or finalize if marked failed)
 		}
 		// Successful poll resets the streak.
-		if t.PollFailureStreak > 0 {
-			t.PollFailureStreak = 0
+		if t.PollRetryCount > 0 {
+			t.PollRetryCount = 0
 			dirty = true
 		}
 
@@ -1005,13 +1039,20 @@ func (sc *RebuildScheduler) advanceRunningRecord(ctx context.Context,
 		}
 	}
 
+	// Clear Rebuilding markers for tasks that reached a terminal state in (a),
+	// BEFORE dispatching the next task. Leader-last means dispatchPending may
+	// need to transfer leadership onto a follower that just finished rebuilding
+	// this same tick; ensureLeaderMovedAway only accepts a follower whose
+	// persisted replica status is ReplicasOK. Clearing first flips that
+	// follower's marker back to OK so it is an eligible transfer target now;
+	// otherwise its stale ReplicasRebuildingIndex marker bars the transfer and
+	// the leader replica is wrongly failed with "no healthy follower".
+	sc.unmarkRebuildingForTerminalTasks(ctx, rec)
+
 	// (b) Dispatch pending tasks under the per-PS-serial constraint.
 	if sc.dispatchPending(ctx, rec) {
 		dirty = true
 	}
-
-	// Clear Rebuilding markers for terminal tasks.
-	sc.unmarkRebuildingForTerminalTasks(ctx, rec)
 
 	// (c) Recompute counters. Cross-record PS occupancy no longer exists;
 	// INV-0 guarantees this record is the only running one.
@@ -1058,6 +1099,22 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 			continue
 		}
 
+		// Rebuild the leader replica LAST. If this pending task's replica is
+		// currently its partition's leader AND the partition still has another
+		// pending (not-yet-rebuilt) replica, defer it: rebuild the followers
+		// first. By the time only the leader replica is left, every other
+		// replica is already rebuilt, so ensureLeaderMovedAway can transfer to
+		// any of them — exactly one transfer per partition, and no replica is
+		// skipped even for a full-space rebuild.
+		if sc.hasOtherPendingReplica(rec, t.PartitionID, t.NodeID) {
+			part, perr := mc.QueryPartition(ctx, t.PartitionID)
+			if perr == nil && part != nil && part.LeaderID == t.NodeID {
+				log.Debug("deferring leader replica rebuild: space=%s pid=%d nodeID=%d (followers first)",
+					rec.SpaceKey(), t.PartitionID, t.NodeID)
+				continue
+			}
+		}
+
 		// Refresh PSNodeAddr before every dispatch
 		server, qerr := mc.QueryServer(ctx, t.NodeID)
 		if qerr != nil || server == nil {
@@ -1069,10 +1126,25 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 		}
 		t.PSNodeAddr = server.RpcAddr()
 
+		// If this replica is the current partition leader, move leadership to a
+		// healthy follower first so the rebuild runs on a follower and
+		// leader-typed reads stay available. If leadership cannot be moved
+		// (no healthy follower / transfer timed out), skip rebuilding this
+		// replica rather than take the leader offline for a rebuild.
+		if skip, serr := sc.ensureLeaderMovedAway(ctx, rec, t); serr != nil {
+			log.Warn("leader transfer before rebuild %s pid=%d nodeID=%d failed: %v",
+				rec.SpaceKey(), t.PartitionID, t.NodeID, serr)
+			if skip {
+				markReplicaFailed(t, fmt.Sprintf(
+					"skipped: replica is leader and leadership could not be moved: %v", serr))
+				return true
+			}
+		}
+
 		t.DispatchAttempts++
 		t.DispatchAt = time.Now()
 		t.StartTime = time.Now()
-		err := client.ExecuteRebuildIndex(t.PSNodeAddr, rec.SpaceKey(),
+		err := client.ExecuteRebuildIndex(t.PSNodeAddr, rec.DBName, rec.SpaceName,
 			t.IndexName, t.PartitionID,
 			t.DropBefore, t.LimitCPU, t.Describe)
 		if err != nil {
@@ -1127,6 +1199,120 @@ func (sc *RebuildScheduler) recountTaskCounters(rec *SpaceRebuildRecord) {
 	rec.FailedTasks = failed
 }
 
+// ensureLeaderMovedAway makes sure task t's replica is NOT the partition
+// leader before its index is rebuilt, by transferring leadership to a healthy
+// follower. Rebuilding the leader's replica would make leader-typed reads fail
+// for the whole rebuild; moving leadership first keeps them served.
+//
+// Returns (skip, err):
+//   - (false, nil): the replica is already a follower (or became one) — safe
+//     to rebuild it now.
+//   - (true, err): the replica is the leader and leadership could NOT be moved
+//     (no healthy follower, RPC error, or transfer did not take effect within
+//     leaderTransferTimeout) — caller should skip rebuilding this replica.
+func (sc *RebuildScheduler) ensureLeaderMovedAway(ctx context.Context,
+	rec *SpaceRebuildRecord, t *RebuildTask) (bool, error) {
+
+	mc := sc.client.Master()
+	part, err := mc.QueryPartition(ctx, t.PartitionID)
+	if err != nil || part == nil {
+		return true, fmt.Errorf("query partition %d: %v", t.PartitionID, err)
+	}
+	// Not the leader → nothing to do, rebuild may proceed.
+	if part.LeaderID != t.NodeID {
+		return false, nil
+	}
+
+	// Single-replica partition: there is no follower to move leadership to.
+	// Rebuild in place (as before this feature existed) rather than skip —
+	// leader-typed reads will fail during the rebuild, an inherent limitation
+	// of a single replica, not a reason to abort the rebuild.
+	if len(part.Replicas) <= 1 {
+		log.Info("single-replica partition %d: rebuilding leader in place (no transfer possible)",
+			t.PartitionID)
+		return false, nil
+	}
+
+	// Pick a healthy follower to become the new leader: registered, ReplicasOK,
+	// not the current leader, and not itself a rebuild target of this record.
+	// A follower that just finished rebuilding reads as ReplicasOK here only
+	// because advanceRunningRecord clears its marker
+	// (unmarkRebuildingForTerminalTasks) BEFORE dispatching this leader task.
+	target := entity.NodeID(0)
+	var targetAddr string
+	for _, nodeID := range part.Replicas {
+		if nodeID == t.NodeID {
+			continue
+		}
+		if part.ReStatusMap[uint64(nodeID)] != entity.ReplicasOK {
+			continue
+		}
+		if sc.nodeIsRebuildTarget(rec, t.PartitionID, nodeID) {
+			continue
+		}
+		srv, qerr := mc.QueryServer(ctx, nodeID)
+		if qerr != nil || srv == nil {
+			continue
+		}
+		target = nodeID
+		targetAddr = srv.RpcAddr()
+		break
+	}
+	if target == 0 {
+		return true, fmt.Errorf("no healthy follower to take leadership of partition %d", t.PartitionID)
+	}
+
+	// Ask the target to campaign. RPC success only means the campaign started;
+	// confirm by polling the partition LeaderID.
+	if terr := client.TransferLeader(targetAddr, t.PartitionID); terr != nil {
+		return true, fmt.Errorf("transfer leader to nodeID=%d: %v", target, terr)
+	}
+	log.Info("leader transfer requested: space=%s pid=%d %d->%d, awaiting confirmation",
+		rec.SpaceKey(), t.PartitionID, t.NodeID, target)
+
+	deadline := time.Now().Add(leaderTransferTimeout)
+	for time.Now().Before(deadline) {
+		time.Sleep(leaderTransferPollInterval)
+		latest, qerr := mc.QueryPartition(ctx, t.PartitionID)
+		if qerr != nil || latest == nil {
+			continue
+		}
+		if latest.LeaderID != t.NodeID {
+			log.Info("leader transfer confirmed: space=%s pid=%d new leader=%d",
+				rec.SpaceKey(), t.PartitionID, latest.LeaderID)
+			return false, nil
+		}
+	}
+	return true, fmt.Errorf("leader transfer to nodeID=%d did not take effect within %s",
+		target, leaderTransferTimeout)
+}
+
+// nodeIsRebuildTarget reports whether (pid, nodeID) is a non-terminal task in
+// this record — i.e. it will itself be rebuilt, so it is a poor transfer target.
+func (sc *RebuildScheduler) nodeIsRebuildTarget(rec *SpaceRebuildRecord,
+	pid entity.PartitionID, nodeID entity.NodeID) bool {
+	for _, t := range rec.Tasks {
+		if t.PartitionID == pid && t.NodeID == nodeID && !t.Status.IsTerminal() {
+			return true
+		}
+	}
+	return false
+}
+
+// hasOtherPendingReplica reports whether the partition has another replica
+// task still Pending besides the one on excludeNode. Used to defer rebuilding
+// the leader replica until its followers are done.
+func (sc *RebuildScheduler) hasOtherPendingReplica(rec *SpaceRebuildRecord,
+	pid entity.PartitionID, excludeNode entity.NodeID) bool {
+	for _, t := range rec.Tasks {
+		if t.PartitionID == pid && t.NodeID != excludeNode &&
+			t.Status == entity.RebuildStatusPending {
+			return true
+		}
+	}
+	return false
+}
+
 // markReplicaFailed sets a per-replica task to terminal failed state.
 func markReplicaFailed(t *RebuildTask, msg string) {
 	t.Status = entity.RebuildStatusFailed
@@ -1145,7 +1331,7 @@ func (sc *RebuildScheduler) handleReplicaFailure(rec *SpaceRebuildRecord,
 		t.Progress = 0
 		t.ErrorMessage = ""
 		t.DispatchAttempts = 0
-		t.PollFailureStreak = 0
+		t.PollRetryCount = 0
 		// Retries must not drop existing index data again.
 		t.DropBefore = 0
 		t.StartTime = time.Time{}
@@ -1398,7 +1584,8 @@ func (sc *RebuildScheduler) buildReplicaTasks(ctx context.Context,
 			NodeID:       nodeID,
 			ReplicaIndex: replicaIdx,
 			PSNodeAddr:   server.RpcAddr(),
-			SpaceKey:     rec.SpaceKey(),
+			DBName:       rec.DBName,
+			SpaceName:    rec.SpaceName,
 			IndexName:    target,
 			// Pending means planned but not yet dispatched.
 			Status:     entity.RebuildStatusPending,

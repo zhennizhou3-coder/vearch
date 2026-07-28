@@ -51,13 +51,6 @@ func (s RebuildStatus) IsTerminal() bool {
 	}
 }
 
-// CancelRebuildRequest cancels rebuild work for a whole space.
-type CancelRebuildRequest struct {
-	DBName    string `json:"db_name"`
-	SpaceName string `json:"space_name"`
-	IndexName string `json:"index_name,omitempty"`
-}
-
 // CancelRebuildResponse describes one cancel attempt.
 type CancelRebuildResponse struct {
 	DBName    string `json:"db_name"`
@@ -87,13 +80,14 @@ type CancelRebuildResponse struct {
 //     contract between master (etcd record + status polls) and PS
 //     (in-memory task + status responses).
 //   - Master-only scheduling metadata (NodeID, ReplicaIndex, PSNodeAddr,
-//     DispatchAt, DispatchAttempts, PollFailureStreak, RetryCount) is zero
+//     DispatchAt, DispatchAttempts, PollRetryCount, RetryCount) is zero
 //     on PS.
 //   - PS-only CGo parameters (FieldName, IndexType) are zero on master.
 type RebuildTask struct {
 	// Identity — both sides.
 	PartitionID PartitionID   `json:"partition_id"`
-	SpaceKey    string        `json:"space_key"` // dbName-spaceName
+	DBName      string        `json:"db_name"`
+	SpaceName   string        `json:"space_name"`
 	IndexName   string        `json:"index_name"`
 	Status      RebuildStatus `json:"status"`
 
@@ -109,25 +103,30 @@ type RebuildTask struct {
 	Describe   int `json:"describe,omitempty"`
 
 	// Master-only scheduling metadata (zero on PS).
-	NodeID            NodeID    `json:"node_id,omitempty"`
-	ReplicaIndex      int       `json:"replica_index,omitempty"`
-	PSNodeAddr        string    `json:"ps_node_addr,omitempty"`
-	DispatchAt        time.Time `json:"dispatch_at,omitempty"`
-	DispatchAttempts  int       `json:"dispatch_attempts,omitempty"`
-	PollFailureStreak int       `json:"poll_failure_streak,omitempty"`
-	RetryCount        int       `json:"retry_count,omitempty"`
+	NodeID           NodeID    `json:"node_id,omitempty"`
+	ReplicaIndex     int       `json:"replica_index,omitempty"`
+	PSNodeAddr       string    `json:"ps_node_addr,omitempty"`
+	DispatchAt       time.Time `json:"dispatch_at,omitempty"`
+	DispatchAttempts int       `json:"dispatch_attempts,omitempty"`
+	PollRetryCount   int       `json:"poll_retry_count,omitempty"`
+	RetryCount       int       `json:"retry_count,omitempty"`
 
 	// PS-only CGo call parameters (zero on master).
 	FieldName string `json:"field_name,omitempty"`
 	IndexType string `json:"index_type,omitempty"`
+
+	// AwaitTransition is PS-local monitor state. A task dispatched while the
+	// target is already INDEXED must observe a later non-INDEXED state before
+	// another INDEXED can be attributed to this rebuild.
+	AwaitTransition bool `json:"-"`
 }
 
 // RebuildRequest is the API payload for starting a rebuild.
 type RebuildRequest struct {
 	DBName      string `json:"db_name"`
 	SpaceName   string `json:"space_name"`
-	PartitionId uint32 `json:"partition_id,omitempty"` // Optional: specific partition to rebuild, 0 means all
 	IndexName   string `json:"index_name,omitempty"`
+	PartitionId uint32 `json:"partition_id,omitempty"` // Optional: specific partition to rebuild, 0 means all
 	DropBefore  bool   `json:"drop_before_rebuild,omitempty"`
 	LimitCPU    int    `json:"limit_cpu,omitempty"`
 	Describe    int    `json:"describe,omitempty"`
@@ -176,7 +175,8 @@ type RebuildSummaryResponse struct {
 
 // RebuildStatusQuery is the rebuild status poll payload.
 type RebuildStatusQuery struct {
-	SpaceKey  string `json:"space_key"`
+	DBName    string `json:"db_name"`
+	SpaceName string `json:"space_name"`
 	IndexName string `json:"index_name"`
 }
 
@@ -194,7 +194,8 @@ type RebuildStatusResponse struct {
 
 // RebuildParam is the rebuild start payload.
 type RebuildParam struct {
-	SpaceKey   string `json:"space_key"`
+	DBName     string `json:"db_name"`
+	SpaceName  string `json:"space_name"`
 	IndexName  string `json:"index_name"`
 	DropBefore int    `json:"drop_before"`
 	LimitCPU   int    `json:"limit_cpu"`
@@ -256,21 +257,21 @@ func (r *SpaceRebuildRecord) HasMoreTargets() bool {
 	return r.CurrentIndexIdx+1 < len(r.Indexes)
 }
 
-// MergeCancelledFrom merges task-level Cancelled markers from `current`
-// into r, and propagates a CancelRequested=true flag from `current`. Called
-// by persistRecord to preserve a concurrent CancelRebuild's writes across
-// the scheduler tick's read-modify-write cycle.
+// MergeCancelledFrom merges task-level Cancelled markers from persistedRecord
+// into r, and propagates a CancelRequested=true flag from persistedRecord.
+// Called by persistRecord to preserve a concurrent CancelRebuild's writes
+// across the scheduler tick's read-modify-write cycle.
 //
 // Returns the number of task-level cancels merged (the flag propagation is
 // not counted; it is a boolean).
-func (r *SpaceRebuildRecord) MergeCancelledFrom(current *SpaceRebuildRecord) int {
-	if current == nil {
+func (r *SpaceRebuildRecord) MergeCancelledFrom(persistedRecord *SpaceRebuildRecord) int {
+	if persistedRecord == nil {
 		return 0
 	}
-	if current.CancelRequested {
+	if persistedRecord.CancelRequested {
 		r.CancelRequested = true
 	}
-	if len(current.Tasks) == 0 || len(r.Tasks) == 0 {
+	if len(persistedRecord.Tasks) == 0 || len(r.Tasks) == 0 {
 		return 0
 	}
 	type taskKey struct {
@@ -285,7 +286,7 @@ func (r *SpaceRebuildRecord) MergeCancelledFrom(current *SpaceRebuildRecord) int
 		byKey[taskKey{t.PartitionID, t.NodeID}] = t
 	}
 	merged := 0
-	for _, ct := range current.Tasks {
+	for _, ct := range persistedRecord.Tasks {
 		if ct == nil || ct.Status != RebuildStatusCancelled {
 			continue
 		}

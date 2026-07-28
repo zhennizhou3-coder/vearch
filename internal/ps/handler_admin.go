@@ -67,10 +67,12 @@ func ExportToRpcAdminHandler(server *Server) {
 		{client.DeletePartitionHandler, &DeletePartitionHandler{server: server}, true},
 		{client.DeleteReplicaHandler, &DeleteReplicaHandler{server: server}, true},
 		{client.UpdatePartitionHandler, &UpdatePartitionHandler{server: server}, true},
+		{client.IndexChangePartitionHandler, &IndexChangePartitionHandler{server: server}, true},
 		{client.IsLiveHandler, new(IsLiveHandler), false},
 		{client.PartitionInfoHandler, &PartitionInfoHandler{server: server}, false},
 		{client.StatsHandler, &StatsHandler{server: server}, false},
 		{client.ChangeMemberHandler, &ChangeMemberHandler{server: server}, false},
+		{client.TransferLeaderHandler, &TransferLeaderHandler{server: server}, false},
 		{client.EngineCfgHandler, &EngineCfgHandler{server: server}, false},
 		{client.BackupHandler, &BackupHandler{server: server}, false},
 		{client.ResourceLimitHandler, &ResourceLimitHandler{server: server}, false},
@@ -186,6 +188,36 @@ func (handler *UpdatePartitionHandler) Execute(ctx context.Context, req *vearchp
 	return nil
 }
 
+type IndexChangePartitionHandler struct {
+	server *Server
+}
+
+func (handler *IndexChangePartitionHandler) Execute(ctx context.Context, req *vearchpb.PartitionData, reply *vearchpb.PartitionData) error {
+	reply.Err = &vearchpb.Error{Code: vearchpb.ErrorEnum_SUCCESS}
+
+	ic := new(vearchpb.IndexChange)
+	if err := json.Unmarshal(req.Data, ic); err != nil {
+		log.Error("failed to unmarshal index change data: %v", err)
+		return vearchpb.NewError(vearchpb.ErrorEnum_RPC_PARAM_ERROR, err)
+	}
+
+	store := handler.server.GetPartition(req.PartitionID)
+	if store == nil {
+		msg := fmt.Sprintf("partition not found, partitionId:[%d], nodeID:[%d], node ip:[%s]",
+			req.PartitionID, handler.server.nodeID, handler.server.ip)
+		log.Error("%s", msg)
+		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_NOT_EXIST, errors.New(msg))
+	}
+
+	if err := store.IndexChange(ctx, ic); err != nil {
+		log.Error("failed to apply index change for partition %d: %v", req.PartitionID, err)
+		return err
+	}
+
+	log.Infof("successfully applied index change for partition %d", req.PartitionID)
+	return nil
+}
+
 type IsLiveHandler int
 
 func (*IsLiveHandler) Execute(ctx context.Context, req *vearchpb.PartitionData, reply *vearchpb.PartitionData) error {
@@ -260,6 +292,8 @@ func (pih *PartitionInfoHandler) buildPartitionInfo(store PartitionStore, opType
 		BackupStatus: int(status.BackupStatus),
 		IndexNum:     int(status.MinIndexedNum),
 		MaxDocid:     int(status.MaxDocid),
+
+		IndexBuildState: status.IndexBuildState,
 	}
 
 	if opType == vearchpb.OpType_GET {
@@ -372,6 +406,43 @@ func (ch *ChangeMemberHandler) Execute(ctx context.Context, req *vearchpb.Partit
 	if reqObj.Method == proto.ConfRemoveNode {
 		ch.server.raftResolver.DeleteNode(reqObj.NodeID)
 	}
+	return nil
+}
+
+// TransferLeaderHandler makes this PS's replica of the partition campaign to
+// become the raft leader. The rebuild scheduler sends it to a healthy follower
+// before rebuilding the current leader's replica, so the index rebuild never
+// runs on the leader (keeping leader-typed reads available). Campaigning is
+// best-effort — success only means the campaign started; the scheduler polls
+// the partition LeaderID to confirm the transfer actually happened.
+type TransferLeaderHandler struct {
+	server *Server
+}
+
+func (th *TransferLeaderHandler) Execute(ctx context.Context, req *vearchpb.PartitionData, reply *vearchpb.PartitionData) error {
+	reply.Err = &vearchpb.Error{Code: vearchpb.ErrorEnum_SUCCESS}
+
+	store := th.server.GetPartition(req.PartitionID)
+	if store == nil {
+		msg := fmt.Sprintf("partition not found, partitionId:[%d], nodeID:[%d]", req.PartitionID, th.server.nodeID)
+		log.Error("%s", msg)
+		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_NOT_EXIST, errors.New(msg))
+	}
+
+	// Already leader: nothing to do, report success so the scheduler proceeds.
+	if store.IsLeader() {
+		log.Info("TransferLeader: partition %d already led by nodeID %d, no-op",
+			req.PartitionID, th.server.nodeID)
+		return nil
+	}
+
+	if err := store.TryToLeader(); err != nil {
+		log.Error("TransferLeader: partition %d nodeID %d campaign failed: %v",
+			req.PartitionID, th.server.nodeID, err)
+		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, err)
+	}
+	log.Info("TransferLeader: partition %d nodeID %d campaign started",
+		req.PartitionID, th.server.nodeID)
 	return nil
 }
 
@@ -1292,8 +1363,8 @@ func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.Parti
 	}
 
 	pid := req.PartitionID
-	log.Info("PS received rebuild index request: spaceKey=%s, indexName=%s, partitionID=%d, dropBefore=%d, limitCPU=%d, describe=%d, myNodeID=%d",
-		param.SpaceKey, param.IndexName, pid,
+	log.Info("PS received rebuild index request: dbName=%s, spaceName=%s, indexName=%s, partitionID=%d, dropBefore=%d, limitCPU=%d, describe=%d, myNodeID=%d",
+		param.DBName, param.SpaceName, param.IndexName, pid,
 		param.DropBefore, param.LimitCPU, param.Describe, rih.server.nodeID)
 
 	// Ensure the target partition lives on this PS.
@@ -1304,17 +1375,17 @@ func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.Parti
 			fmt.Errorf("partition %d not found", pid))
 	}
 
-	// Derive spaceKey for old clients that do not send it.
-	spaceKey := param.SpaceKey
-	if spaceKey == "" {
+	// Derive db/space identity for old clients that do not send it.
+	dbName, spaceName := param.DBName, param.SpaceName
+	if dbName == "" || spaceName == "" {
 		space := store.GetSpace()
-		dbName, qerr := rih.server.client.Master().QueryDBId2Name(ctx, space.DBId)
+		qdb, qerr := rih.server.client.Master().QueryDBId2Name(ctx, space.DBId)
 		if qerr != nil {
 			return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
-				fmt.Errorf("resolve dbName for spaceKey: %v", qerr))
+				fmt.Errorf("resolve db/space for rebuild task: %v", qerr))
 		}
-		spaceKey = fmt.Sprintf("%s-%s", dbName, space.Name)
-		log.Warn("rebuild index request missing spaceKey, derived %s for pid=%d", spaceKey, pid)
+		dbName, spaceName = qdb, space.Name
+		log.Warn("rebuild index request missing db/space, derived %s/%s for pid=%d", dbName, spaceName, pid)
 	}
 
 	// Resolve the index by name on the local space schema, and translate
@@ -1335,15 +1406,15 @@ func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.Parti
 	// GetRebuildManager is lazily initialized and safe for concurrent handlers.
 	rebuildMgr := rih.server.GetRebuildManager()
 
-	if err := rebuildMgr.StartRebuildTask(spaceKey, param.IndexName, idx.FieldName, idx.Type,
+	if err := rebuildMgr.StartRebuildTask(dbName, spaceName, param.IndexName, idx.FieldName, idx.Type,
 		uint32(pid), param.DropBefore, param.LimitCPU, param.Describe); err != nil {
-		log.Error("Failed to start rebuild task: spaceKey=%s, indexName=%s, pid=%d: %v",
-			spaceKey, param.IndexName, pid, err)
+		log.Error("Failed to start rebuild task: dbName=%s, spaceName=%s, indexName=%s, pid=%d: %v",
+			dbName, spaceName, param.IndexName, pid, err)
 		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, err)
 	}
 
-	log.Info("Rebuild index task accepted: spaceKey=%s, indexName=%s, partitionID=%d (async)",
-		spaceKey, param.IndexName, pid)
+	log.Info("Rebuild index task accepted: dbName=%s, spaceName=%s, indexName=%s, partitionID=%d (async)",
+		dbName, spaceName, param.IndexName, pid)
 	return nil
 }
 
@@ -1362,15 +1433,15 @@ func (rsh *RebuildStatusHandler) Execute(ctx context.Context, req *vearchpb.Part
 	}
 
 	pid := req.PartitionID
-	log.Info("PS received rebuild status query: spaceKey=%s, indexName=%s, partitionID=%d, myNodeID=%d",
-		query.SpaceKey, query.IndexName, pid, rsh.server.nodeID)
+	log.Info("PS received rebuild status query: dbName=%s, spaceName=%s, indexName=%s, partitionID=%d, myNodeID=%d",
+		query.DBName, query.SpaceName, query.IndexName, pid, rsh.server.nodeID)
 
 	rebuildMgr := rsh.server.GetRebuildManager()
 
 	status, errorMsg, exists, progress := rebuildMgr.GetRebuildTaskStatus(
-		query.SpaceKey, query.IndexName, pid)
-	log.Info("RebuildTaskStatus result: spaceKey=%s, indexName=%s, partitionID=%d, status=%s, exists=%v, errorMsg=%s, progress=%d%%",
-		query.SpaceKey, query.IndexName, pid, status, exists, errorMsg, progress)
+		query.DBName, query.SpaceName, query.IndexName, pid)
+	log.Info("RebuildTaskStatus result: dbName=%s, spaceName=%s, indexName=%s, partitionID=%d, status=%s, exists=%v, errorMsg=%s, progress=%d%%",
+		query.DBName, query.SpaceName, query.IndexName, pid, status, exists, errorMsg, progress)
 
 	response := &entity.RebuildStatusResponse{
 		Exists:       exists,

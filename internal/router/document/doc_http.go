@@ -244,6 +244,11 @@ func (handler *DocumentHandler) proxyMaster(group *gin.RouterGroup) error {
 	group.DELETE(fmt.Sprintf("/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
 	group.PUT(fmt.Sprintf("/dbs/:%s/spaces/:%s", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
 
+	// space indexes handler
+	group.GET(fmt.Sprintf("/dbs/:%s/spaces/:%s/indexes", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
+	group.POST(fmt.Sprintf("/dbs/:%s/spaces/:%s/indexes", URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
+	group.DELETE(fmt.Sprintf("/dbs/:%s/spaces/:%s/indexes/:%s", URLParamDbName, URLParamSpaceName, URLParamIndexName), handler.handleMasterRequest)
+
 	// alias handler
 	group.POST(fmt.Sprintf("/alias/:%s/dbs/:%s/spaces/:%s", URLParamAliasName, URLParamDbName, URLParamSpaceName), handler.handleMasterRequest)
 	group.GET(fmt.Sprintf("/alias/:%s", URLParamAliasName), handler.handleMasterRequest)

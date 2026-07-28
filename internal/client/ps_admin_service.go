@@ -50,6 +50,24 @@ func UpdatePartition(addr string, space *entity.Space, pid entity.PartitionID) e
 	return operatePartition(UpdatePartitionHandler, addr, space, pid)
 }
 
+// PartitionIndexChange ships an explicit add/remove-index instruction to a
+// partition (routed to a raft CmdType_INDEXCHANGE).
+func PartitionIndexChange(addr string, pid entity.PartitionID, ic *vearchpb.IndexChange) error {
+	bytes, e := vjson.Marshal(ic)
+	if e != nil {
+		return e
+	}
+	args := &vearchpb.PartitionData{PartitionID: uint32(pid), Data: bytes}
+	reply := new(vearchpb.PartitionData)
+	if err := Execute(addr, IndexChangePartitionHandler, args, reply); err != nil {
+		return err
+	}
+	if reply.Err.Code != vearchpb.ErrorEnum_SUCCESS {
+		return vearchpb.NewError(reply.Err.Code, nil)
+	}
+	return nil
+}
+
 func GetEngineCfg(addr string, pid entity.PartitionID) (cfg *entity.SpaceConfig, err error) {
 	args := &vearchpb.PartitionData{PartitionID: pid, Type: vearchpb.OpType_GET}
 	reply := new(vearchpb.PartitionData)
@@ -322,6 +340,22 @@ func ChangeMember(addr string, changeMember *entity.ChangeMember) error {
 	return nil
 }
 
+// TransferLeader asks the PS at addr to make its replica of partition pid the
+// raft leader (it campaigns via store.TryToLeader()). A nil return only means
+// the campaign was started, NOT that leadership has moved — the caller must
+// confirm by polling the partition's LeaderID.
+func TransferLeader(addr string, pid entity.PartitionID) error {
+	args := &vearchpb.PartitionData{PartitionID: pid}
+	reply := new(vearchpb.PartitionData)
+	err := Execute(addr, TransferLeaderHandler, args, reply)
+	if err != nil {
+		return err
+	} else if reply.Err.Code != vearchpb.ErrorEnum_SUCCESS {
+		return vearchpb.NewError(reply.Err.Code, nil)
+	}
+	return nil
+}
+
 func operatePsMemLimitCfg(method, addr string, cfg *entity.MemoryLimitCfg) error {
 	bytes, e := vjson.Marshal(cfg)
 	if e != nil {
@@ -344,10 +378,11 @@ func UpdateMemoryLimitCfg(addr string, cfg *entity.MemoryLimitCfg) error {
 }
 
 // ExecuteRebuildIndex starts a rebuild task on PS.
-func ExecuteRebuildIndex(addr string, spaceKey, indexName string,
+func ExecuteRebuildIndex(addr string, dbName, spaceName, indexName string,
 	pid entity.PartitionID, dropBefore int, limitCPU int, describe int) error {
 	param := &entity.RebuildParam{
-		SpaceKey:   spaceKey,
+		DBName:     dbName,
+		SpaceName:  spaceName,
 		IndexName:  indexName,
 		DropBefore: dropBefore,
 		LimitCPU:   limitCPU,
@@ -370,16 +405,17 @@ func ExecuteRebuildIndex(addr string, spaceKey, indexName string,
 		return vearchpb.NewError(reply.Err.Code, nil)
 	}
 
-	log.Info("ExecuteRebuildIndex RPC success: addr=%s, spaceKey=%s, indexName=%s, pid=%d",
-		addr, spaceKey, indexName, pid)
+	log.Info("ExecuteRebuildIndex RPC success: addr=%s, dbName=%s, spaceName=%s, indexName=%s, pid=%d",
+		addr, dbName, spaceName, indexName, pid)
 	return nil
 }
 
 // GetRebuildStatus queries one PS rebuild task.
-func GetRebuildStatus(addr string, spaceKey, indexName string,
+func GetRebuildStatus(addr string, dbName, spaceName, indexName string,
 	pid entity.PartitionID) (*entity.RebuildStatusResponse, error) {
 	query := &entity.RebuildStatusQuery{
-		SpaceKey:  spaceKey,
+		DBName:    dbName,
+		SpaceName: spaceName,
 		IndexName: indexName,
 	}
 
@@ -407,7 +443,7 @@ func GetRebuildStatus(addr string, spaceKey, indexName string,
 		return nil, err
 	}
 
-	log.Info("GetRebuildStatus RPC success: addr=%s, spaceKey=%s, indexName=%s, pid=%d, status=%d, progress=%d%%",
-		addr, spaceKey, indexName, pid, response.Status, response.Progress)
+	log.Info("GetRebuildStatus RPC success: addr=%s, dbName=%s, spaceName=%s, indexName=%s, pid=%d, status=%d, progress=%d%%",
+		addr, dbName, spaceName, indexName, pid, response.Status, response.Progress)
 	return response, nil
 }
