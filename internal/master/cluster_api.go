@@ -2126,6 +2126,11 @@ func (ca *clusterAPI) modifySpaceConfig(c *gin.Context) {
 		return
 	}
 
+	if spaceCfg.IndexBuildBatchSize != nil && *spaceCfg.IndexBuildBatchSize <= 0 {
+		httpCode = response.New(c).JsonError(errors.NewErrBadRequest(fmt.Errorf("index_build_batch_size must be greater than 0")))
+		return
+	}
+
 	if err := ca.masterService.Config().ModifySpaceConfig(c, dbName, spaceName, spaceCfg); err != nil {
 		httpCode = response.New(c).JsonError(errors.NewErrInternal(err))
 	} else {

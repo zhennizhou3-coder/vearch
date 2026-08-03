@@ -149,6 +149,7 @@ type Space struct {
 	PartitionOperatorType *string                     `json:"operator_type,omitempty"`   // partition rule operator type
 	EnableIdCache         *bool                       `json:"enable_id_cache,omitempty"` // whether enable map docid to _id value in cache
 	EnableRealtime        *bool                       `json:"enable_realtime,omitempty"` // whether enable realtime search
+	IndexBuildBatchSize   *int64                      `json:"index_build_batch_size,omitempty"`
 }
 
 // TODO separete space config and mapping
@@ -161,6 +162,13 @@ type SpaceConfig struct {
 	SlowSearchTime  *int64  `json:"slow_search_time,omitempty"` //previous name "long_search_time"
 	RefreshInterval *int32  `json:"refresh_interval,omitempty"`
 	EnableIdCache   *bool   `json:"enable_id_cache,omitempty"`
+	// IndexBuildBatchSize overrides the batch size used when building vector
+	// indexes from newly-written vectors. Unset leaves the per-hardware default
+	// in effect; a positive value overrides it. Values <= 0 are rejected at the
+	// API boundary. Persisted in master meta and re-applied to the PS engine on
+	// restart via RegisterServer (threaded through the gamma Table), so it
+	// survives restarts.
+	IndexBuildBatchSize *int64 `json:"index_build_batch_size,omitempty"`
 }
 
 type SpaceSchema struct {
@@ -409,7 +417,6 @@ func (index *Index) UnmarshalJSON(bs []byte) error {
 				}
 			}
 
-			// training_threshold >= ncentroids * min_points_per_centroid (=39)
 			if indexParams.TrainingThreshold != 0 {
 				if indexParams.TrainingThreshold < indexParams.Ncentroids {
 					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than ncentroids:[%d]", indexParams.TrainingThreshold, indexParams.Ncentroids))

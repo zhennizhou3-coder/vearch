@@ -1272,7 +1272,15 @@ func (sc *RebuildScheduler) ensureLeaderMovedAway(ctx context.Context,
 
 	deadline := time.Now().Add(leaderTransferTimeout)
 	for time.Now().Before(deadline) {
-		time.Sleep(leaderTransferPollInterval)
+		select {
+		case <-ctx.Done():
+			// Scheduler tick is being torn down (master step-down / shutdown /
+			// 30s tick deadline). Stop waiting; the transfer was not confirmed,
+			// so report it as not-moved (skip rebuilding this leader replica).
+			return true, fmt.Errorf("leader transfer to nodeID=%d aborted: %w",
+				target, ctx.Err())
+		case <-time.After(leaderTransferPollInterval):
+		}
 		latest, qerr := mc.QueryPartition(ctx, t.PartitionID)
 		if qerr != nil || latest == nil {
 			continue
@@ -1669,16 +1677,16 @@ func (sc *RebuildScheduler) persistRecord(ctx context.Context, rec *SpaceRebuild
 		if raw == "" {
 			return fmt.Errorf("persist %s: record gone from etcd", key)
 		}
-		current := &SpaceRebuildRecord{}
-		if err := vjson.Unmarshal([]byte(raw), current); err != nil {
-			return fmt.Errorf("persist %s: unmarshal current: %w", key, err)
+		persisted := &SpaceRebuildRecord{}
+		if err := vjson.Unmarshal([]byte(raw), persisted); err != nil {
+			return fmt.Errorf("persist %s: unmarshal persisted: %w", key, err)
 		}
-		if current.Status == entity.RebuildStatusCancelled {
+		if persisted.Status == entity.RebuildStatusCancelled {
 			log.Info("persistRecord %s: etcd record is Cancelled; skipping persist", key)
 			return nil
 		}
 		// Merge task-level Cancelled markers so they survive this write.
-		if merged := rec.MergeCancelledFrom(current); merged > 0 {
+		if merged := rec.MergeCancelledFrom(persisted); merged > 0 {
 			log.Info("persistRecord %s: preserved %d task-level cancels from concurrent CancelRebuild", key, merged)
 		}
 		value, err := vjson.Marshal(rec)

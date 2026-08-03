@@ -146,8 +146,20 @@ func (rcv *Table) IndexesLength() int {
 	return 0
 }
 
+func (rcv *Table) IndexBuildBatchSize() int64 {
+	o := flatbuffers.UOffsetT(rcv._tab.Offset(22))
+	if o != 0 {
+		return rcv._tab.GetInt64(o + rcv._tab.Pos)
+	}
+	return 0
+}
+
+func (rcv *Table) MutateIndexBuildBatchSize(n int64) bool {
+	return rcv._tab.MutateInt64Slot(22, n)
+}
+
 func TableStart(builder *flatbuffers.Builder) {
-	builder.StartObject(9)
+	builder.StartObject(10)
 }
 func TableAddName(builder *flatbuffers.Builder, name flatbuffers.UOffsetT) {
 	builder.PrependUOffsetTSlot(0, flatbuffers.UOffsetT(name), 0)
@@ -184,6 +196,9 @@ func TableAddIndexes(builder *flatbuffers.Builder, indexes flatbuffers.UOffsetT)
 }
 func TableStartIndexesVector(builder *flatbuffers.Builder, numElems int) flatbuffers.UOffsetT {
 	return builder.StartVector(4, numElems, 4)
+}
+func TableAddIndexBuildBatchSize(builder *flatbuffers.Builder, indexBuildBatchSize int64) {
+	builder.PrependInt64Slot(9, indexBuildBatchSize, 0)
 }
 func TableEnd(builder *flatbuffers.Builder) flatbuffers.UOffsetT {
 	return builder.EndObject()

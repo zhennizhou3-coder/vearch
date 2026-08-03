@@ -69,13 +69,22 @@ type Engine interface {
 	Load() error
 	IndexInfo() (int, int, int)
 
-	// IndexStatusOf returns the stringified status of the vector index whose
-	// physical name (field::type) matches indexName, from
-	// EngineStatus.IndexStatuses.
-	IndexStatusOf(indexName string) (status string, err error)
+	// IndexStatusOf returns the stringified status and the indexed-vector
+	// count of the vector index whose physical name (field::type) matches
+	// indexName, from EngineStatus.IndexStatuses. indexedNum is 0 for engines
+	// predating the per-index count field.
+	IndexStatusOf(indexName string) (status string, indexedNum int, err error)
 	GetEngineStatus(status *entity.EngineStatus) error
 	Close()
 	HasClosed() bool
+
+	// IndexTrainInFlight reports whether a long, uninterruptible index train is
+	// running on this engine (a RebuildIndex cgo call, or a BuildIndex whose
+	// train() is in progress). The snapshot-install path uses it to defer
+	// (reject) a snapshot rather than run the destructive Close + data removal
+	// while a train holds the engine — which would otherwise block for the whole
+	// train and risk wiping local data before the new snapshot is installed.
+	IndexTrainInFlight() bool
 
 	UpdateMapping(space *entity.Space) error
 	GetMapping() *mapping.IndexMapping

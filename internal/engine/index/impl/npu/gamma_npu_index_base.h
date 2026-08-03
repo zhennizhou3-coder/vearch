@@ -95,6 +95,8 @@ class GammaNPUIndexBase : public IndexModel {
 
   virtual long GetTotalMemBytes() override { return 0; }
 
+  bool IsNPUIndex() const override { return true; }
+
  protected:
   virtual faiss::Index *CreateNPUIndex() = 0;
   virtual int CreateSearchThread() = 0;

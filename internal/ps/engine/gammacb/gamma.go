@@ -37,10 +37,12 @@ import (
 
 var _ engine.Engine = &gammaEngine{}
 
-// indexLocker serializes BuildIndex, RebuildIndex, and Load across the
-// entire PS process. Rebuild scheduling already limits concurrent rebuild work
-// on a PS; the package-level lock also covers write-triggered BuildIndex and
-// partition Load calls that are not coordinated by the rebuild scheduler.
+// indexLocker serializes the *start* of BuildIndex and the Load of a partition
+// across the entire PS process. It is held only briefly: BuildIndex spawns its
+// C++ work on a goroutine and returns, and Load runs a bounded init+load. It is
+// deliberately NOT held by RebuildIndex, whose synchronous cgo call can run for
+// hours — the C++ engine and the master scheduler own rebuild concurrency (see
+// RebuildIndex).
 var indexLocker sync.Mutex
 
 type EngineConfig struct {
@@ -148,6 +150,15 @@ type gammaEngine struct {
 	counter   *atomic.AtomicInt64
 	lock      sync.RWMutex
 	hasClosed bool
+	// rebuilding guards against a second concurrent RebuildIndex on THIS
+	// engine (0 = idle, 1 = rebuilding). The C++ engine does not serialize
+	// concurrent rebuilds of the same index (two trainers can race into the
+	// swap and free each other's index), and RebuildIndex intentionally holds
+	// no process-global lock, so this per-engine CAS gate enforces "at most one
+	// rebuild per partition" as a hard mechanism rather than relying only on
+	// the master scheduler's logical serialization. Value type: the zero value
+	// is a ready (idle) gate, so no constructor init is needed.
+	rebuilding atomic.AtomicInt64
 }
 
 func (ge *gammaEngine) GetSpace() *entity.Space {
@@ -315,6 +326,14 @@ func (ge *gammaEngine) IndexInfo() (int, int, int) {
 }
 
 func (ge *gammaEngine) GetEngineStatus(status *entity.EngineStatus) error {
+	// Pin the engine for the whole cgo call. Close() nils ge.gamma and then
+	// waits for counter==0 before freeing the C++ engine, so holding the
+	// counter across gamma.GetEngineStatus prevents a use-after-free when a
+	// partition closes mid-call — e.g. the rebuild monitor polling an
+	// adopt-in-flight build that holds no counter of its own.
+	ge.counter.Incr()
+	defer ge.counter.Decr()
+
 	enginePtr, err := ge.getEnginePtr()
 	if err != nil {
 		return err
@@ -328,20 +347,50 @@ func (ge *gammaEngine) GetEngineStatus(status *entity.EngineStatus) error {
 	return nil
 }
 
-// IndexStatusOf returns the numeric status of the index whose name matches
-// indexName (the user index_name, which is the vector_indexes_ key), from
-// EngineStatus.IndexStatuses.
-func (ge *gammaEngine) IndexStatusOf(indexName string) (string, error) {
+// IndexStatusOf returns the numeric status and the indexed-vector count of
+// the index whose name matches indexName (the user index_name, which is the
+// vector_indexes_ key), from EngineStatus.IndexStatuses.
+func (ge *gammaEngine) IndexStatusOf(indexName string) (string, int, error) {
 	status := &entity.EngineStatus{}
 	if err := ge.GetEngineStatus(status); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	for _, p := range status.IndexStatuses {
 		if p.IndexName == indexName {
-			return p.Status, nil
+			return p.Status, int(p.IndexedNum), nil
 		}
 	}
-	return "", fmt.Errorf("index %q not found in index_statuses", indexName)
+	return "", 0, fmt.Errorf("index %q not found in index_statuses", indexName)
+}
+
+// engineIndexStatusIndexing is the per-index status token the engine reports
+// (EngineStatus.IndexStatuses[].Status) while a vector index is training.
+const engineIndexStatusIndexing = "INDEXING"
+
+// IndexTrainInFlight reports whether a long, uninterruptible index train is
+// running on this engine — a RebuildIndex cgo call, or an initial/background
+// BuildIndex whose train() is in progress. Either makes Close() block until the
+// train finishes, so the snapshot-install path (Store.ApplySnapshot) defers
+// (rejects the snapshot) instead of the destructive Close + RemoveDataPath.
+func (ge *gammaEngine) IndexTrainInFlight() bool {
+	// A rebuild cgo pins the engine (via ge.rebuilding) for its whole,
+	// train-dominated duration. Cheap, so check it first.
+	if ge.rebuilding.Get() != 0 {
+		return true
+	}
+	// A BuildIndex train: Engine::Indexing sets each vector index's per-index
+	// status to INDEXING for exactly the train phase. On status-read failure,
+	// don't over-defer.
+	status := &entity.EngineStatus{}
+	if err := ge.GetEngineStatus(status); err != nil {
+		return false
+	}
+	for _, s := range status.IndexStatuses {
+		if s.Status == engineIndexStatusIndexing {
+			return true
+		}
+	}
+	return false
 }
 
 func (ge *gammaEngine) BuildIndex() error {
@@ -382,11 +431,24 @@ func (ge *gammaEngine) BuildIndex() error {
 // so this must not spawn another goroutine — doing so would report completion
 // before the rebuild actually finished.
 func (ge *gammaEngine) RebuildIndex(indexName, field, indexType string, drop, cpu, des int) error {
+	// Per-engine gate: at most one rebuild in flight on this partition. CAS
+	// failure means a rebuild is already running — fail fast rather than queue,
+	// matching the "one rebuild per partition" contract. See the rebuilding
+	// field comment for why the C++ engine cannot be trusted to serialize this.
+	if !ge.rebuilding.CompareAndSwap(0, 1) {
+		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR,
+			fmt.Errorf("rebuild already in progress, partition:[%d]", ge.partitionID))
+	}
+	defer ge.rebuilding.Set(0)
+
+	// counter pins the engine against Close for the whole cgo call. We do NOT
+	// take indexLocker here: this call is synchronous and can run for hours, so
+	// holding a process-global lock across it would stall Load/BuildIndex on
+	// every other partition of this PS. Cross-partition and cross-node rebuild
+	// serialization is owned by the master scheduler (one running record at a
+	// time); same-partition serialization is the rebuilding CAS gate above.
 	ge.counter.Incr()
 	defer ge.counter.Decr()
-
-	indexLocker.Lock()
-	defer indexLocker.Unlock()
 
 	enginePtr, err := ge.getEnginePtr()
 	if err != nil {

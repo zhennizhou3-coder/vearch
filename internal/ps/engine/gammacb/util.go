@@ -68,6 +68,7 @@ func mapping2Table(cfg EngineConfig, m *mapping.IndexMapping) (*gamma.Table, err
 	refreshInterval = int32(entity.DefaultRefreshInterval)
 	enableIdCache := entity.DefaultEnableIdCache
 	enableRealtime := entity.DefalutEnableRealtime
+	var indexBuildBatchSize int64
 	if cfg.Space.RefreshInterval != nil {
 		refreshInterval = *cfg.Space.RefreshInterval
 	}
@@ -77,14 +78,18 @@ func mapping2Table(cfg EngineConfig, m *mapping.IndexMapping) (*gamma.Table, err
 	if cfg.Space.EnableRealtime != nil {
 		enableRealtime = *cfg.Space.EnableRealtime
 	}
+	if cfg.Space.IndexBuildBatchSize != nil {
+		indexBuildBatchSize = *cfg.Space.IndexBuildBatchSize
+	}
 	table := &gamma.Table{
-		Name:            cfg.Space.Name + "-" + cast.ToString(cfg.PartitionID),
-		IndexType:       "",
-		IndexParams:     "",
-		RefreshInterval: refreshInterval,
-		EnableIdCache:   enableIdCache,
-		EnableRealtime:  enableRealtime,
-		Indexes:         indexes,
+		Name:                cfg.Space.Name + "-" + cast.ToString(cfg.PartitionID),
+		IndexType:           "",
+		IndexParams:         "",
+		RefreshInterval:     refreshInterval,
+		EnableIdCache:       enableIdCache,
+		EnableRealtime:      enableRealtime,
+		Indexes:             indexes,
+		IndexBuildBatchSize: indexBuildBatchSize,
 	}
 	fieldInfo := gamma.FieldInfo{Name: entity.IdField, DataType: gamma.STRING, IsIndex: false}
 	table.Fields = append(table.Fields, fieldInfo)

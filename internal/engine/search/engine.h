@@ -169,6 +169,9 @@ class Engine {
 
   int CreateTableFromLocal(std::string &table_name);
 
+
+  int DeleteDocid(int64_t docid);
+
   int Indexing();
 
   // Safely stop a running indexing thread (compare_exchange RUNNING->STOPPING,

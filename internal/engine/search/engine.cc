@@ -688,6 +688,10 @@ Status Engine::CreateTable(TableInfo &table) {
   refresh_interval_ = table.RefreshInterval();
   LOG(INFO) << space_name_ << " init refresh_interval=" << refresh_interval_;
 
+  vec_manager_->SetIndexBuildBatchSize(table.IndexBuildBatchSize());
+  LOG(INFO) << space_name_ << " init index_build_batch_size="
+            << table.IndexBuildBatchSize();
+
   LOG(INFO) << "create table [" << table_name << "] success!";
   created_table_ = true;
   
@@ -705,15 +709,43 @@ int Engine::AddOrUpdate(Doc &doc) {
 
   // add fields into table
   int64_t docid = -1;
+  int64_t npu_old_docid = -1;
   table_->GetDocidByKey(key, docid);
   if (docid != -1 && docid < max_docid_) {
-    if (Update(docid, fields_table, fields_vec)) {
-      LOG(ERROR) << space_name_ << " update error, key=" << key
+    bool has_npu_index = vec_manager_->HasNPUIndex();
+
+    if (!has_npu_index) {
+      int ret = Update(docid, fields_table, fields_vec);
+      if (ret < 0) {
+        LOG(ERROR) << space_name_ << " update error, key=" << key
+                   << ", docid=" << docid;
+        return -1;
+      }
+      is_dirty_ = true;
+      return ret;
+    }
+
+    Doc old_doc;
+    int res = GetDoc(key, old_doc);
+    if (res != 0) {
+      LOG(ERROR) << space_name_ << " get doc error, key=" << key
                  << ", docid=" << docid;
       return -1;
     }
-    is_dirty_ = true;
-    return 0;
+
+    for (auto &[name, field] : old_doc.TableFields()) {
+      fields_table.emplace(name, field);
+    }
+    for (auto &[name, field] : old_doc.VectorFields()) {
+      fields_vec.emplace(name, field);
+    }
+    Status status = CheckDoc(fields_table, fields_vec);
+    if (!status.ok()) {
+      LOG(ERROR) << space_name_ << " update error, key=" << key
+                 << " err: " << status.ToString();
+      return -3;
+    }
+    npu_old_docid = docid;
   } else if (docid >= max_docid_) {
     LOG(ERROR) << space_name_ << " add error, key=" << key
                << ", max_docid_=" << max_docid_.load() << ", docid=" << docid;
@@ -755,6 +787,26 @@ int Engine::AddOrUpdate(Doc &doc) {
                << "] err= " << ret;
     return -7;
   };
+
+  if (npu_old_docid != -1) {
+    // The new doc is already committed and visible, so we cannot fail the whole
+    // operation here (that would make the caller retry and re-add the doc,
+    // producing more duplicates). Retire the old docid, retrying once on
+    // failure since a leftover live old docid means the key is returned twice.
+    int del_ret = DeleteDocid(npu_old_docid);
+    if (del_ret != 0) {
+      LOG(WARNING) << space_name_ << " retire old docid [" << npu_old_docid
+                   << "] failed after re-add, key=" << key << ", ret=" << del_ret
+                   << ", retrying";
+      del_ret = DeleteDocid(npu_old_docid);
+    }
+    if (del_ret != 0) {
+      LOG(ERROR) << space_name_ << " retire old docid [" << npu_old_docid
+                 << "] still failing after retry, key=" << key
+                 << ", ret=" << del_ret
+                 << "; key may be returned twice until next flush/rebuild";
+    }
+  }
 
   if (refresh_interval_ >= 0 and
       indexing_state_.load() == IndexingState::IDLE and
@@ -868,35 +920,42 @@ int Engine::Update(int doc_id,
 
 int Engine::Delete(std::string &key) {
   int64_t docid = -1;
-  int ret = 0;
-  ret = table_->GetDocidByKey(key, docid);
+  int ret = table_->GetDocidByKey(key, docid);
   if (ret != 0 || docid < 0) return -1;
-
-  if (docids_bitmap_->Test(docid)) {
-    return ret;
-  }
-  ret = docids_bitmap_->Set(docid);
-  if (ret) {
-    LOG(ERROR) << space_name_ << " bitmap set failed: ret=" << ret;
-    return ret;
-  }
-  ++delete_num_;
-  ret = docids_bitmap_->Dump(docid, 1);
-  if (ret) {
-    LOG(ERROR) << space_name_ << " bitmap dump failed: ret=" << ret;
-    return ret;
-  }
-  scalar_index_manager_->DeleteDoc(docid);
   table_->Delete(key);
-
-  vec_manager_->Delete(docid);
-  is_dirty_ = true;
+  ret = DeleteDocid(docid);
+  if (ret != 0) return ret;
 
   if (vec_manager_ != nullptr &&
       !vec_manager_->SupportIncrement() && index_status_ == INDEXED) {
     return 1;
   }
-  return ret;
+  return 0;
+}
+
+int Engine::DeleteDocid(int64_t docid) {
+  if (docid < 0) return -1;
+
+  if (docids_bitmap_->Test(docid)) {
+    return 0;
+  }
+  int ret = docids_bitmap_->Set(docid);
+  if (ret) {
+    LOG(ERROR) << space_name_ << " bitmap set failed: ret=" << ret;
+    return ret;
+  }
+  ++delete_num_;
+  scalar_index_manager_->DeleteDoc(docid);
+  vec_manager_->Delete(docid);
+  is_dirty_ = true;
+  ret = docids_bitmap_->Dump(docid, 1);
+  if (ret) {
+    LOG(ERROR) << space_name_ << " bitmap dump failed for docid [" << docid
+               << "], tombstone kept in memory, will be persisted on next flush:"
+               << " ret=" << ret;
+    return ret;
+  }
+  return 0;
 }
 
 int Engine::GetDoc(const std::string &key, Doc &doc) {
@@ -950,21 +1009,21 @@ int Engine::GetDoc(int docid, Doc &doc, bool next) {
     doc.AddField(std::move(field));
   }
 
-  std::vector<std::pair<std::string, int>> vec_fields_ids;
-  for (size_t i = 0; i < index_names.size(); ++i) {
-    vec_fields_ids.emplace_back(std::make_pair(index_names[i], docid));
-  }
 
-  std::vector<std::string> vec;
-  ret = vec_manager_->GetVector(vec_fields_ids, vec);
-  if (ret == 0 && vec.size() == vec_fields_ids.size()) {
-    for (size_t i = 0; i < index_names.size(); ++i) {
-      struct Field field;
-      field.name = index_names[i];
-      field.datatype = DataType::VECTOR;
-      field.value = vec[i];
-      doc.AddField(field);
+  for (const std::string &vec_name : index_names) {
+    std::vector<uint8_t> vec;
+    std::string field_name = vec_name;  // GetDocVector takes a non-const ref
+    int vret = vec_manager_->GetDocVector(docid, field_name, vec);
+    if (vret != 0) {
+      LOG(WARNING) << space_name_ << " get vector field [" << vec_name
+                   << "] for docid [" << docid << "] failed, ret=" << vret;
+      continue;
     }
+    struct Field field;
+    field.name = vec_name;
+    field.datatype = DataType::VECTOR;
+    field.value = std::string(vec.begin(), vec.end());
+    doc.AddField(field);
   }
   return 0;
 }
@@ -1038,26 +1097,51 @@ int Engine::RebuildIndex(const std::string &index_name,
   // no-op call never needlessly interrupts realtime indexing.
   StopIndexingThread("rebuild");
 
-  if (drop_before_rebuild) {
-    Status status = vec_manager_->ReCreateVectorIndex(
-        index_name, field_name, index_type, training_threshold_);
-    if (!status.ok()) {
-      LOG(ERROR) << space_name_
-                 << " RebuildIndex ReCreateVectorIndex failed for "
-                 << index_name << " (" << field_name << ":" << index_type
-                 << ") : " << status.ToString();
-      return -1;
+  // Cap the OpenMP thread count for the long, CPU-heavy training below. A
+  // rebuild that saturates every core starves this PS's raft log apply; slow
+  // apply backs up the raft applyc pipeline and can push lagging followers into
+  // a snapshot. omp_set_num_threads sets only the current (synchronous rebuild)
+  // thread's ICV, so concurrent search threads keep their own thread counts, and
+  // the restart-indexing thread spawned further below gets fresh ICVs — the cap
+  // is confined to this training. Restored via RAII on every exit, including the
+  // early-return failures.
+  struct OmpThreadScope {
+    int prev;
+    explicit OmpThreadScope(int limit) : prev(omp_get_max_threads()) {
+      if (limit > 0) omp_set_num_threads(limit);
     }
-  } else {
-    bool do_train = (max_docid_ - delete_num_ > training_threshold_);
-    Status status = vec_manager_->RebuildVectorIndex(
-        index_name, field_name, index_type, training_threshold_, do_train);
-    if (!status.ok()) {
-      LOG(ERROR) << space_name_
-                 << " RebuildIndex RebuildVectorIndex failed for "
-                 << index_name << " (" << field_name << ":" << index_type
-                 << ") : " << status.ToString();
-      return -1;
+    ~OmpThreadScope() { omp_set_num_threads(prev); }
+  };
+
+  // NOTE: limit_cpu (the RPC-provided cap) is intentionally NOT used yet — the
+  // control plane does not populate it reliably. For now the training thread cap
+  // is controlled manually here; switch to limit_cpu once it is plumbed. Tune
+  // this value as needed.
+  const int rebuild_train_threads = std::max(1, omp_get_max_threads() / 2);
+
+  {
+    OmpThreadScope omp_scope(rebuild_train_threads);
+    if (drop_before_rebuild) {
+      Status status = vec_manager_->ReCreateVectorIndex(
+          index_name, field_name, index_type, training_threshold_);
+      if (!status.ok()) {
+        LOG(ERROR) << space_name_
+                   << " RebuildIndex ReCreateVectorIndex failed for "
+                   << index_name << " (" << field_name << ":" << index_type
+                   << ") : " << status.ToString();
+        return -1;
+      }
+    } else {
+      bool do_train = (max_docid_ - delete_num_ > training_threshold_);
+      Status status = vec_manager_->RebuildVectorIndex(
+          index_name, field_name, index_type, training_threshold_, do_train);
+      if (!status.ok()) {
+        LOG(ERROR) << space_name_
+                   << " RebuildIndex RebuildVectorIndex failed for "
+                   << index_name << " (" << field_name << ":" << index_type
+                   << ") : " << status.ToString();
+        return -1;
+      }
     }
   }
 
@@ -1222,6 +1306,7 @@ std::string Engine::EngineStatus() {
       arr.push_back({
           {"index_name", s.name},
           {"status", IndexStatusToString(s.status)},
+          {"indexed_num", s.indexed_num},
       });
     }
   } else {
@@ -2108,6 +2193,7 @@ int Engine::GetConfig(std::string &conf_str) {
   j["slow_search_time"] = slow_search_time_;
   j["refresh_interval"] = refresh_interval_;
   j["enable_id_cache"] = table_->GetEnableIdCache();
+  j["index_build_batch_size"] = vec_manager_->GetIndexBuildBatchSize();
   conf_str = j.dump();
   return 0;
 }
@@ -2141,6 +2227,12 @@ int Engine::SetConfig(std::string conf_str) {
       LOG(INFO) << space_name_
               << " update enable_id_cache=" << enable_id_cache;
     }
+  }
+
+  if (j.contains("index_build_batch_size")) {
+    int64_t size = j["index_build_batch_size"];
+    vec_manager_->SetIndexBuildBatchSize(size);
+    LOG(INFO) << space_name_ << " update index_build_batch_size=" << size;
   }
   return 0;
 }

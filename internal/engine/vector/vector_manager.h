@@ -44,6 +44,14 @@ class VectorManager {
   struct IndexStatusEntry {
     std::string name;
     IndexStatus status;
+    // Vectors actually added to this index so far (the framework's
+    // indexed_count_). Read from the same IndexModel the status is keyed by,
+    // under the same rdlock. Lets the rebuild monitor gate completion on
+    // "backfill caught up" instead of the train-done status flip (which reports
+    // INDEXED while indexed_count_ is still climbing from the background
+    // AddRTVecsToIndex pass). Named indexed_num to match the EngineStatus
+    // surface field (min_indexed_num), not the internal indexed_count_.
+    int64_t indexed_num;
   };
 
   VectorManager(const VectorStorageType &store_type,
@@ -196,6 +204,8 @@ class VectorManager {
     return any;
   }
 
+  bool HasNPUIndex();
+
   int Delete(int64_t docid);
 
   std::map<std::string, RawVector *> &RawVectors() { return raw_vectors_; }
@@ -235,6 +245,13 @@ class VectorManager {
                                const std::string &index_param);
 
   bool GetEnableRealtime() { return enable_realtime_; }
+
+  // Batch size used by AddRTVecsToIndex when draining new vectors into indexes.
+  // 0 means "use the per-hardware default"; a positive value overrides it for
+  // all index types. Set at engine startup from the gamma Table (so it survives
+  // restart) and at runtime via Engine::SetConfig.
+  void SetIndexBuildBatchSize(int64_t size) { index_build_batch_size_ = size; }
+  int64_t GetIndexBuildBatchSize() { return index_build_batch_size_; }
 
  private:
   inline std::string IndexName(const std::string &field_name,
@@ -293,6 +310,9 @@ class VectorManager {
   // FLAT index
   std::map<std::string, IndexModel *> vector_memory_buffer_indexes_;
   bool enable_realtime_;
+
+  // See Set/GetIndexBuildBatchSize. 0 = use per-hardware default.
+  int64_t index_build_batch_size_ = 0;
 
   // Per-field vector index types and their params: field_name -> (index_type ->
   // params). Replaces the old parallel index_types_/index_params_ vectors,

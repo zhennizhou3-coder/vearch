@@ -119,6 +119,9 @@ func (s *ConfigService) UpdateSpaceConfig(ctx context.Context, space *entity.Spa
 		if cfg.EnableIdCache != nil {
 			new_cfg.EnableIdCache = cfg.EnableIdCache
 		}
+		if cfg.IndexBuildBatchSize != nil {
+			new_cfg.IndexBuildBatchSize = cfg.IndexBuildBatchSize
+		}
 	}
 	marshal, err := json.Marshal(new_cfg)
 	if err != nil {

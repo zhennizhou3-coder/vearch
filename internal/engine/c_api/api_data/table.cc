@@ -70,7 +70,8 @@ int TableInfo::Serialize(char **out, int *out_len) {
                                       refresh_interval_,
                                       enable_id_cache_,
                                       enable_realtime_,
-                                      builder.CreateVector(index_info_vector));
+                                      builder.CreateVector(index_info_vector),
+                                      index_build_batch_size_);
   builder.Finish(table);
   *out_len = builder.GetSize();
   *out = (char *)malloc(*out_len * sizeof(char));
@@ -131,6 +132,7 @@ void TableInfo::Deserialize(const char *data, int len) {
   refresh_interval_ = table_->refresh_interval();
   enable_id_cache_ = table_->enable_id_cache();
   enable_realtime_ = table_->enable_realtime();
+  index_build_batch_size_ = table_->index_build_batch_size();
 
   if (table_->indexes() != nullptr) {
     for (size_t i = 0; i < table_->indexes()->size(); ++i) {
@@ -214,6 +216,12 @@ std::vector<struct IndexInfo> &TableInfo::Indexes() { return indexes_; }
 
 void TableInfo::AddIndex(struct IndexInfo &index) {
   indexes_.emplace_back(index);
+}
+
+int64_t TableInfo::IndexBuildBatchSize() { return index_build_batch_size_; }
+
+void TableInfo::SetIndexBuildBatchSize(int64_t index_build_batch_size) {
+  index_build_batch_size_ = index_build_batch_size;
 }
 
 int TableInfo::Read(const std::string &path) {

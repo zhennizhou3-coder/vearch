@@ -308,6 +308,8 @@ class IndexModel {
   // Return model memory usage
   virtual long GetTotalMemBytes() = 0;
 
+  virtual bool IsNPUIndex() const { return false; }
+
   /** Dump model and index
    *
    * @param dir   dump directory

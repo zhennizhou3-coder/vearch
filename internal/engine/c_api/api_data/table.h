@@ -88,6 +88,10 @@ class TableInfo : public RawData {
 
   void AddIndex(struct IndexInfo &index);
 
+  int64_t IndexBuildBatchSize();
+
+  void SetIndexBuildBatchSize(int64_t index_build_batch_size);
+
   int Read(const std::string &path);
 
   int Write(const std::string &path);
@@ -106,6 +110,7 @@ class TableInfo : public RawData {
   bool enable_id_cache_ = false;
   bool enable_realtime_ = false;
   std::vector<struct IndexInfo> indexes_;
+  int64_t index_build_batch_size_ = 0;
 };
 
 }  // namespace vearch

@@ -36,6 +36,7 @@ table Table {
   enable_id_cache:bool;
   enable_realtime:bool;
   indexes:[IndexInfo];
+  index_build_batch_size:long = 0; // 0 = per-hardware default
 }
 
 root_type Table;

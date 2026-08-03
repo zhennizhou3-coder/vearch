@@ -76,6 +76,7 @@ func (s *ServerService) RegisterServer(ctx context.Context, ip string, nodeID en
 			} else {
 				s.EnableIdCache = config.EnableIdCache
 			}
+			s.IndexBuildBatchSize = config.IndexBuildBatchSize
 		}
 		for _, p := range s.Partitions {
 			for _, id := range p.Replicas {

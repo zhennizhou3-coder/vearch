@@ -1594,7 +1594,7 @@ class TestRebuildPSFailureExtras:
             for ps_idx in PSES_IDX:
                 txt = cl.read_node_logs("ps", ps_idx)
                 for line in txt.splitlines():
-                    if "RebuildFieldIndex dispatched" in line and \
+                    if "RebuildIndex dispatched" in line and \
                        "dropBefore" in line:
                         dispatch_lines.append((ps_idx, line))
 

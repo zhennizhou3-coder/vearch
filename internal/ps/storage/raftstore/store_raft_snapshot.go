@@ -15,10 +15,12 @@
 package raftstore
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/cubefs/cubefs/depends/tiglabs/raft/proto"
 	"github.com/vearch/vearch/v3/internal/pkg/log"
+	"github.com/vearch/vearch/v3/internal/proto/vearchpb"
 )
 
 // Snapshot implements the raft interface.
@@ -28,7 +30,31 @@ func (s *Store) Snapshot() (proto.Snapshot, error) {
 
 // ApplySnapshot implements the raft interface.
 func (s *Store) ApplySnapshot(peers []proto.Peer, iter proto.SnapIterator) (err error) {
+	// Defer the snapshot install while a long index train (rebuild / build) is
+	// in flight. The install below is destructive — it Closes the engine, waits
+	// for it to stop, then RemoveDataPath() before streaming in the new data.
+	// Close() blocks until the train finishes (a rebuild pins the engine; a build
+	// makes the destructor join the indexing thread), so during a train we would
+	// stall here for the whole train, blow past raft's snapshot transport
+	// timeout, and risk sitting with local data already removed. Returning an
+	// error makes the follower reject this snapshot; the leader retries after a
+	// heartbeat interval and re-sends a fresh snapshot, so once the train
+	// completes a later attempt installs cleanly. The engine data is left intact
+	// here (Close/RemoveDataPath are skipped), so the replica just stays behind
+	// until then instead of losing data.
+	//
+	// NOTE: the raft library truncates this follower's raft log *before* calling
+	// us (wal.Storage.ApplySnapshot(empty) -> TruncateAll), so a reject cannot
+	// prevent the log truncation — only the far costlier engine data removal.
+	// The truncated log is rebuilt from the leader's next successful snapshot.
+	if s.Engine.IndexTrainInFlight() {
+		log.Info("defer apply snapshot for partition[%d]: index train in flight", s.Partition.Id)
+		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR,
+			fmt.Errorf("apply snapshot deferred: index train in flight, partition:[%d]", s.Partition.Id))
+	}
+
 	s.Engine.Close()
+
 	log.Debug("Close engine")
 	i := 0
 	// wait engine close

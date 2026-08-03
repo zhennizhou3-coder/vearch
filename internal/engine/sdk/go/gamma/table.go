@@ -51,16 +51,17 @@ type IndexInfo struct {
 }
 
 type Table struct {
-	Name            string
-	Fields          []FieldInfo
-	VectorsInfos    []VectorInfo
-	IndexType       string
-	IndexParams     string
-	RefreshInterval int32
-	EnableIdCache   bool
-	EnableRealtime  bool
-	Indexes         []IndexInfo
-	table           *gamma_api.Table
+	Name                string
+	Fields              []FieldInfo
+	VectorsInfos        []VectorInfo
+	IndexType           string
+	IndexParams         string
+	RefreshInterval     int32
+	EnableIdCache       bool
+	EnableRealtime      bool
+	Indexes             []IndexInfo
+	IndexBuildBatchSize int64
+	table               *gamma_api.Table
 }
 
 func (table *Table) Serialize() []byte {
@@ -173,6 +174,7 @@ func (table *Table) Serialize() []byte {
 	if len(indexesOffsets) > 0 {
 		gamma_api.TableAddIndexes(builder, indexesVec)
 	}
+	gamma_api.TableAddIndexBuildBatchSize(builder, table.IndexBuildBatchSize)
 	builder.Finish(builder.EndObject())
 	return builder.FinishedBytes()
 }
@@ -214,6 +216,7 @@ func (table *Table) DeSerialize(buffer []byte) {
 	table.RefreshInterval = table.table.RefreshInterval()
 	table.EnableIdCache = table.table.EnableIdCache()
 	table.EnableRealtime = table.table.EnableRealtime()
+	table.IndexBuildBatchSize = table.table.IndexBuildBatchSize()
 
 	table.Indexes = make([]IndexInfo, table.table.IndexesLength())
 	for i := 0; i < len(table.Indexes); i++ {
