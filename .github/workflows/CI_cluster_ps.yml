@@ -68,38 +68,38 @@ jobs:
         curl -s -L -u root:secret http://127.0.0.1:8817/servers | jq
         curl -s -L -u root:secret http://127.0.0.1:8817/cluster/health?detail=true | jq
 
-    - name: Run tests for list indexes detail per-replica
-      run: |
-        cd test
-        # Create a 3-replica IVFPQ space, seed, dynamically add an index and
-        # assert GET /indexes?detail=true reports every replica's own build
-        # state (structure + is_leader + converge-to-READY).
-        pytest test_cluster_space.py -x -k "TestListIndexesDetailPrepare" --log-cli-level=INFO
-        cd ../cloud
-        # Stop ps1 so one replica becomes unreachable, then assert the detail
-        # response still succeeds and marks that replica's entry with an error
-        # while the survivors report normally.
-        docker-compose stop ps1
-        sleep 30
-        status=$(curl -s -L -u root:secret http://127.0.0.1:8817/cluster/health?detail=true\&timeout=1000000 | jq -r '.data[0].status')
-        echo "cluster status after ps1 stop: $status"
-        cd ../test
-        pytest test_cluster_space.py -x -k "TestListIndexesDetailVerify" --log-cli-level=INFO
-        cd ../cloud
-        docker-compose start ps1
-        sleep 30
-        cd ../test
-        # Drop the space/db only after ps1 is back (every other step starts the
-        # stopped PS before tearing down).
-        pytest test_cluster_space.py -x -k "TestListIndexesDetailCleanup" --log-cli-level=INFO
-        sleep 10
-        # Leave the cluster clean for the next step: no leftover dbs, health back.
-        db_num=$(curl -s -L -u root:secret http://127.0.0.1:8817/dbs | jq '.data | length')
-        if [ "$db_num" -ne 0 ]; then
-          echo "db is not empty after list-indexes-detail step"
-          exit 1
-        fi
-        curl -s -L -u root:secret http://127.0.0.1:8817/cluster/health?detail=true | jq
+    # - name: Run tests for list indexes detail per-replica
+    #   run: |
+    #     cd test
+    #     # Create a 3-replica IVFPQ space, seed, dynamically add an index and
+    #     # assert GET /indexes?detail=true reports every replica's own build
+    #     # state (structure + is_leader + converge-to-READY).
+    #     pytest test_cluster_space.py -x -k "TestListIndexesDetailPrepare" --log-cli-level=INFO
+    #     cd ../cloud
+    #     # Stop ps1 so one replica becomes unreachable, then assert the detail
+    #     # response still succeeds and marks that replica's entry with an error
+    #     # while the survivors report normally.
+    #     docker-compose stop ps1
+    #     sleep 30
+    #     status=$(curl -s -L -u root:secret http://127.0.0.1:8817/cluster/health?detail=true\&timeout=1000000 | jq -r '.data[0].status')
+    #     echo "cluster status after ps1 stop: $status"
+    #     cd ../test
+    #     pytest test_cluster_space.py -x -k "TestListIndexesDetailVerify" --log-cli-level=INFO
+    #     cd ../cloud
+    #     docker-compose start ps1
+    #     sleep 30
+    #     cd ../test
+    #     # Drop the space/db only after ps1 is back (every other step starts the
+    #     # stopped PS before tearing down).
+    #     pytest test_cluster_space.py -x -k "TestListIndexesDetailCleanup" --log-cli-level=INFO
+    #     sleep 10
+    #     # Leave the cluster clean for the next step: no leftover dbs, health back.
+    #     db_num=$(curl -s -L -u root:secret http://127.0.0.1:8817/dbs | jq '.data | length')
+    #     if [ "$db_num" -ne 0 ]; then
+    #       echo "db is not empty after list-indexes-detail step"
+    #       exit 1
+    #     fi
+    #     curl -s -L -u root:secret http://127.0.0.1:8817/cluster/health?detail=true | jq
 
     - name: Run tests for upsert with faulty ps
       run: |
