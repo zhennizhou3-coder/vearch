@@ -1113,11 +1113,11 @@ int Engine::RebuildIndex(const std::string &index_name,
     ~OmpThreadScope() { omp_set_num_threads(prev); }
   };
 
-  // NOTE: limit_cpu (the RPC-provided cap) is intentionally NOT used yet — the
-  // control plane does not populate it reliably. For now the training thread cap
-  // is controlled manually here; switch to limit_cpu once it is plumbed. Tune
-  // this value as needed.
-  const int rebuild_train_threads = std::max(1, omp_get_max_threads() / 2);
+  // Training thread cap: use the RPC-provided limit_cpu when set (> 0),
+  // otherwise fall back to max(1, cores*1/2). Capping keeps a rebuild from
+  // saturating every core and starving this PS's raft log apply.
+  const int rebuild_train_threads =
+      limit_cpu > 0 ? limit_cpu : std::max(1, omp_get_max_threads() * 1 / 2);
 
   {
     OmpThreadScope omp_scope(rebuild_train_threads);

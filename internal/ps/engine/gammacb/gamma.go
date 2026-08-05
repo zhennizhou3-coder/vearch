@@ -363,36 +363,6 @@ func (ge *gammaEngine) IndexStatusOf(indexName string) (string, int, error) {
 	return "", 0, fmt.Errorf("index %q not found in index_statuses", indexName)
 }
 
-// engineIndexStatusIndexing is the per-index status token the engine reports
-// (EngineStatus.IndexStatuses[].Status) while a vector index is training.
-const engineIndexStatusIndexing = "INDEXING"
-
-// IndexTrainInFlight reports whether a long, uninterruptible index train is
-// running on this engine — a RebuildIndex cgo call, or an initial/background
-// BuildIndex whose train() is in progress. Either makes Close() block until the
-// train finishes, so the snapshot-install path (Store.ApplySnapshot) defers
-// (rejects the snapshot) instead of the destructive Close + RemoveDataPath.
-func (ge *gammaEngine) IndexTrainInFlight() bool {
-	// A rebuild cgo pins the engine (via ge.rebuilding) for its whole,
-	// train-dominated duration. Cheap, so check it first.
-	if ge.rebuilding.Get() != 0 {
-		return true
-	}
-	// A BuildIndex train: Engine::Indexing sets each vector index's per-index
-	// status to INDEXING for exactly the train phase. On status-read failure,
-	// don't over-defer.
-	status := &entity.EngineStatus{}
-	if err := ge.GetEngineStatus(status); err != nil {
-		return false
-	}
-	for _, s := range status.IndexStatuses {
-		if s.Status == engineIndexStatusIndexing {
-			return true
-		}
-	}
-	return false
-}
-
 func (ge *gammaEngine) BuildIndex() error {
 	ge.counter.Incr()
 	defer ge.counter.Decr()

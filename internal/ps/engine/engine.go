@@ -78,14 +78,6 @@ type Engine interface {
 	Close()
 	HasClosed() bool
 
-	// IndexTrainInFlight reports whether a long, uninterruptible index train is
-	// running on this engine (a RebuildIndex cgo call, or a BuildIndex whose
-	// train() is in progress). The snapshot-install path uses it to defer
-	// (reject) a snapshot rather than run the destructive Close + data removal
-	// while a train holds the engine — which would otherwise block for the whole
-	// train and risk wiping local data before the new snapshot is installed.
-	IndexTrainInFlight() bool
-
 	UpdateMapping(space *entity.Space) error
 	GetMapping() *mapping.IndexMapping
 
