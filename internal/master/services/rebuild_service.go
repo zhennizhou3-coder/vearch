@@ -230,12 +230,6 @@ func (s *RebuildService) ListAllRebuildProgress(ctx context.Context) (*entity.Re
 
 // ListDBRebuildProgress summarizes rebuild records for one database.
 func (s *RebuildService) ListDBRebuildProgress(ctx context.Context, dbName string) (*entity.RebuildSummaryResponse, error) {
-	// Validate db existence up-front so a nonexistent db returns DB_NOT_EXIST
-	// rather than an empty summary that is indistinguishable from "db exists
-	// but has no rebuild records".
-	if _, err := s.client.Master().QueryDBName2ID(ctx, dbName); err != nil {
-		return nil, err
-	}
 	prefix := entity.PrefixRebuild + dbName + "/"
 	return s.listRebuildProgressByPrefix(ctx, prefix)
 }
@@ -310,8 +304,7 @@ func (s *RebuildService) CancelRebuild(ctx context.Context, dbName, spaceName st
 		return nil, fmt.Errorf("load rebuild record: %v", err)
 	}
 	if rec == nil {
-		return nil, vearchpb.NewError(vearchpb.ErrorEnum_REBUILD_RECORD_NOT_EXIST,
-			fmt.Errorf("no rebuild record found for %s/%s", dbName, spaceName))
+		return nil, fmt.Errorf("no rebuild record found for %s/%s", dbName, spaceName)
 	}
 
 	// classify maps a record's current terminal / read-only status to a
@@ -528,7 +521,6 @@ func rebuildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse
 	}
 	// Build task counts, weighted progress, and aggregate retry count.
 	progressSum := 0
-	cancelled := 0
 	for _, t := range rec.Tasks {
 		resp.RetryCount += t.RetryCount
 		switch t.Status {
@@ -539,27 +531,16 @@ func rebuildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse
 			progressSum += t.Progress
 		case entity.RebuildStatusCompleted:
 			progressSum += 100
-		case entity.RebuildStatusCancelled:
-			// Cancelled before dispatch on a user cancel: never ran, excluded
-			// from the overall_percent denominator below.
-			cancelled++
 		case entity.RebuildStatusFailed:
 			// No progress contribution; the failure is reflected in FailedTasks.
 		}
 	}
 	if resp.TotalTasks > 0 {
 		resp.SuccessRatio = float64(resp.CompletedTasks) / float64(resp.TotalTasks)
-		// overall_percent is measured over tasks that actually run. Exclude
-		// cancelled tasks from the denominator, otherwise a partially-cancelled
-		// rebuild is pegged below 100 forever (e.g. 1 completed replica of 3
-		// tasks with 2 cancelled would read 33%). Failed replicas stay in the
-		// denominator: they contribute 0 progress, so they correctly hold
-		// overall_percent below 100.
-		if denom := resp.TotalTasks - cancelled; denom > 0 {
-			resp.OverallPercent = progressSum / denom
-			if resp.OverallPercent > 100 {
-				resp.OverallPercent = 100
-			}
+		// Divide by TotalTasks so failed replicas lower overall progress.
+		resp.OverallPercent = progressSum / resp.TotalTasks
+		if resp.OverallPercent > 100 {
+			resp.OverallPercent = 100
 		}
 	}
 	return resp
@@ -1189,8 +1170,8 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 		log.Info("rebuild dispatched: space=%s pid=%d nodeID=%d (attempt=%d)",
 			rec.SpaceKey(), t.PartitionID, t.NodeID, t.DispatchAttempts)
 		// Mark this replica as Rebuilding in the partition record.
-		if err := sc.setReplicaRebuildStatus(ctx, t.PartitionID, t.NodeID, entity.ReplicasRebuildingIndex); err != nil {
-			log.Warn("setReplicaRebuildStatus(rebuilding) failed for pid=%d nodeID=%d: %v",
+		if err := sc.markReplicaRebuilding(ctx, t.PartitionID, t.NodeID, true); err != nil {
+			log.Warn("markReplicaRebuilding(rebuilding) failed for pid=%d nodeID=%d: %v",
 				t.PartitionID, t.NodeID, err)
 		}
 		// Strict serialism: at most one live task at any moment.
@@ -1391,15 +1372,10 @@ func (sc *RebuildScheduler) handleReplicaFailure(rec *SpaceRebuildRecord,
 	}
 }
 
-// setReplicaRebuildStatus transitions the router-visible rebuild marker for a
-// replica. Setting ReplicasRebuildingIndex is the dispatch-time mark. Clearing
-// to ReplicasOK / ReplicasRebuildFailed only fires when the replica is
-// currently ReplicasRebuildingIndex, so it never clobbers a concurrently-set
-// ReplicasNotReady (raft-lag) status. Setting ReplicasRebuildingIndex from a
-// prior ReplicasRebuildFailed is allowed, so an idle self-heal retry re-marks a
-// previously-failed replica as rebuilding again.
-func (sc *RebuildScheduler) setReplicaRebuildStatus(ctx context.Context,
-	pid entity.PartitionID, nodeID entity.NodeID, target uint32) error {
+// markReplicaRebuilding toggles the router-visible Rebuilding marker.
+// Clearing only changes ReplicasRebuildingIndex, leaving other replica states intact.
+func (sc *RebuildScheduler) markReplicaRebuilding(ctx context.Context,
+	pid entity.PartitionID, nodeID entity.NodeID, rebuilding bool) error {
 
 	key := entity.PartitionKey(pid)
 	return sc.client.Master().STM(ctx, func(stm concurrency.STM) error {
@@ -1416,14 +1392,17 @@ func (sc *RebuildScheduler) setReplicaRebuildStatus(ctx context.Context,
 		}
 
 		cur := p.ReStatusMap[uint64(nodeID)]
-		if target == entity.ReplicasRebuildingIndex {
+		if rebuilding {
 			if cur == entity.ReplicasRebuildingIndex {
 				return nil // already set, no-op
 			}
-		} else if cur != entity.ReplicasRebuildingIndex {
-			return nil // only clear from Rebuilding; don't clobber NotReady etc.
+			p.ReStatusMap[uint64(nodeID)] = entity.ReplicasRebuildingIndex
+		} else {
+			if cur != entity.ReplicasRebuildingIndex {
+				return nil // not currently Rebuilding; don't clobber NotReady etc.
+			}
+			p.ReStatusMap[uint64(nodeID)] = entity.ReplicasOK
 		}
-		p.ReStatusMap[uint64(nodeID)] = target
 
 		// Bump UpdateTime so router partition caches accept this write.
 		p.UpdateTime = time.Now().UnixNano()
@@ -1437,22 +1416,15 @@ func (sc *RebuildScheduler) setReplicaRebuildStatus(ctx context.Context,
 	})
 }
 
-// unmarkRebuildingForTerminalTasks clears markers for finished tasks. A failed
-// task leaves ReplicasRebuildFailed so reads keep avoiding the replica (its
-// index may be partial after a drop=true rebuild) until a later rebuild
-// succeeds; completed/cancelled tasks return to ReplicasOK.
+// unmarkRebuildingForTerminalTasks clears markers for finished tasks.
 func (sc *RebuildScheduler) unmarkRebuildingForTerminalTasks(
 	ctx context.Context, rec *SpaceRebuildRecord) {
 	for _, t := range rec.Tasks {
 		if !t.Status.IsTerminal() {
 			continue
 		}
-		target := uint32(entity.ReplicasOK)
-		if t.Status == entity.RebuildStatusFailed {
-			target = entity.ReplicasRebuildFailed
-		}
-		if err := sc.setReplicaRebuildStatus(ctx, t.PartitionID, t.NodeID, target); err != nil {
-			log.Warn("setReplicaRebuildStatus(reset) %s pid=%d nodeID=%d: %v",
+		if err := sc.markReplicaRebuilding(ctx, t.PartitionID, t.NodeID, false); err != nil {
+			log.Warn("markReplicaRebuilding(reset) %s pid=%d nodeID=%d: %v",
 				rec.SpaceKey(), t.PartitionID, t.NodeID, err)
 		}
 	}

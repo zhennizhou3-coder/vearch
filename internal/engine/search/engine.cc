@@ -1097,51 +1097,26 @@ int Engine::RebuildIndex(const std::string &index_name,
   // no-op call never needlessly interrupts realtime indexing.
   StopIndexingThread("rebuild");
 
-  // Cap the OpenMP thread count for the long, CPU-heavy training below. A
-  // rebuild that saturates every core starves this PS's raft log apply; slow
-  // apply backs up the raft applyc pipeline and can push lagging followers into
-  // a snapshot. omp_set_num_threads sets only the current (synchronous rebuild)
-  // thread's ICV, so concurrent search threads keep their own thread counts, and
-  // the restart-indexing thread spawned further below gets fresh ICVs — the cap
-  // is confined to this training. Restored via RAII on every exit, including the
-  // early-return failures.
-  struct OmpThreadScope {
-    int prev;
-    explicit OmpThreadScope(int limit) : prev(omp_get_max_threads()) {
-      if (limit > 0) omp_set_num_threads(limit);
+  if (drop_before_rebuild) {
+    Status status = vec_manager_->ReCreateVectorIndex(
+        index_name, field_name, index_type, training_threshold_);
+    if (!status.ok()) {
+      LOG(ERROR) << space_name_
+                 << " RebuildIndex ReCreateVectorIndex failed for "
+                 << index_name << " (" << field_name << ":" << index_type
+                 << ") : " << status.ToString();
+      return -1;
     }
-    ~OmpThreadScope() { omp_set_num_threads(prev); }
-  };
-
-  // Training thread cap: use the RPC-provided limit_cpu when set (> 0),
-  // otherwise fall back to max(1, cores*1/2). Capping keeps a rebuild from
-  // saturating every core and starving this PS's raft log apply.
-  const int rebuild_train_threads =
-      limit_cpu > 0 ? limit_cpu : std::max(1, omp_get_max_threads() * 1 / 2);
-
-  {
-    OmpThreadScope omp_scope(rebuild_train_threads);
-    if (drop_before_rebuild) {
-      Status status = vec_manager_->ReCreateVectorIndex(
-          index_name, field_name, index_type, training_threshold_);
-      if (!status.ok()) {
-        LOG(ERROR) << space_name_
-                   << " RebuildIndex ReCreateVectorIndex failed for "
-                   << index_name << " (" << field_name << ":" << index_type
-                   << ") : " << status.ToString();
-        return -1;
-      }
-    } else {
-      bool do_train = (max_docid_ - delete_num_ > training_threshold_);
-      Status status = vec_manager_->RebuildVectorIndex(
-          index_name, field_name, index_type, training_threshold_, do_train);
-      if (!status.ok()) {
-        LOG(ERROR) << space_name_
-                   << " RebuildIndex RebuildVectorIndex failed for "
-                   << index_name << " (" << field_name << ":" << index_type
-                   << ") : " << status.ToString();
-        return -1;
-      }
+  } else {
+    bool do_train = (max_docid_ - delete_num_ > training_threshold_);
+    Status status = vec_manager_->RebuildVectorIndex(
+        index_name, field_name, index_type, training_threshold_, do_train);
+    if (!status.ok()) {
+      LOG(ERROR) << space_name_
+                 << " RebuildIndex RebuildVectorIndex failed for "
+                 << index_name << " (" << field_name << ":" << index_type
+                 << ") : " << status.ToString();
+      return -1;
     }
   }
 
@@ -1306,7 +1281,6 @@ std::string Engine::EngineStatus() {
       arr.push_back({
           {"index_name", s.name},
           {"status", IndexStatusToString(s.status)},
-          {"indexed_num", s.indexed_num},
       });
     }
   } else {

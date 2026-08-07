@@ -42,12 +42,6 @@ const (
 	// ReplicasRebuildingIndex means the replica's index is being rebuilt;
 	// it is kept off reads until the rebuild finishes.
 	ReplicasRebuildingIndex = 3
-	// ReplicasRebuildFailed means an index rebuild on this replica reached a
-	// terminal failure. Its index may be partial/broken (a drop=true rebuild
-	// removes the old index before building the new one), so the replica is
-	// kept off reads until a later rebuild succeeds and clears it back to
-	// ReplicasOK.
-	ReplicasRebuildFailed = 4
 )
 
 type PartitionForSearch struct {

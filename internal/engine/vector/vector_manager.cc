@@ -558,36 +558,24 @@ Status VectorManager::ReCreateVectorIndex(const std::string &index_name,
     return status;
   }
 
-  // Publish the freshly-created (untrained) index into the live map, mark it
-  // INDEXING, then release the write lock BEFORE training. Training is the long
-  // (minutes~hours) phase; holding vector_indexes_mutex_ across it would block
-  // every search on this partition for the whole rebuild. With the lock
-  // released, searches on this field hit the untrained index under the rdlock
-  // and fall back to the realtime buffer — exactly the initial-build behavior
-  // (the field is effectively unqueryable until training completes) — instead
-  // of blocking. The old index was already dropped above, so peak memory stays
-  // at a single index (the drop-before contract this path exists for).
   for (auto &[name, idx] : new_indexes) {
     vector_indexes_[name] = idx;
-    vector_index_status_[name] = IndexStatus::INDEXING;
+    vector_index_status_[name] = IndexStatus::UNINDEXED;
     LOG(INFO) << desc_ << "set " << name << " index";
   }
-  pthread_rwlock_unlock(&vector_indexes_mutex_);
 
-  // Train without the lock. new_indexes holds the same IndexModel* now live in
-  // vector_indexes_; concurrent search reads them under the rdlock while
-  // Indexing() trains — the same read-vs-train concurrency the initial build
-  // already relies on. SetIndexStatus re-takes the write lock briefly and is a
-  // no-op if the index was meanwhile removed, so it is safe to call unlocked.
   int train_ret = TrainIndex(new_indexes);
   if (train_ret != 0) {
     LOG(ERROR) << desc_ << "TrainIndex for " << target_index_name
                << " failed after ReCreateVectorIndex, ret=" << train_ret;
-    SetIndexStatus(target_index_name, IndexStatus::FAILED);
+    vector_index_status_[target_index_name] = IndexStatus::FAILED;
+    pthread_rwlock_unlock(&vector_indexes_mutex_);
     SetIndexState(index_name, IndexState::FAILED);
     return Status::IOError("ReCreateVectorIndex: TrainIndex failed");
   }
-  SetIndexStatus(target_index_name, IndexStatus::INDEXED);
+  vector_index_status_[target_index_name] = IndexStatus::INDEXED;
+
+  pthread_rwlock_unlock(&vector_indexes_mutex_);
   SetIndexState(index_name, IndexState::READY);
   LOG(INFO) << desc_ << "ReCreateVectorIndex for " << target_index_name
             << " success";
@@ -677,15 +665,7 @@ std::vector<VectorManager::IndexStatusEntry> VectorManager::IndexStatuses() {
   pthread_rwlock_rdlock(&vector_indexes_mutex_);
   out.reserve(vector_index_status_.size());
   for (const auto &[name, st] : vector_index_status_) {
-    // indexed_count_ lives on the IndexModel in the sibling vector_indexes_
-    // map, keyed identically. Both maps are guarded by vector_indexes_mutex_
-    // (held here), so this is a free read — no extra lock, no extra traversal.
-    int64_t indexed_num = 0;
-    auto it = vector_indexes_.find(name);
-    if (it != vector_indexes_.end() && it->second != nullptr) {
-      indexed_num = it->second->indexed_count_;
-    }
-    out.push_back({name, st, indexed_num});
+    out.push_back({name, st});
   }
   pthread_rwlock_unlock(&vector_indexes_mutex_);
   return out;

@@ -69,11 +69,10 @@ type Engine interface {
 	Load() error
 	IndexInfo() (int, int, int)
 
-	// IndexStatusOf returns the stringified status and the indexed-vector
-	// count of the vector index whose physical name (field::type) matches
-	// indexName, from EngineStatus.IndexStatuses. indexedNum is 0 for engines
-	// predating the per-index count field.
-	IndexStatusOf(indexName string) (status string, indexedNum int, err error)
+	// IndexStatusOf returns the stringified status of the vector index whose
+	// physical name (field::type) matches indexName, from
+	// EngineStatus.IndexStatuses.
+	IndexStatusOf(indexName string) (status string, err error)
 	GetEngineStatus(status *entity.EngineStatus) error
 	Close()
 	HasClosed() bool

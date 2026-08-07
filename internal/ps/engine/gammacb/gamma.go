@@ -347,20 +347,20 @@ func (ge *gammaEngine) GetEngineStatus(status *entity.EngineStatus) error {
 	return nil
 }
 
-// IndexStatusOf returns the numeric status and the indexed-vector count of
-// the index whose name matches indexName (the user index_name, which is the
-// vector_indexes_ key), from EngineStatus.IndexStatuses.
-func (ge *gammaEngine) IndexStatusOf(indexName string) (string, int, error) {
+// IndexStatusOf returns the numeric status of the index whose name matches
+// indexName (the user index_name, which is the vector_indexes_ key), from
+// EngineStatus.IndexStatuses.
+func (ge *gammaEngine) IndexStatusOf(indexName string) (string, error) {
 	status := &entity.EngineStatus{}
 	if err := ge.GetEngineStatus(status); err != nil {
-		return "", 0, err
+		return "", err
 	}
 	for _, p := range status.IndexStatuses {
 		if p.IndexName == indexName {
-			return p.Status, int(p.IndexedNum), nil
+			return p.Status, nil
 		}
 	}
-	return "", 0, fmt.Errorf("index %q not found in index_statuses", indexName)
+	return "", fmt.Errorf("index %q not found in index_statuses", indexName)
 }
 
 func (ge *gammaEngine) BuildIndex() error {

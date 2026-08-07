@@ -1368,14 +1368,6 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			return 0, vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_LEADER_REBUILDING,
 				fmt.Errorf("partition %d leader=%d is rebuilding index", partition.Id, partition.LeaderID))
 		}
-		// A rebuild that terminally failed may leave the leader's index partial;
-		// a Leader-typed read cannot fall back to a follower, so fail it rather
-		// than serve broken results. Reuses PARTITION_LEADER_REBUILDING (the
-		// leader-unavailable-due-to-rebuild signal the client already handles).
-		if partition.ReStatusMap[partition.LeaderID] == entity.ReplicasRebuildFailed {
-			return 0, vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_LEADER_REBUILDING,
-				fmt.Errorf("partition %d leader=%d index rebuild failed", partition.Id, partition.LeaderID))
-		}
 		nodeId = partition.LeaderID
 	case request.NotLeader:
 		noLeaderIDs := make([]entity.NodeID, 0)
@@ -1388,13 +1380,6 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
-				continue
-			}
-			// Keep terminally-failed rebuild replicas off reads unconditionally
-			// (both consistency modes), mirroring the busy-node skip above; the
-			// RaftConsistent-only ReplicasOK filter below would not exclude them
-			// when RaftConsistent is off.
-			if partition.ReStatusMap[nodeID] == entity.ReplicasRebuildFailed {
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1421,13 +1406,6 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
 				continue
 			}
-			// Keep terminally-failed rebuild replicas off reads unconditionally
-			// (both consistency modes), mirroring the busy-node skip above; the
-			// RaftConsistent-only ReplicasOK filter below would not exclude them
-			// when RaftConsistent is off.
-			if partition.ReStatusMap[nodeID] == entity.ReplicasRebuildFailed {
-				continue
-			}
 			if config.Conf().Global.RaftConsistent {
 				if partition.ReStatusMap[nodeID] == entity.ReplicasOK {
 					randIDs = append(randIDs, nodeID)
@@ -1451,13 +1429,6 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
-				continue
-			}
-			// Keep terminally-failed rebuild replicas off reads unconditionally
-			// (both consistency modes), mirroring the busy-node skip above; the
-			// RaftConsistent-only ReplicasOK filter below would not exclude them
-			// when RaftConsistent is off.
-			if partition.ReStatusMap[nodeID] == entity.ReplicasRebuildFailed {
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {
@@ -1508,13 +1479,6 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
 				continue
 			}
-			// Keep terminally-failed rebuild replicas off reads unconditionally
-			// (both consistency modes), mirroring the busy-node skip above; the
-			// RaftConsistent-only ReplicasOK filter below would not exclude them
-			// when RaftConsistent is off.
-			if partition.ReStatusMap[nodeID] == entity.ReplicasRebuildFailed {
-				continue
-			}
 			if config.Conf().Global.RaftConsistent {
 				if partition.ReStatusMap[nodeID] == entity.ReplicasOK {
 					if server.HostZone == entity.HostZone {
@@ -1547,13 +1511,6 @@ func SelectNodeByClientType(clientType string, partition *entity.Partition, serv
 				continue
 			}
 			if nodeID == entity.NodeID(rebuildBusyNodeID.Load()) {
-				continue
-			}
-			// Keep terminally-failed rebuild replicas off reads unconditionally
-			// (both consistency modes), mirroring the busy-node skip above; the
-			// RaftConsistent-only ReplicasOK filter below would not exclude them
-			// when RaftConsistent is off.
-			if partition.ReStatusMap[nodeID] == entity.ReplicasRebuildFailed {
 				continue
 			}
 			if config.Conf().Global.RaftConsistent {

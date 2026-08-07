@@ -107,6 +107,59 @@ class TestConfigCacheSize:
         destroy(router_url, db_name, space_name)
 
 
+class TestConfigIndexBuildBatchSize:
+    def setup_class(self):
+        self.xb = xb
+
+    # prepare
+    def test_prepare_cluster(self):
+        create(router_url, "MemoryOnly")
+
+    def test_prepare_upsert(self):
+        batch_size = 100
+        total_batch = 1
+        add_string_array(total_batch, batch_size, xb, with_id=True)
+        assert get_space_num() == int(total_batch * batch_size)
+
+    def test_default_index_build_batch_size(self):
+        url = router_url + "/config/" + db_name + "/" + space_name
+
+        rs = requests.get(url, auth=(username, password))
+        assert rs.status_code == 200
+        assert rs.json()["data"]["index_build_batch_size"] == 0
+
+    def test_modify_index_build_batch_size(self):
+        url = router_url + "/config/" + db_name + "/" + space_name
+
+        for batch_size in [1, 1000, 5000, 100000]:
+            batch_dict = {
+                "index_build_batch_size": batch_size,
+            }
+            json_str = json.dumps(batch_dict)
+            rs = requests.post(url, auth=(username, password), data=json_str)
+            assert rs.status_code == 200
+            assert rs.json()["data"]["index_build_batch_size"] == batch_size
+
+            rs = requests.get(url, auth=(username, password))
+            assert rs.status_code == 200
+            assert rs.json()["data"]["index_build_batch_size"] == batch_size
+
+    def test_modify_index_build_batch_size_invalid(self):
+        url = router_url + "/config/" + db_name + "/" + space_name
+
+        for batch_size in [0, -1]:
+            batch_dict = {
+                "index_build_batch_size": batch_size,
+            }
+            json_str = json.dumps(batch_dict)
+            rs = requests.post(url, auth=(username, password), data=json_str)
+            assert rs.json()["code"] != 0
+
+    # destroy
+    def test_destroy_cluster(self):
+        destroy(router_url, db_name, space_name)
+
+
 class TestConfigRefreshIntervalUpdate:
     def setup_class(self):
         self.xb = xb

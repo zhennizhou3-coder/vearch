@@ -44,14 +44,6 @@ class VectorManager {
   struct IndexStatusEntry {
     std::string name;
     IndexStatus status;
-    // Vectors actually added to this index so far (the framework's
-    // indexed_count_). Read from the same IndexModel the status is keyed by,
-    // under the same rdlock. Lets the rebuild monitor gate completion on
-    // "backfill caught up" instead of the train-done status flip (which reports
-    // INDEXED while indexed_count_ is still climbing from the background
-    // AddRTVecsToIndex pass). Named indexed_num to match the EngineStatus
-    // surface field (min_indexed_num), not the internal indexed_count_.
-    int64_t indexed_num;
   };
 
   VectorManager(const VectorStorageType &store_type,

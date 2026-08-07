@@ -1278,13 +1278,13 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 		dbID, err := mc.QueryDBName2ID(ctx, dbName)
 		if err != nil {
 			log.Error("rebuildIndex: query db %s failed: %v", dbName, err)
-			httpCode = ca.handleError(c, err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(fmt.Errorf("query db %s failed: %v", dbName, err)))
 			return
 		}
 		space, err := mc.QuerySpaceByName(ctx, dbID, spaceName)
-		if err != nil {
+		if err != nil || space == nil {
 			log.Error("rebuildIndex: query space %s/%s failed: %v", dbName, spaceName, err)
-			httpCode = ca.handleError(c, err)
+			httpCode = response.New(c).JsonError(errors.NewErrBadRequest(fmt.Errorf("space %s/%s not found", dbName, spaceName)))
 			return
 		}
 		if space.Enabled != nil && !*space.Enabled {
@@ -1297,7 +1297,7 @@ func (ca *clusterAPI) rebuildIndex(c *gin.Context) {
 		dbID, err := mc.QueryDBName2ID(ctx, dbName)
 		if err != nil {
 			log.Error("rebuildIndex: query db %s failed: %v", dbName, err)
-			httpCode = ca.handleError(c, err)
+			httpCode = response.New(c).JsonError(errors.NewErrInternal(fmt.Errorf("query db %s failed: %v", dbName, err)))
 			return
 		}
 		spaces, err := mc.QuerySpaces(ctx, dbID)
@@ -1446,7 +1446,7 @@ func (ca *clusterAPI) listDBRebuildProgress(c *gin.Context) {
 	summary, err := ca.masterService.Rebuild().ListDBRebuildProgress(c, dbName)
 	if err != nil {
 		log.Error("listDBRebuildProgress failed for db=%s: %v", dbName, err)
-		ca.handleError(c, err)
+		response.New(c).JsonError(errors.NewErrInternal(err))
 		return
 	}
 
@@ -1492,33 +1492,8 @@ func (ca *clusterAPI) cancelRebuildIndex(c *gin.Context) {
 
 	switch {
 	case dbName != "" && spaceName != "":
-		// Validate db+space existence so cancelling a nonexistent db/space
-		// returns DB_NOT_EXIST / SPACE_NOT_EXIST as a top-level error, instead
-		// of burying a REBUILD_RECORD_NOT_EXIST in the batch failures. A space
-		// that exists but has no rebuild record still surfaces as
-		// REBUILD_RECORD_NOT_EXIST from CancelRebuild below. Matches the
-		// rebuild trigger endpoint.
-		dbID, err := mc.QueryDBName2ID(ctx, dbName)
-		if err != nil {
-			log.Error("cancelRebuildIndex: query db %s failed: %v", dbName, err)
-			httpCode = ca.handleError(c, err)
-			return
-		}
-		if _, err := mc.QuerySpaceByName(ctx, dbID, spaceName); err != nil {
-			log.Error("cancelRebuildIndex: query space %s/%s failed: %v", dbName, spaceName, err)
-			httpCode = ca.handleError(c, err)
-			return
-		}
 		targets = append(targets, target{db: dbName, space: spaceName})
 	case dbName != "":
-		// Validate db existence so cancelling under a nonexistent db returns
-		// DB_NOT_EXIST rather than a "no spaces to cancel" success that is
-		// indistinguishable from "db exists but has no rebuild records".
-		if _, err := mc.QueryDBName2ID(ctx, dbName); err != nil {
-			log.Error("cancelRebuildIndex: query db %s failed: %v", dbName, err)
-			httpCode = ca.handleError(c, err)
-			return
-		}
 		// Only cancel spaces that actually have a rebuild record
 		prefix := entity.PrefixRebuild + dbName + "/"
 		_, bytesList, err := mc.Store.PrefixScan(ctx, prefix)

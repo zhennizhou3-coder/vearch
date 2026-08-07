@@ -417,19 +417,20 @@ func (index *Index) UnmarshalJSON(bs []byte) error {
 				}
 			}
 
+			// The engine (ComputeIVFTrainingNum) needs at least
+			// DefaultMinPointsPerCentroid(=39) samples per centroid to train IVF
+			// well, and never fewer than MinTrainingThreshold(=256) overall.
+			// Reject up front so params too small to train never reach raft/PS/engine.
+			required := MinTrainingThreshold
+			if indexParams.Ncentroids != 0 && indexParams.Ncentroids*DefaultMinPointsPerCentroid > required {
+				required = indexParams.Ncentroids * DefaultMinPointsPerCentroid
+			}
 			if indexParams.TrainingThreshold != 0 {
-				if indexParams.TrainingThreshold < indexParams.Ncentroids {
-					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than ncentroids:[%d]", indexParams.TrainingThreshold, indexParams.Ncentroids))
+				if indexParams.TrainingThreshold < required {
+					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should be >= max(%d, ncentroids[%d]*%d) = %d", indexParams.TrainingThreshold, MinTrainingThreshold, indexParams.Ncentroids, DefaultMinPointsPerCentroid, required))
 				}
-				if indexParams.TrainingThreshold < MinTrainingThreshold {
-					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than [%d]", indexParams.TrainingThreshold, MinTrainingThreshold))
-				}
-				if indexParams.Ncentroids != 0 {
-					required := indexParams.Ncentroids * DefaultMinPointsPerCentroid
-					if indexParams.TrainingThreshold < required {
-						return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should be >= ncentroids[%d] * %d = %d", indexParams.TrainingThreshold, indexParams.Ncentroids, DefaultMinPointsPerCentroid, required))
-					}
-				}
+			} else if indexParams.Ncentroids != 0 && indexParams.Ncentroids*DefaultMinPointsPerCentroid < MinTrainingThreshold {
+				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold should be >= %d", MinTrainingThreshold))
 			}
 			if indexParams.Nprobe != 0 && indexParams.Nprobe > indexParams.Ncentroids {
 				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" nprobe:[%d] should less than ncentroids:[%d]", indexParams.Nprobe, indexParams.Ncentroids))
