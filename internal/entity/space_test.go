@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/vearch/vearch/v3/internal/entity"
+	"github.com/vearch/vearch/v3/internal/proto/vearchpb"
 )
 
 func TestEngineSpaceString(t *testing.T) {
@@ -176,7 +177,7 @@ func TestSpace_Validate(t *testing.T) {
 }
 
 func TestParseIndex_TrainingThreshold(t *testing.T) {
-	// Engine (ComputeIVFTrainingNum) requires
+	// Write-path validation (ValidateIndexes) requires
 	// training_threshold >= max(MinTrainingThreshold(256),
 	// ncentroids * DefaultMinPointsPerCentroid(39)).
 	tests := []struct {
@@ -217,21 +218,35 @@ func TestParseIndex_TrainingThreshold(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			raw := fmt.Sprintf(`{
-				"name": "gamma",
-				"type": "%s",
-				"params": {
-					"metric_type": "L2",
-					"ncentroids": %d,
-					"nsubvector": 16,
-					"training_threshold": %d
-				}
-			}`, tt.indexType, tt.ncentroids, tt.trainingValue)
-			idx := &entity.Index{}
-			err := json.Unmarshal([]byte(raw), idx)
+			params := fmt.Sprintf(`{"metric_type":"L2","ncentroids":%d,"nsubvector":16,"training_threshold":%d}`,
+				tt.ncentroids, tt.trainingValue)
+			idx := &entity.Index{
+				Name:      "gamma",
+				Type:      tt.indexType,
+				FieldName: "field_vector",
+				Params:    json.RawMessage(params),
+			}
+			props := map[string]*entity.SpaceProperties{
+				"field_vector": {FieldType: vearchpb.FieldType_VECTOR},
+			}
+			err := entity.ValidateIndexes([]*entity.Index{idx}, props)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("Index.UnmarshalJSON error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("ValidateIndexes error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestParseIndex_TrainingThreshold_ReloadCompat guards against H1: the
+// training_threshold >= ncentroids*39 rule must NOT live in Index.UnmarshalJSON,
+// because that path also runs when reloading an already-persisted space from
+// etcd. A space created by an older version with training_threshold in
+// [max(256, ncentroids), ncentroids*39) (e.g. ncentroids=128, tt=3999) must
+// still deserialize, or it would be silently dropped from the cluster on upgrade.
+func TestParseIndex_TrainingThreshold_ReloadCompat(t *testing.T) {
+	raw := `{"name":"gamma","type":"IVFPQ","params":{"metric_type":"L2","ncentroids":128,"nsubvector":16,"training_threshold":3999}}`
+	idx := &entity.Index{}
+	if err := json.Unmarshal([]byte(raw), idx); err != nil {
+		t.Fatalf("existing space with training_threshold=3999 must still unmarshal, got: %v", err)
 	}
 }

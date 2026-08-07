@@ -73,6 +73,10 @@ var (
 	DefalutEnableRealtime       = false
 )
 
+// ivfFamilyTypes are the IVF-based vector index types that share ncentroids /
+// training_threshold parameter semantics.
+var ivfFamilyTypes = []string{"BINARYIVF", "IVFFLAT", "IVFPQ", "GPU_IVFPQ", "GPU_IVFFLAT", "IVFRABITQ", "NPU_IVFRABITQ", "NPU_IVFFLAT"}
+
 type IndexParams struct {
 	Nlinks            int    `json:"nlinks,omitempty"`
 	EfSearch          int    `json:"efSearch,omitempty"`
@@ -410,27 +414,24 @@ func (index *Index) UnmarshalJSON(bs []byte) error {
 			}
 		} else if tempIndex.Type == "FLAT" {
 
-		} else if slices.Contains([]string{"BINARYIVF", "IVFFLAT", "IVFPQ", "GPU_IVFPQ", "GPU_IVFFLAT", "IVFRABITQ", "NPU_IVFRABITQ", "NPU_IVFFLAT"}, tempIndex.Type) {
+		} else if slices.Contains(ivfFamilyTypes, tempIndex.Type) {
 			if indexParams.Ncentroids != 0 {
 				if indexParams.Ncentroids < MinNcentroids || indexParams.Ncentroids > MaxNcentroids {
 					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf("index params ncentroids:%d should in [%d, %d]", indexParams.Ncentroids, MinNcentroids, MaxNcentroids))
 				}
 			}
 
-			// The engine (ComputeIVFTrainingNum) needs at least
-			// DefaultMinPointsPerCentroid(=39) samples per centroid to train IVF
-			// well, and never fewer than MinTrainingThreshold(=256) overall.
-			// Reject up front so params too small to train never reach raft/PS/engine.
-			required := MinTrainingThreshold
-			if indexParams.Ncentroids != 0 && indexParams.Ncentroids*DefaultMinPointsPerCentroid > required {
-				required = indexParams.Ncentroids * DefaultMinPointsPerCentroid
-			}
 			if indexParams.TrainingThreshold != 0 {
-				if indexParams.TrainingThreshold < required {
-					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should be >= max(%d, ncentroids[%d]*%d) = %d", indexParams.TrainingThreshold, MinTrainingThreshold, indexParams.Ncentroids, DefaultMinPointsPerCentroid, required))
+				if indexParams.TrainingThreshold < indexParams.Ncentroids {
+					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than ncentroids:[%d]", indexParams.TrainingThreshold, indexParams.Ncentroids))
 				}
-			} else if indexParams.Ncentroids != 0 && indexParams.Ncentroids*DefaultMinPointsPerCentroid < MinTrainingThreshold {
-				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold should be >= %d", MinTrainingThreshold))
+				if indexParams.TrainingThreshold < MinTrainingThreshold {
+					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than [%d]", indexParams.TrainingThreshold, MinTrainingThreshold))
+				}
+			} else {
+				if indexParams.Ncentroids != 0 && indexParams.Ncentroids*DefaultMinPointsPerCentroid < MinTrainingThreshold {
+					return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" training_threshold:[%d] should more than [%d]", indexParams.TrainingThreshold, MinTrainingThreshold))
+				}
 			}
 			if indexParams.Nprobe != 0 && indexParams.Nprobe > indexParams.Ncentroids {
 				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR, fmt.Errorf(tempIndex.Type+" nprobe:[%d] should less than ncentroids:[%d]", indexParams.Nprobe, indexParams.Ncentroids))
@@ -704,6 +705,31 @@ func ValidateIndexes(indexes []*Index, props map[string]*SpaceProperties) error 
 						fmt.Errorf("indexes[%d] name[%s] type[%s]: field[%s] is a scalar field, use scalar index types instead",
 							i, idx.Name, idx.Type, idx.FieldName))
 				}
+			}
+		}
+
+		// IVF-family indexes must satisfy training_threshold >= max(MinTrainingThreshold,
+		// ncentroids*DefaultMinPointsPerCentroid). The engine triggers training at the
+		// configured threshold but samples at least ncentroids*39 vectors
+		// (ComputeIVFTrainingNum / GetTrainingVectors in internal/engine); a smaller
+		// training_threshold leaves a window where training fires but cannot gather
+		// enough samples. Enforced here on the write path (create / add-index) rather
+		// than in Index.UnmarshalJSON, which also runs when reloading an already-persisted
+		// space from etcd and must not reject values older versions accepted.
+		if len(idx.Params) != 0 && slices.Contains(ivfFamilyTypes, idx.Type) {
+			var p IndexParams
+			if err := json.Unmarshal(idx.Params, &p); err != nil {
+				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
+					fmt.Errorf("indexes[%d] name[%s]: params json.Unmarshal err: %v", i, idx.Name, err))
+			}
+			required := MinTrainingThreshold
+			if p.Ncentroids != 0 && p.Ncentroids*DefaultMinPointsPerCentroid > required {
+				required = p.Ncentroids * DefaultMinPointsPerCentroid
+			}
+			if p.TrainingThreshold != 0 && p.TrainingThreshold < required {
+				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
+					fmt.Errorf("indexes[%d] name[%s] type[%s]: training_threshold[%d] should be >= max(%d, ncentroids[%d]*%d) = %d",
+						i, idx.Name, idx.Type, p.TrainingThreshold, MinTrainingThreshold, p.Ncentroids, DefaultMinPointsPerCentroid, required))
 			}
 		}
 	}
