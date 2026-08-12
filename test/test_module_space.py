@@ -91,7 +91,7 @@ class TestSpaceCreate:
                             "efConstruction": 40,
                             "nprobe": 80,
                             "efSearch": 64,
-                            "training_threshold": 70000,
+                            "training_threshold": 80000,
                         },
                     },
                 },
