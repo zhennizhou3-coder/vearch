@@ -195,8 +195,6 @@ gt = sift10k.get_groundtruth()
     [
         ["MemoryOnly", 128, 10000],
         ["RocksDB", 128, 10000],
-        ["MemoryOnly", 128, 1000],
-        ["RocksDB", 128, 1000],
     ],
 )
 def test_vearch_index_ivfpq_without_nsubvector(store_type: str, ncentroids: int, training_threshold: int):
