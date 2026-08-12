@@ -1260,6 +1260,8 @@ struct GammaIVFPQIndex : GammaFLATIndex, faiss::IndexIVFPQ {
 
   virtual ~GammaIVFPQIndex();
 
+  bool IsTrained() const override { return is_trained; }
+
   faiss::InvertedListScanner *GetInvertedListScanner(
       bool store_pairs, const faiss::IDSelector *sel,
       const faiss::IVFSearchParameters*, const RetrievalContext *retrieval_context);

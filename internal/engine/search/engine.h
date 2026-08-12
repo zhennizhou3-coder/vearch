@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -16,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "omp.h"
 #include "c_api/api_data/doc.h"
 #include "c_api/api_data/request.h"
 #include "c_api/api_data/response.h"
@@ -44,6 +46,37 @@ struct IndexTask {
   std::vector<std::string> field_names;  // ADD only
   std::string index_type;                // ADD only
   std::string index_param;               // ADD only
+};
+
+// Training thread cap for an index rebuild. The result is always clamped to the
+// physical core count so a rebuild never oversubscribes the CPU:
+//   - limit_cpu > 0  -> min(limit_cpu, num_cores). The RPC value is honored but
+//     never exceeds the cores actually available: asking for more threads than
+//     cores only adds context-switching and would worsen the very raft-apply
+//     starvation this cap exists to prevent.
+//   - limit_cpu <= 0 -> max(1, num_cores*3/4) fallback.
+// The max(1, ...) floor guarantees at least one thread even when num_cores*3/4
+// truncates to 0 (num_cores < 2). Pass omp_get_num_procs() (the hardware core
+// count) as num_cores, NOT omp_get_max_threads(): the latter is a mutable
+// per-thread ICV that omp_set_num_threads changes, so it would drift once this
+// or any earlier scope has capped the calling thread. Extracted from
+// Engine::RebuildIndex for unit testing.
+inline int RebuildTrainThreadCap(int limit_cpu, int num_cores) {
+  if (limit_cpu > 0) return std::max(1, std::min(limit_cpu, num_cores));
+  return std::max(1, num_cores * 3 / 4);
+}
+
+// RAII guard that caps the calling thread's OpenMP thread count for the lifetime
+// of the scope and restores the previous value on every exit (including early
+// returns and exceptions). omp_set_num_threads touches only the current thread's
+// ICV, so concurrent search threads keep their own thread counts. A non-positive
+// limit leaves the thread count unchanged.
+struct OmpThreadScope {
+  int prev;
+  explicit OmpThreadScope(int limit) : prev(omp_get_max_threads()) {
+    if (limit > 0) omp_set_num_threads(limit);
+  }
+  ~OmpThreadScope() { omp_set_num_threads(prev); }
 };
 
 class Engine {

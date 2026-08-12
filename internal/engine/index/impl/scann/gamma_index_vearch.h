@@ -88,6 +88,8 @@ class GammaVearchIndex : public IndexModel {
 
   virtual ~GammaVearchIndex();
 
+  bool IsTrained() const override { return is_trained_.load(); }
+
   int Init(const std::string &model_parameters, int training_threshold) override;
 
   RetrievalParameters *Parse(const std::string &parameters) override;
@@ -125,7 +127,7 @@ class GammaVearchIndex : public IndexModel {
 
   void *vearch_index_ = nullptr;
 
-  bool is_trained_ = false;
+  std::atomic<bool> is_trained_{false};
 
   int d_ = 512;
 

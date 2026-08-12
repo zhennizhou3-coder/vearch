@@ -174,13 +174,8 @@ func (s *PartitionService) RegisterPartition(ctx context.Context, partition *ent
 				partition.ReStatusMap = make(map[uint64]uint32)
 			}
 			for nodeID, st := range cur.ReStatusMap {
-				// A PS heartbeat only reports OK/NotReady; preserve master-set
-				// rebuild markers (in-progress and terminally-failed) so a
-				// re-register does not put a rebuilding/broken replica back into
-				// read rotation. The failed marker is cleared only by a later
-				// successful rebuild.
-				if st == entity.ReplicasRebuildingIndex || st == entity.ReplicasRebuildFailed {
-					partition.ReStatusMap[nodeID] = st
+				if st == entity.ReplicasRebuildingIndex {
+					partition.ReStatusMap[nodeID] = entity.ReplicasRebuildingIndex
 				}
 			}
 		}

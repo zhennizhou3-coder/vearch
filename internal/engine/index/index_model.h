@@ -335,6 +335,13 @@ class IndexModel {
 
   bool SupportIncrement() const { return support_increment_; }
 
+  // Whether this index is trained. A virtual (not a base field) because the
+  // underlying flag is not uniform: faiss-based indexes carry faiss's
+  // `is_trained`, while GPU/NPU/SCANN own an `is_trained_`. Indexes with no
+  // training concept (FLAT/HNSW/DISKANN) are ready on creation and use this
+  // default of true.
+  virtual bool IsTrained() const { return true; }
+
   VectorReader *vector_;
   tbb::concurrent_bounded_queue<int64_t> updated_vids_;
   // warining: indexed_count_ is only used by framework, sub-class cann't use it

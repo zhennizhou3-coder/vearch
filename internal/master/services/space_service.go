@@ -406,8 +406,6 @@ func (s *SpaceService) DescribeSpace(ctx context.Context, space *entity.Space, s
 				replicasStatus[nodeID] = "ReplicasOK"
 			case entity.ReplicasRebuildingIndex:
 				replicasStatus[nodeID] = "ReplicasRebuildingIndex"
-			case entity.ReplicasRebuildFailed:
-				replicasStatus[nodeID] = "ReplicasRebuildFailed"
 			default:
 				replicasStatus[nodeID] = "ReplicasNotReady"
 			}

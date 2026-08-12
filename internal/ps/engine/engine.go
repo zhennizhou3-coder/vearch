@@ -53,6 +53,27 @@ type Writer interface {
 	Commit(ctx context.Context, sn int64) (chan error, error)
 }
 
+// IndexStatusInfo is the per-index status a rebuild poll needs. Named fields
+// (not a positional tuple) so the two same-typed flags cannot be swapped at a
+// call site without the compiler noticing.
+type IndexStatusInfo struct {
+	// Status is the engine's stringified IndexStatus:
+	// "UNINDEXED"/"INDEXING"/"INDEXED"/"FAILED".
+	Status string
+	// IndexedNum is vectors actually added to this index so far.
+	IndexedNum int
+	// IsTrained / SupportIncrement classify whether the index backfills after a
+	// swap. Both default to true on engines predating these flags (the safe
+	// "will backfill, wait for catch-up" classification).
+	IsTrained        bool
+	SupportIncrement bool
+	// MaxDocid is the engine-wide doc frontier (max_docid), not a per-index
+	// value — it is identical for every index in the partition. It is carried
+	// here so a single GetEngineStatus read serves the whole poll: the monitor
+	// needs both this index's fields and the frontier it gates completion on.
+	MaxDocid int
+}
+
 // Engine is the interface that wraps the core operations of a document store.
 type Engine interface {
 	Reader() Reader
@@ -69,11 +90,12 @@ type Engine interface {
 	Load() error
 	IndexInfo() (int, int, int)
 
-	// IndexStatusOf returns the stringified status and the indexed-vector
-	// count of the vector index whose physical name (field::type) matches
-	// indexName, from EngineStatus.IndexStatuses. indexedNum is 0 for engines
-	// predating the per-index count field.
-	IndexStatusOf(indexName string) (status string, indexedNum int, err error)
+	// IndexStatusOf returns the per-index status (status string, indexed count,
+	// the isTrained / supportIncrement classification flags, and the engine-wide
+	// MaxDocid) of the vector index whose physical name (field::type) matches
+	// indexName. MaxDocid comes from the same EngineStatus read, so one call
+	// serves a whole rebuild poll.
+	IndexStatusOf(indexName string) (IndexStatusInfo, error)
 	GetEngineStatus(status *entity.EngineStatus) error
 	Close()
 	HasClosed() bool

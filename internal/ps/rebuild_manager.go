@@ -61,16 +61,6 @@ const (
 	indexInfoFailureBudget = 5
 	// terminalRetentionPeriod keeps terminal tasks visible to master polls.
 	terminalRetentionPeriod = 2 * time.Hour
-	// drainQuiescenceGrace is how long the post-swap indexed_num may stay
-	// static at 0 before the monitor concludes the index will never populate
-	// the framework counter and completes anyway. This covers the two cases
-	// indistinguishable by count alone: an untrained below-threshold index
-	// (served by full-recall FLAT fallback, so no data loss) and a
-	// non-incremental index (DISKANN_STATIC, built entirely inside Indexing()
-	// with indexed_num left at 0). Sized above the engine's has_error retry
-	// sleep (5s) and refresh_interval (1s) so a legitimate backfill that is
-	// merely between passes is never mistaken for quiescent.
-	drainQuiescenceGrace = 15 * time.Second
 )
 
 // RebuildTask aliases the shared entity type; master and PS use the same
@@ -161,26 +151,30 @@ func (r *RebuildManager) executeRebuild(task *RebuildTask, dropBefore int, limit
 		return
 	}
 
-	// Pre-flight: adopt vs dispatch. A build still in flight (UNINDEXED/INDEXING)
-	// — a restart's Load build, or a drop-path rebuild still training — is
-	// adopted, not dispatched again; the monitor just waits. INDEXED (steady) or
-	// FAILED (recover) is dispatched. Whole-partition rebuild (FieldName == "")
-	// reads the engine-wide status; field-level reads the named index's status.
+	// Pre-flight: decide whether to dispatch a fresh build or only monitor.
+	// shouldDispatchBuild==false means a build is running / about to run, or the
+	// index is already at a state the monitor can complete without rebuilding —
+	// dispatching would interrupt or race it. Whole-partition rebuild
+	// (FieldName == "") reads the engine-wide status; field-level reads the named
+	// index's status (and its per-index SupportIncrement flag).
 	var preStatus string
+	var preSupportIncrement = true // whole-partition path has no per-index flag; assume incremental
 	var err error
 	if task.FieldName == "" {
 		st, _, _ := engine.IndexInfo()
 		preStatus = indexStatusToString(st)
 	} else {
-		preStatus, _, err = engine.IndexStatusOf(task.IndexName)
+		info, serr := engine.IndexStatusOf(task.IndexName)
+		preStatus, preSupportIncrement, err = info.Status, info.SupportIncrement, serr
 	}
 	if err != nil {
 		r.markFailed(task, fmt.Sprintf("pre-rebuild status read for %q: %v", task.IndexName, err))
 		return
 	}
-	if preStatus == indexStatusUnindexed || preStatus == indexStatusIndexing {
+	if !shouldDispatchBuild(preStatus, preSupportIncrement) {
 		task.AwaitTransition = false
-		log.Info("adopting in-flight index build: pid=%d indexName=%q", task.PartitionID, task.IndexName)
+		log.Info("rebuild monitoring existing build (no dispatch): pid=%d indexName=%q status=%q",
+			task.PartitionID, task.IndexName, preStatus)
 		r.monitorRebuild(task, store, nil)
 		return
 	}
@@ -209,16 +203,31 @@ func (r *RebuildManager) executeRebuild(task *RebuildTask, dropBefore int, limit
 	r.monitorRebuild(task, store, doneCh)
 }
 
-// monitorRebuild drives one rebuild to a terminal state. An index build counts
-// as complete only when its freshly-built index is BOTH swapped in (status
-// INDEXED) and fully backfilled (indexed_num has reached the doc frontier frozen
-// at swap time) — the train+swap moment alone leaves indexed_num at 0 while the
-// background AddRTVecsToIndex pass is still filling it, and completing then would
-// clear the ReplicasRebuildingIndex marker and route reads to an empty index.
-// Indexes that never populate the framework counter (untrained below-threshold,
-// served by full-recall FLAT fallback; or non-incremental, built inside
-// Indexing()) hold indexed_num at exactly 0 and complete via the quiescence
-// backstop instead of starving to the deadline.
+// monitorRebuild drives one rebuild to a terminal state in two phases:
+//
+//   Phase 1 (waiting): wait until THIS rebuild has reached INDEXED — its freshly
+//   built index has been swapped in. See reachedIndexed for how the dispatch and
+//   monitor-only paths each confirm that.
+//
+//   Phase 2 (backfilling): on the tick INDEXED is first reached, classify the
+//   index and freeze the doc frontier it owns, then wait for indexed_num to catch
+//   up to that frontier. Reaching INDEXED is NOT completion: the swap leaves
+//   indexed_num at 0 while the background AddRTVecsToIndex pass backfills, and
+//   reporting complete then would clear the ReplicasRebuildingIndex marker while
+//   the new index is still empty.
+//
+// The classification exists for TERMINATION, not for query safety (the rebuilding
+// replica is marked busy and serves no reads until it completes). Two index
+// classes have an indexed_num that can NEVER reach the frozen frontier, so a
+// blind "wait for catch-up" would hang until rebuildMaxDuration and be reported
+// as FAILED. They are terminal at the swap itself and complete in phase 1:
+//   - !supportIncrement: non-incremental (DISKANN) is built whole in Indexing()
+//     from the vector count at build time; AddRTVecsToIndex skips it, so
+//     indexed_num stays below any frontier that grew via concurrent writes.
+//   - !isTrained: an untrained index (live doc count below training_threshold)
+//     never trains, so Add() early-returns and indexed_num stays 0 forever.
+// A trained, incremental index waits for indexed_num >= the frozen frontier; a
+// genuinely stalled backfill then fails at rebuildMaxDuration rather than early.
 func (r *RebuildManager) monitorRebuild(task *RebuildTask, store PartitionStore,
 	doneCh <-chan error) {
 	var serverCtx context.Context
@@ -230,10 +239,15 @@ func (r *RebuildManager) monitorRebuild(task *RebuildTask, store PartitionStore,
 	defer ticker.Stop()
 
 	failureStreak := 0
-	swapConfirmed := false // engine.RebuildIndex returned nil (dispatch path)
-	targetDocCount := -1   // <0 until the new index is swapped in; then frozen
-	lastIndexedNum := 0
-	lastProgressAt := time.Now()
+	// engineReturned records the dispatch path's authoritative signal: the
+	// synchronous engine.RebuildIndex has returned nil (train+swap done). The
+	// monitor-only path leaves it false and confirms via polled status instead.
+	engineReturned := false
+	// inBackfillPhase is the single phase marker: false while phase 1 (waiting
+	// for THIS rebuild to reach INDEXED), true once it has. targetDocCount is the
+	// frozen backfill frontier, meaningful only after the transition.
+	inBackfillPhase := false
+	targetDocCount := 0
 
 	for {
 		select {
@@ -242,11 +256,8 @@ func (r *RebuildManager) monitorRebuild(task *RebuildTask, store PartitionStore,
 				r.markFailed(task, fmt.Sprintf("engine.RebuildIndex: %v", err))
 				return
 			}
-			// Synchronous return proves this rebuild's train+swap is done, even
-			// when it was too fast to observe an intermediate INDEXING status.
-			// Nil the channel so the drained receive stops firing.
-			swapConfirmed = true
-			doneCh = nil
+			engineReturned = true
+			doneCh = nil // stop the drained receive from firing
 		case <-ticker.C:
 		case <-ctxDone(serverCtx):
 			r.markFailed(task, "PS server shutting down")
@@ -264,7 +275,7 @@ func (r *RebuildManager) monitorRebuild(task *RebuildTask, store PartitionStore,
 			return
 		}
 
-		state, indexedNum, maxDocid, infoErr := r.pollStatus(task, engine)
+		info, infoErr := r.pollStatus(task, engine)
 		if infoErr != nil {
 			failureStreak++
 			log.Warn("rebuild status poll failed for pid=%d (streak=%d/%d): %v",
@@ -278,60 +289,133 @@ func (r *RebuildManager) monitorRebuild(task *RebuildTask, store PartitionStore,
 			continue
 		}
 		failureStreak = 0
-		r.updateProgress(task, computeProgress(indexedNum, maxDocid))
+		r.updateProgress(task, computeProgress(info.IndexedNum, info.MaxDocid))
 
-		if state == indexStatusFailed {
+		if info.Status == indexStatusFailed {
 			r.markFailed(task, "engine reported index status=FAILED")
 			return
 		}
 
-		// Gate on this rebuild's swap before measuring backfill. The dispatch
-		// path trusts the synchronous return (swapConfirmed); otherwise trust an
-		// INDEXED status only once observeRebuildStatus has ruled out a stale
-		// terminal reading left by a prior build.
-		if !swapConfirmed {
-			awaiting := observeRebuildStatus(task.AwaitTransition, state)
-			if awaiting != task.AwaitTransition {
-				r.mu.Lock()
-				task.AwaitTransition = awaiting
-				r.mu.Unlock()
+		// Phase 1 → 2 transition: wait until this rebuild reaches INDEXED, then
+		// classify + freeze the frontier exactly once.
+		if !inBackfillPhase {
+			if !r.reachedIndexed(task, info, engineReturned) {
+				continue // still building / awaiting our swap
 			}
-			if awaiting || state != indexStatusIndexed {
-				continue // still awaiting our swap, or still building
+			inBackfillPhase = true
+
+			if !info.SupportIncrement {
+				r.markCompleted(task)
+				log.Info("rebuild task completed for partition %d (non-incremental index, swap is terminal)",
+					task.PartitionID)
+				return
 			}
+			if !info.IsTrained {
+				// Terminal, but a degradation worth surfacing: the new index is
+				// untrained because the live doc count is below training_threshold.
+				// Queries fall back to a full brute-force scan (correct results,
+				// slower) instead of the ANN index. Typical cause: an index that
+				// was trained earlier, then had enough docs deleted that the live
+				// count dropped below the threshold, so a non-drop rebuild swaps in
+				// an untrained index. Not a failure (data is fully queryable, and a
+				// retry would deterministically reproduce this since the doc count
+				// is unchanged), so complete rather than hang or trigger self-heal
+				// — but WARN so operators see the degradation.
+				r.markCompleted(task)
+				log.Warn("rebuild task completed for partition %d with an UNTRAINED index "+
+					"(live doc count below training_threshold); queries use full brute-force "+
+					"scan until enough docs exist to train", task.PartitionID)
+				return
+			}
+			// Freeze the frontier this rebuild owns; writes beyond it are the
+			// realtime indexer's job, so completion is measured against a fixed target.
+			targetDocCount = info.MaxDocid + 1
 		}
 
-		// Freeze the frontier this rebuild owns on the first poll past the swap.
-		// Writes beyond it belong to the realtime indexer, so completion is
-		// measured against a fixed target rather than a moving max_docid.
-		if targetDocCount < 0 {
-			targetDocCount = maxDocid + 1
-			lastIndexedNum = indexedNum
-			lastProgressAt = time.Now()
-		}
-
-		switch {
-		case indexedNum >= targetDocCount:
+		// Phase 2: complete once the backfill catches up to the frozen frontier.
+		if info.IndexedNum >= targetDocCount {
 			r.markCompleted(task)
 			log.Info("rebuild task completed for partition %d (indexed=%d >= target=%d)",
-				task.PartitionID, indexedNum, targetDocCount)
-			return
-		case indexedNum > lastIndexedNum:
-			lastIndexedNum = indexedNum
-			lastProgressAt = time.Now()
-		case indexedNum == 0 && time.Since(lastProgressAt) > drainQuiescenceGrace:
-			// Pinned at 0 through the grace window: this index does not backfill
-			// the framework counter (untrained→FLAT fallback, or non-incremental
-			// built inside Indexing()). Neither loses query data, so complete
-			// rather than starve to the deadline. A plateau at >0 but <target is
-			// a stalled backfill (engine add error) and is deliberately left to
-			// fail at the deadline instead of reporting a partial index ready.
-			r.markCompleted(task)
-			log.Info("rebuild task completed for partition %d (index does not backfill; indexed=0 target=%d)",
-				task.PartitionID, targetDocCount)
+				task.PartitionID, info.IndexedNum, targetDocCount)
 			return
 		}
 	}
+}
+
+// reachedIndexed reports whether THIS rebuild has settled into a state the
+// phase-2 classifier can act on. Two confirmation paths:
+//
+//   - Dispatch path: engine.RebuildIndex is synchronous, so its nil return
+//     (engineReturned) is authoritative — the build finished, even if too fast to
+//     observe an intermediate INDEXING status. Trusted over the polled state,
+//     which may lag the cgo return by a tick.
+//   - Monitor-only path (engineReturned=false): confirm via the polled status.
+//     A rebuild dispatched from a prior terminal state must first observe a
+//     non-terminal state (UNINDEXED/INDEXING) before a settled reading is
+//     attributed to it — otherwise a stale status from the previous build would
+//     be mistaken for this one's result. task.AwaitTransition tracks that gate.
+//
+// A settled state is INDEXED (the normal case: a trained, swapped-in index — this
+// now includes a non-incremental index such as DISKANN, whose Load path publishes
+// INDEXED once its on-disk structure is ready; see VectorManager::Load). The one
+// remaining non-INDEXED settled state is an untrained index (IsTrained=false)
+// resting at UNINDEXED: it never trains (live doc count below training_threshold),
+// so it would otherwise starve to the deadline. It is completed (with a WARN) in
+// phase 2. Crucially, that flag is honored ONLY when status != INDEXING: while an
+// index is actively training, IsTrained is transiently false, and settling then
+// would report a still-building rebuild as complete.
+func (r *RebuildManager) reachedIndexed(task *RebuildTask, info engine.IndexStatusInfo,
+	engineReturned bool) bool {
+	if engineReturned {
+		return true
+	}
+	awaiting := observeRebuildStatus(task.AwaitTransition, info.Status)
+	if awaiting != task.AwaitTransition {
+		r.mu.Lock()
+		task.AwaitTransition = awaiting
+		r.mu.Unlock()
+	}
+	if awaiting {
+		return false // still awaiting this rebuild's own build to start
+	}
+	// INDEXED is the normal settled state. An untrained index rests at UNINDEXED
+	// and is settled too — but only when it is not mid-build (status != INDEXING),
+	// so an actively-training index (transiently IsTrained=false) is not mistaken
+	// for a terminal untrained one.
+	return info.Status == indexStatusIndexed ||
+		(!info.IsTrained && info.Status != indexStatusIndexing)
+}
+
+// shouldDispatchBuild reports whether this rebuild request must issue a fresh
+// engine.RebuildIndex. False means monitor only — do NOT dispatch — because a
+// build is running, about to run, or the index is already at a state the monitor
+// can complete without rebuilding:
+//
+//   - INDEXING → do not dispatch. A build is genuinely mid-flight (a restart's
+//     Load build, a drop-path rebuild still training, or a RebuildVectorIndex in
+//     progress). Dispatching would call StopIndexingThread and restart it — an
+//     interrupt + duplicate. Just observe it to completion.
+//   - UNINDEXED + incremental → do not dispatch. Two sub-cases both resolve to
+//     "don't": (a) a Load-triggered BuildIndex that has CAS'd indexing_state_ to
+//     STARTING but not yet flipped status to INDEXING — dispatching would race a
+//     build about to run (StopIndexingThread only stops a RUNNING build, so it
+//     would NOT stop a STARTING one → two concurrent builds); (b) a settled
+//     untrained index (doc count below training_threshold) that the monitor
+//     completes via the !IsTrained gate — rebuilding would only re-swap an
+//     equally-untrained index.
+//   - UNINDEXED + non-incremental (DISKANN) → dispatch. It is never driven by the
+//     background indexing thread (auto-build gates skip SupportIncrement()==false),
+//     so UNINDEXED means "nothing is or will be building"; only a dispatch builds
+//     the on-disk index.
+//   - INDEXED (steady) / FAILED (recover) → dispatch a fresh build.
+func shouldDispatchBuild(preStatus string, supportIncrement bool) bool {
+	if preStatus == indexStatusIndexing {
+		return false
+	}
+	if preStatus == indexStatusUnindexed && supportIncrement {
+		return false
+	}
+	return true
 }
 
 // observeRebuildStatus reports whether the monitor is still awaiting the engine
@@ -349,20 +433,37 @@ func observeRebuildStatus(awaitTransition bool, status string) bool {
 	return true // stale INDEXED/FAILED from a prior build; keep waiting
 }
 
-func (r *RebuildManager) pollStatus(task *RebuildTask, engine engine.Engine) (string, int, int, error) {
+// pollStatus returns this rebuild's per-index status info, including the
+// engine-wide doc frontier (info.MaxDocid). Field-level rebuild reads the named
+// index's info in a single GetEngineStatus (IndexStatusOf now also carries
+// MaxDocid), so a poll makes one cgo call, not two.
+//
+// The whole-partition branch (FieldName == "") is defensive: in production a
+// rebuild task always carries a non-empty FieldName — Space.AllVectorIndexes
+// only lists indexes with FieldName != "" (space.go), and the PS handler
+// resolves the request via GetIndexByName before dispatch (handler_admin.go),
+// so the engine's own whole-partition RebuildIndex path is never taken here.
+// It reports the engine-wide status with both classification flags defaulted to
+// true (plain "wait for indexed_num to catch up"); were it ever reached for a
+// non-incremental index, that index's indexed_num could not reach the frontier
+// and the monitor would wait to rebuildMaxDuration — acceptable only because the
+// path is unreachable.
+func (r *RebuildManager) pollStatus(task *RebuildTask, eng engine.Engine) (
+	info engine.IndexStatusInfo, err error) {
 	if task.FieldName == "" {
-		st, indexed, maxDocid := engine.IndexInfo()
-		return indexStatusToString(st), indexed, maxDocid, nil
+		st, idx, md := eng.IndexInfo()
+		return engine.IndexStatusInfo{
+			Status:           indexStatusToString(st),
+			IndexedNum:       idx,
+			IsTrained:        true,
+			SupportIncrement: true,
+			MaxDocid:         md,
+		}, nil
 	}
-	status, indexed, err := engine.IndexStatusOf(task.IndexName)
-	if err != nil {
-		return "", 0, 0, err
-	}
-	// maxDocid is engine-wide (the doc frontier), independent of which index we
-	// are rebuilding; indexed is this index's own count so a lagging sibling
-	// index does not gate this rebuild's completion.
-	_, _, maxDocid := engine.IndexInfo()
-	return status, indexed, maxDocid, nil
+	// info.MaxDocid is engine-wide (the doc frontier), independent of which index
+	// we are rebuilding; info.IndexedNum is this index's own count so a lagging
+	// sibling index does not gate this rebuild's completion.
+	return eng.IndexStatusOf(task.IndexName)
 }
 
 // computeProgress returns 0..100. Returns 0 when totals are unknown.

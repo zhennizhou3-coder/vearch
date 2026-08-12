@@ -152,6 +152,8 @@ struct GammaIVFFlatIndex : faiss::IndexIVFFlat, public GammaFLATIndex {
   GammaIVFFlatIndex();
   virtual ~GammaIVFFlatIndex();
 
+  bool IsTrained() const override { return is_trained; }
+
   void search_preassigned(RetrievalContext *retrieval_context, idx_t n,
                           const float *x, int k, const idx_t *keys,
                           const float *coarse_dis, float *distances,

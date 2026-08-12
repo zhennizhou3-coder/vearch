@@ -274,6 +274,8 @@ struct GammaIVFPQFastScanIndex : GammaFLATIndex, faiss::IndexIVFPQFastScan {
 
   virtual ~GammaIVFPQFastScanIndex();
 
+  bool IsTrained() const override { return is_trained; }
+
   Status Init(const std::string &model_parameters,
               int training_threshold) override;
 

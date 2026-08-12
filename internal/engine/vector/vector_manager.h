@@ -52,6 +52,13 @@ class VectorManager {
     // AddRTVecsToIndex pass). Named indexed_num to match the EngineStatus
     // surface field (min_indexed_num), not the internal indexed_count_.
     int64_t indexed_num;
+    // Two factual basic properties the rebuild monitor combines to classify
+    // whether this index will backfill after swap: is_trained (untrained IVF
+    // serves via full-recall FLAT, never backfills indexed_num) and
+    // support_increment (non-incremental DISKANN is built whole in Indexing(),
+    // never backfilled). Both read under the same rdlock as status/indexed_num.
+    bool is_trained;
+    bool support_increment;
   };
 
   VectorManager(const VectorStorageType &store_type,
@@ -182,6 +189,13 @@ class VectorManager {
   std::map<std::string, std::string> GetAllIndexStates() const;
 
   bool SupportIncrement();
+
+  // Per-index variant: does the index named index_name support incremental
+  // Add? A missing index returns the same default as a fresh IndexModel (true),
+  // so callers treat "unknown" as incremental. Used by RebuildIndex to force a
+  // full build for non-incremental indexes (e.g. DISKANN) regardless of the
+  // training_threshold gate, which is an IVF-only concept.
+  bool SupportIncrementOf(const std::string &index_name);
 
   void VectorNames(std::vector<std::string> &names) {
     for (const auto &it : raw_vectors_) {

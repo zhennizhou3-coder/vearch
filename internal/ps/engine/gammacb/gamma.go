@@ -329,8 +329,8 @@ func (ge *gammaEngine) GetEngineStatus(status *entity.EngineStatus) error {
 	// Pin the engine for the whole cgo call. Close() nils ge.gamma and then
 	// waits for counter==0 before freeing the C++ engine, so holding the
 	// counter across gamma.GetEngineStatus prevents a use-after-free when a
-	// partition closes mid-call — e.g. the rebuild monitor polling an
-	// adopt-in-flight build that holds no counter of its own.
+	// partition closes mid-call — e.g. the rebuild monitor polling on the
+	// monitor-only path, which holds no counter of its own.
 	ge.counter.Incr()
 	defer ge.counter.Decr()
 
@@ -347,20 +347,31 @@ func (ge *gammaEngine) GetEngineStatus(status *entity.EngineStatus) error {
 	return nil
 }
 
-// IndexStatusOf returns the numeric status and the indexed-vector count of
-// the index whose name matches indexName (the user index_name, which is the
-// vector_indexes_ key), from EngineStatus.IndexStatuses.
-func (ge *gammaEngine) IndexStatusOf(indexName string) (string, int, error) {
+// IndexStatusOf returns the per-index status (status, indexed count, and the
+// isTrained / supportIncrement classification flags) of the index whose name
+// matches indexName (the user index_name, which is the vector_indexes_ key),
+// from EngineStatus.IndexStatuses. A nil flag from the engine (older .so that
+// does not emit it) resolves to true — the safe "will backfill, wait for
+// catch-up" default, so a normal index is never misclassified as terminal.
+// MaxDocid is filled from the same EngineStatus so the caller needs only this
+// one read to obtain both the index's fields and the engine-wide doc frontier.
+func (ge *gammaEngine) IndexStatusOf(indexName string) (engine.IndexStatusInfo, error) {
 	status := &entity.EngineStatus{}
 	if err := ge.GetEngineStatus(status); err != nil {
-		return "", 0, err
+		return engine.IndexStatusInfo{}, err
 	}
 	for _, p := range status.IndexStatuses {
 		if p.IndexName == indexName {
-			return p.Status, int(p.IndexedNum), nil
+			return engine.IndexStatusInfo{
+				Status:           p.Status,
+				IndexedNum:       int(p.IndexedNum),
+				IsTrained:        p.IsTrained == nil || *p.IsTrained,
+				SupportIncrement: p.SupportIncrement == nil || *p.SupportIncrement,
+				MaxDocid:         int(status.MaxDocid),
+			}, nil
 		}
 	}
-	return "", 0, fmt.Errorf("index %q not found in index_statuses", indexName)
+	return engine.IndexStatusInfo{}, fmt.Errorf("index %q not found in index_statuses", indexName)
 }
 
 func (ge *gammaEngine) BuildIndex() error {

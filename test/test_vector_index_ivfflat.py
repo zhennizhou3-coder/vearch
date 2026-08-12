@@ -189,7 +189,7 @@ def test_vearch_index_ivfflat_hnsw(
     index_params = {}
     index_params["metric_type"] = "L2"
     index_params["ncentroids"] = ncentroids
-    index_params["training_threshold"] = ncentroids * 39
+    index_params["training_threshold"] = ncentroids * 19
 
     index_params["hnsw"] = {}
     index_params["hnsw"]["nlinks"] = 32

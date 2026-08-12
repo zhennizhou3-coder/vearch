@@ -651,6 +651,13 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
   }
 
   // Step 3: swap in under the write lock. Old index stays queryable until here.
+  // Status reflects the training state: a trained index (do_train succeeded in
+  // Step 2 — a failure there already returned) is INDEXED; an untrained index
+  // (do_train was false because the live doc count is below training_threshold)
+  // is UNINDEXED, matching the first-build convention so the AddOrUpdate
+  // auto-index gate re-trains it once enough docs exist.
+  IndexStatus index_status =
+      do_train ? IndexStatus::INDEXED : IndexStatus::UNINDEXED;
   pthread_rwlock_wrlock(&vector_indexes_mutex_);
   auto it = vector_indexes_.find(target_index_name);
   if (it != vector_indexes_.end()) {
@@ -661,8 +668,9 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
   }
   for (auto &[name, idx] : new_indexes) {
     vector_indexes_[name] = idx;
-    vector_index_status_[name] = IndexStatus::INDEXED;
-    LOG(INFO) << desc_ << "set " << name << " index";
+    vector_index_status_[name] = index_status;
+    LOG(INFO) << desc_ << "set " << name << " index, status="
+              << IndexStatusToString(index_status);
   }
   pthread_rwlock_unlock(&vector_indexes_mutex_);
 
@@ -677,15 +685,30 @@ std::vector<VectorManager::IndexStatusEntry> VectorManager::IndexStatuses() {
   pthread_rwlock_rdlock(&vector_indexes_mutex_);
   out.reserve(vector_index_status_.size());
   for (const auto &[name, st] : vector_index_status_) {
-    // indexed_count_ lives on the IndexModel in the sibling vector_indexes_
-    // map, keyed identically. Both maps are guarded by vector_indexes_mutex_
-    // (held here), so this is a free read — no extra lock, no extra traversal.
+    // vector_index_status_ and vector_indexes_ share keys (kept in sync at swap);
+    // a missing model keeps the safe defaults below.
     int64_t indexed_num = 0;
+    bool is_trained = true;
+    bool support_increment = true;
     auto it = vector_indexes_.find(name);
     if (it != vector_indexes_.end() && it->second != nullptr) {
       indexed_num = it->second->indexed_count_;
+      // IsTrained() for the faiss families (IVF*) reads faiss's non-atomic
+      // `is_trained`, which Engine::Indexing writes via train() WITHOUT this
+      // lock (TrainIndex iterates lock-free). That is a formal data race on a
+      // non-atomic bool. It does NOT corrupt the rebuild monitor's decision:
+      // Indexing() writes is_trained (train()) and only afterwards, under the
+      // WRITE lock, publishes status=INDEXED (SetAllStatuses). A reader that
+      // observes INDEXED under this read lock therefore also observes the
+      // settled is_trained (write-unlock synchronizes-with read-lock); and the
+      // monitor consumes is_trained only once status has settled (not while
+      // INDEXING). GPU/NPU/SCANN avoid the race outright with atomic<bool>;
+      // faiss's is_trained is a base-class member we cannot retype here, so the
+      // race remains benign-but-real (ThreadSanitizer will flag it).
+      is_trained = it->second->IsTrained();
+      support_increment = it->second->SupportIncrement();
     }
-    out.push_back({name, st, indexed_num});
+    out.push_back({name, st, indexed_num, is_trained, support_increment});
   }
   pthread_rwlock_unlock(&vector_indexes_mutex_);
   return out;
@@ -1790,6 +1813,27 @@ int VectorManager::Load(const std::vector<std::string> &index_dirs,
                 << ", has_delete=" << has_delete;
     }
   }
+
+  // A non-incremental index (DISKANN) is not driven by Engine::Indexing's status
+  // machine and is not re-trained by the post-load BuildIndex gate (that gate is
+  // skipped for it because SupportIncrement() is false). So after a restart its
+  // vector_index_status_ would stay at the UNINDEXED seed from CreateVectorTable
+  // even though index->Load has restored a fully queryable on-disk index — a
+  // status that lies about a serving index and makes the rebuild monitor treat
+  // it as never-built. Reconcile here: for a non-incremental index that Load
+  // left ready (IsTrained() reflects disk_index_ready_), publish INDEXED. One
+  // that was never built (no meta file → not ready) keeps UNINDEXED, honestly.
+  // Incremental indexes are untouched — their status is owned by Engine::Indexing.
+  pthread_rwlock_wrlock(&vector_indexes_mutex_);
+  for (const auto &[name, index] : vector_indexes_) {
+    if (index != nullptr && !index->SupportIncrement() && index->IsTrained()) {
+      vector_index_status_[name] = IndexStatus::INDEXED;
+      LOG(INFO) << desc_ << "load reconciled non-incremental index [" << name
+                << "] status=INDEXED";
+    }
+  }
+  pthread_rwlock_unlock(&vector_indexes_mutex_);
+
   LOG(INFO) << desc_ << "vector_mgr load vec_num=" << doc_num;
   return 0;
 }
@@ -1952,6 +1996,19 @@ bool VectorManager::SupportIncrement() {
       support = false;
       break;
     }
+  }
+  pthread_rwlock_unlock(&vector_indexes_mutex_);
+  return support;
+}
+
+bool VectorManager::SupportIncrementOf(const std::string &index_name) {
+  // Same locking rationale as SupportIncrement(). Default true when the index
+  // is not (yet) present, matching IndexModel's default.
+  pthread_rwlock_rdlock(&vector_indexes_mutex_);
+  bool support = true;
+  auto it = vector_indexes_.find(index_name);
+  if (it != vector_indexes_.end() && it->second != nullptr) {
+    support = it->second->SupportIncrement();
   }
   pthread_rwlock_unlock(&vector_indexes_mutex_);
   return support;

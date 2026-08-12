@@ -15,6 +15,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <vector>
+#include <atomic>
 
 #include "common/gamma_common_data.h"
 #include "concurrentqueue/blockingconcurrentqueue.h"
@@ -58,6 +59,8 @@ class GammaGPUIndexBase : public IndexModel {
         d_(0) {}
 
   virtual ~GammaGPUIndexBase() { Cleanup(); }
+
+  bool IsTrained() const override { return is_trained_.load(); }
 
   virtual Status Init(const std::string &model_parameters,
                       int training_threshold) override {
@@ -136,7 +139,7 @@ class GammaGPUIndexBase : public IndexModel {
 
   // State variables
   bool b_exited_;
-  bool is_trained_;
+  std::atomic<bool> is_trained_;
   int d_;
   DistanceComputeType metric_type_;
 

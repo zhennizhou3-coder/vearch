@@ -2167,6 +2167,101 @@ class TestRebuildIndexTypeMatrix:
             except Exception:
                 pass
 
+    def test_rebuild_diskann_below_training_threshold(self):
+        """DiskANN rebuild must build a usable index even when the live doc count
+        is below training_threshold.
+
+        DiskANN is non-incremental: its whole on-disk structure is built in
+        Indexing(), with no IVF-style "enough samples to train" requirement.
+        RebuildIndex must therefore force a full build for it regardless of the
+        threshold gate. Before that fix, a sub-threshold rebuild took do_train=
+        false, skipped Indexing(), and swapped in an empty (unqueryable) index
+        while still reporting the rebuild complete. This test inserts far fewer
+        docs than training_threshold and asserts the rebuilt index still reaches
+        INDEXED and returns results.
+        """
+        case_space = space_name + "_comp_diskann_sub"
+        embedding_size = xb.shape[1]
+        # threshold far above the doc count we insert, so do_train would be false
+        # under the plain IVF-style gate.
+        cfg = {
+            "name": case_space, "partition_num": 1, "replica_num": 1,
+            "fields": [
+                {"name": "field_int", "type": "integer"},
+                {"name": "field_vector", "type": "vector",
+                 "store_type": "RocksDB",
+                 "index": {"name": "gamma", "type": "DISKANN_STATIC",
+                           "params": {
+                               "metric_type": "L2",
+                               "training_threshold": 50000,
+                               "R": 32, "L": 64,
+                               "num_threads": 2,
+                               "beam_width": 4,
+                               "num_nodes_to_cache": 100000,
+                               "search_dram_budget_gb": 0.5,
+                               "build_dram_budget_gb": 0.56,
+                               "disk_pq_bytes": 0,
+                               "use_opq": 0,
+                               "append_reorder_data": 0,
+                           }},
+                 "dimension": embedding_size},
+            ],
+        }
+        resp = create_space(router_url, db_name, cfg)
+        body = resp.json()
+        if body.get("code") != 0:
+            pytest.skip(
+                f"DISKANN_STATIC not supported on this cluster build: "
+                f"code={body.get('code')} msg={body.get('msg')}")
+        try:
+            # 500 docs << training_threshold (50000).
+            batch_size, total = 100, 500
+            logger.info("6.6 inserting %d docs (sub-threshold DISKANN)", total)
+            add(total // batch_size, batch_size, xb[:total], True, False,
+                space_name=case_space)
+            time.sleep(5)
+            doc_num_after_insert = _get_space_detail(
+                db_name, case_space).get("doc_num", 0)
+            assert doc_num_after_insert >= total, (
+                f"insert lost data: expected ≥{total}, got {doc_num_after_insert}")
+
+            logger.info("6.6 triggering /index/forcemerge for initial DiskANN build")
+            fm = requests.post(
+                router_url + "/index/forcemerge",
+                auth=(username, password),
+                json={"db_name": db_name, "space_name": case_space,
+                      "partition_id": 0},
+                timeout=60)
+            assert fm.json().get("code") == 0, f"forcemerge failed: {fm.text[:300]}"
+
+            # Initial build should reach INDEXED despite doc_num < threshold.
+            _wait_index_status_indexed(db_name, case_space,
+                                       max_rounds=300, poll_interval=5)
+
+            pre_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
+
+            logger.info("6.6 triggering rebuild (sub-threshold)")
+            assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
+            _wait_rebuild_completed(db_name, case_space, timeout=1800)
+
+            # The rebuilt index must still be INDEXED (force-build), not left
+            # UNINDEXED/empty by a skipped Indexing().
+            _wait_index_status_indexed(db_name, case_space,
+                                       max_rounds=300, poll_interval=5)
+
+            post_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
+            assert post_doc_num == pre_doc_num, (
+                f"doc_num diverged across rebuild: pre={pre_doc_num} "
+                f"post={post_doc_num}")
+
+            # And it must return results — an empty index would find nothing.
+            _check_search(case_space, times=3)
+        finally:
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception:
+                pass
+
     def test_rebuild_scann(self):
         """Verifies a SCANN index can be rebuilt successfully."""
         case_space = space_name + "_comp_scann"

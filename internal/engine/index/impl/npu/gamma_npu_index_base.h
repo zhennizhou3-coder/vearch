@@ -87,6 +87,8 @@ class GammaNPUIndexBase : public IndexModel {
 
   virtual ~GammaNPUIndexBase() { Cleanup(); }
 
+  bool IsTrained() const override { return is_trained_.load(); }
+
   virtual Status Init(const std::string &model_parameters,
                       int training_threshold) override {
     b_exited_ = false;
@@ -206,7 +208,7 @@ class GammaNPUIndexBase : public IndexModel {
 
   static constexpr int kMaxBatchItems = 512;
   static constexpr int kMaxReqNum = 512;
-  static constexpr int kMaxRecallNum = 4096;
+  static constexpr int kMaxRecallNum = 16384;
 
  private:
   class RerankScope {

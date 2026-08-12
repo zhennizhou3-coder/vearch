@@ -80,6 +80,8 @@ class GammaIndexBinaryIVF : public IndexModel, faiss::IndexBinaryIVF {
 
   virtual ~GammaIndexBinaryIVF();
 
+  bool IsTrained() const override { return is_trained; }
+
   Status Init(const std::string &model_parameters,
               int training_threshold) override;
 
