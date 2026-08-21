@@ -13,12 +13,19 @@
 
 size_t IndexModel::ComputeIVFTrainingNum(size_t nlist) const {
   size_t num;
-  if ((size_t)training_threshold_ < nlist * vearch::min_points_per_centroid) {
-    num = nlist * vearch::min_points_per_centroid;
+  if ((size_t)training_threshold_ < nlist) {
+    // Fewer training points than centroids: k-means cannot run. Return 0 so
+    // GetTrainingVectors rejects it and the index is left unbuilt.
+    LOG(ERROR) << "training_threshold[" << training_threshold_
+               << "] < ncentroids[" << nlist << "], cannot train index.";
+    return 0;
+  } else if ((size_t)training_threshold_ <
+             nlist * vearch::min_points_per_centroid) {
+    num = (size_t)training_threshold_;
     LOG(WARNING) << "training_threshold[" << training_threshold_
                  << "] < ncentroids[" << nlist << "] * "
-                 << vearch::min_points_per_centroid
-                 << ", clamped up to " << num << ".";
+                 << vearch::min_points_per_centroid << ", training on " << num
+                 << " vectors, index quality may be lower.";
   } else if ((size_t)training_threshold_ <=
              nlist * vearch::max_points_per_centroid) {
     num = (size_t)training_threshold_;
@@ -26,8 +33,8 @@ size_t IndexModel::ComputeIVFTrainingNum(size_t nlist) const {
     num = nlist * vearch::max_points_per_centroid;
     LOG(WARNING) << "training_threshold[" << training_threshold_
                  << "] > ncentroids[" << nlist << "] * "
-                 << vearch::max_points_per_centroid
-                 << ", clamped down to " << num << ".";
+                 << vearch::max_points_per_centroid << ", clamped down to "
+                 << num << ".";
   }
   return num;
 }

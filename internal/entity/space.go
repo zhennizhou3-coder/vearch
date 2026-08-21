@@ -728,7 +728,7 @@ func ValidateIndexes(indexes []*Index, props map[string]*SpaceProperties) error 
 			}
 			if p.TrainingThreshold != 0 && p.TrainingThreshold < required {
 				return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
-					fmt.Errorf("indexes[%d] name[%s] type[%s]: training_threshold[%d] should be >= max(%d, ncentroids[%d]*%d) = %d",
+					fmt.Errorf("indexes[%d] name[%s] type[%s]: training_threshold[%d] should be greater than or equal to max(%d, ncentroids[%d]*%d) = %d",
 						i, idx.Name, idx.Type, p.TrainingThreshold, MinTrainingThreshold, p.Ncentroids, DefaultMinPointsPerCentroid, required))
 			}
 		}
