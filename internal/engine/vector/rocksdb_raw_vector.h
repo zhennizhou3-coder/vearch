@@ -53,6 +53,12 @@ class RocksDBRawVector : public RawVector {
                 bool &deletable) const override;
 
  private:
+  // Snapshot-aware batch fetch, used only by SampleTrainingVectors so the
+  // sampled vids cannot be reclaimed between sampling and fetching. Gets()
+  // forwards here with snap=nullptr.
+  int GetsWithSnapshot(const std::vector<int64_t> &vids, ScopeVectors &vecs,
+                       const rocksdb::Snapshot *snap) const;
+
   rocksdb::BlockBasedTableOptions table_options_;
   size_t block_cache_size_;
 };

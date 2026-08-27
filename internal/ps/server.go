@@ -26,6 +26,7 @@ import (
 	"github.com/cubefs/cubefs/depends/tiglabs/raft"
 	"github.com/vearch/vearch/v3/internal/client"
 	"github.com/vearch/vearch/v3/internal/config"
+	"github.com/vearch/vearch/v3/internal/engine/sdk/go/gamma"
 	"github.com/vearch/vearch/v3/internal/entity"
 	"github.com/vearch/vearch/v3/internal/entity/request"
 	"github.com/vearch/vearch/v3/internal/monitor"
@@ -174,6 +175,10 @@ func (s *Server) Start() error {
 
 	ExportToRpcHandler(s)
 	ExportToRpcAdminHandler(s)
+
+	monitor.RegisterEngineMetricsProvider(func() string {
+		return gamma.GetEngineMetrics(nil)
+	})
 
 	log.Info("ps server successfully started...")
 

@@ -479,7 +479,11 @@ long GammaIndexDiskANNStatic::GetTotalMemBytes() {
   return mem;
 }
 
-Status GammaIndexDiskANNStatic::Dump(const std::string &dir) {
+Status GammaIndexDiskANNStatic::Dump(const std::string &path,
+                                     bool training_only) {
+  if (training_only) {
+    return Status::NotSupported("DiskANN has no separable training artifacts");
+  }
   if (!disk_index_ready_) {
     std::string msg = "DiskANN static index not built, dump failed";
     LOG(ERROR) << msg;
@@ -487,7 +491,7 @@ Status GammaIndexDiskANNStatic::Dump(const std::string &dir) {
   }
 
   std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string dump_dir = dir + "/" + index_name;
+  std::string dump_dir = path + "/" + index_name;
   utils::make_dir(dump_dir.c_str());
 
   std::string meta_file = dump_dir + "/" + DiskANNStaticMetaFile;
@@ -507,10 +511,13 @@ Status GammaIndexDiskANNStatic::Dump(const std::string &dir) {
   return Status::OK();
 }
 
-Status GammaIndexDiskANNStatic::Load(const std::string &dir,
-                                   int64_t &load_num) {
+Status GammaIndexDiskANNStatic::Load(const std::string &path, bool training_only,
+                                     int64_t &load_num) {
+  if (training_only) {
+    return Status::NotSupported("DiskANN has no separable training artifacts");
+  }
   std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string load_dir = dir + "/" + index_name;
+  std::string load_dir = path + "/" + index_name;
   std::string meta_file = load_dir + "/" + DiskANNStaticMetaFile;
 
   std::ifstream fin(meta_file, std::ios::binary);

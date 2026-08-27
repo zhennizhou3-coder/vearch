@@ -77,6 +77,7 @@ func Register(masterClient *client.Client, etcdServer *etcdserver.EtcdServer, mo
 	once.Do(func() {
 		collector = newMetricCollector(masterClient, etcdServer)
 		metricRegistry.MustRegister(collector)
+		metricRegistry.MustRegister(&engineMetricsCollector{})
 
 		http.Handle("/metrics", promhttp.HandlerFor(
 			prometheus.Gatherers{metricRegistry, prometheus.DefaultGatherer},
@@ -157,7 +158,7 @@ func DataNodeProfiler(key string, startTime time.Time, code int, ip string, node
 }
 
 func newMetricCollector(masterClient *client.Client, etcdServer *etcdserver.EtcdServer) *MonitorService {
-	return &MonitorService{
+	ms := &MonitorService{
 		masterClient: masterClient,
 		etcdServer:   etcdServer,
 
@@ -303,6 +304,8 @@ func newMetricCollector(masterClient *client.Client, etcdServer *etcdserver.Etcd
 			[]string{"node_type", "instance"},
 		),
 	}
+
+	return ms
 }
 
 func (ms *MonitorService) Describe(ch chan<- *prometheus.Desc) {

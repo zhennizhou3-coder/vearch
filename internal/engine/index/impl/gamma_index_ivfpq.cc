@@ -299,7 +299,8 @@ int GammaIVFPQIndex::Indexing() {
     return 0;
   }
 
-  size_t num = ComputeIVFTrainingNum(nlist);
+  int64_t num = ComputeIVFTrainingNum(nlist);
+  if (num <= 0) return num;
 
   std::unique_ptr<const uint8_t[]> train_data;
   size_t num_got = 0;
@@ -964,21 +965,35 @@ std::string IVFPQToString(const faiss::IndexIVFPQ *ivpq,
   return ss.str();
 }
 
-Status GammaIVFPQIndex::Dump(const std::string &dir) {
+// Dump merges the full dump and the training-artifacts dump: both write the
+// same training artifacts (magic "IwPQ" + IVF header + PQ codebook + optional
+// OPQ); the full dump then appends the inverted lists. Because the magic is
+// identical, a training-artifacts file is a byte-for-byte prefix of a full
+// dump. `training_only == false`: `path` is a directory and the file is
+// dir/<AbsoluteName>/ivfpq.index. `training_only == true`: `path` is the exact
+// output file and the inverted lists are skipped.
+Status GammaIVFPQIndex::Dump(const std::string &path, bool training_only) {
   if (!this->is_trained) {
     LOG(INFO) << "gamma index is not trained, skip dumping";
     return Status::OK();
   }
-  std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_dir = dir + "/" + index_name;
-  if (utils::make_dir(index_dir.c_str())) {
-    std::string msg = std::string("mkdir error, index dir=") + index_dir;
-    return Status::IOError(msg);
+
+  std::string index_file;
+  if (training_only) {
+    index_file = path;
+  } else {
+    std::string index_name = vector_->MetaInfo()->AbsoluteName();
+    std::string index_dir = path + "/" + index_name;
+    if (utils::make_dir(index_dir.c_str())) {
+      std::string msg = std::string("mkdir error, index dir=") + index_dir;
+      return Status::IOError(msg);
+    }
+    index_file = index_dir + "/ivfpq.index";
   }
 
-  std::string index_file = index_dir + "/ivfpq.index";
   faiss::IOWriter *f = new FileIOWriter(index_file.c_str());
   utils::ScopeDeleter1<FileIOWriter> del((FileIOWriter *)f);
+
   const IndexIVFPQ *ivpq = static_cast<const IndexIVFPQ *>(this);
   uint32_t h = faiss::fourcc("IwPQ");
   WRITE1(h);
@@ -986,36 +1001,55 @@ Status GammaIVFPQIndex::Dump(const std::string &dir) {
   WRITE1(ivpq->by_residual);
   WRITE1(ivpq->code_size);
   vearch::write_product_quantizer(&ivpq->pq, f);
-
   if (opq_ != nullptr) write_opq(opq_, f);
 
-  if (WriteInvertedLists(f, rt_invert_index_ptr_)) {
-    std::string msg =
-        std::string("write invert list error, index name=") + index_name;
-    LOG(ERROR) << msg;
-    return Status::IndexError(msg);
+  if (!training_only) {
+    if (WriteInvertedLists(f, rt_invert_index_ptr_)) {
+      std::string msg = std::string("write invert list error, index name=") +
+                        vector_->MetaInfo()->AbsoluteName();
+      LOG(ERROR) << msg;
+      return Status::IndexError(msg);
+    }
   }
 
-  LOG(INFO) << "dump:" << IVFPQToString(ivpq, opq_)
+  LOG(INFO) << (training_only ? "dump training artifacts:" : "dump:")
+            << IVFPQToString(ivpq, opq_)
             << ", indexed count=" << indexed_vec_count_;
   return Status::OK();
 }
 
-Status GammaIVFPQIndex::Load(const std::string &index_dir, int64_t &load_num) {
-  std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_file = index_dir + "/" + index_name + "/ivfpq.index";
-  if (!utils::file_exist(index_file)) {
-    LOG(INFO) << index_file << " isn't existed, skip loading";
-    return Status::OK();  // it should train again after load
+// Load merges the full load and the training-artifacts load (inverse of Dump):
+// both read the training artifacts; the full load then reads the inverted
+// lists, while the training-only load leaves indexed_vec_count_ at 0 so backfill
+// rebuilds the inverted lists after swap-in.
+Status GammaIVFPQIndex::Load(const std::string &path, bool training_only,
+                             int64_t &load_num) {
+  std::string index_file;
+  if (training_only) {
+    index_file = path;
+    if (!utils::file_exist(index_file)) {
+      return Status::IOError("Load training artifacts: file not found: " +
+                             index_file);
+    }
+  } else {
+    std::string index_name = vector_->MetaInfo()->AbsoluteName();
+    index_file = path + "/" + index_name + "/ivfpq.index";
+    if (!utils::file_exist(index_file)) {
+      LOG(INFO) << index_file << " isn't existed, skip loading";
+      return Status::OK();  // it should train again after load
+    }
   }
 
   faiss::IOReader *f = new FileIOReader(index_file.c_str());
   utils::ScopeDeleter1<FileIOReader> del((FileIOReader *)f);
+
   uint32_t h;
   READ1(h);
-  assert(h == faiss::fourcc("IwPQ"));
+  if (h != faiss::fourcc("IwPQ")) {
+    return Status::IOError("bad magic for IVFPQ index");
+  }
   IndexIVFPQ *ivpq = static_cast<IndexIVFPQ *>(this);
-  vearch::read_ivf_header(ivpq, f, nullptr);  // not legacy
+  vearch::read_ivf_header(ivpq, f, nullptr);  // ivf->quantizer = read_index(f)
   READ1(ivpq->by_residual);
   READ1(ivpq->code_size);
   vearch::read_product_quantizer(&ivpq->pq, f);
@@ -1030,26 +1064,37 @@ Status GammaIVFPQIndex::Load(const std::string &index_dir, int64_t &load_num) {
     read_opq(opq_, f);
   }
 
+  if (training_only) {
+    // No inverted lists: recompute the (unstored) PQ table and set the metric.
+    // indexed_vec_count_ stays 0; backfill rebuilds the inverted lists.
+    ivpq->use_precomputed_table = 0;
+    if (ivpq->by_residual) ivpq->precompute_table();
+    if (ivpq->metric_type == faiss::METRIC_INNER_PRODUCT) {
+      metric_type_ = DistanceComputeType::INNER_PRODUCT;
+    } else {
+      metric_type_ = DistanceComputeType::L2;
+    }
+    indexed_vec_count_ = 0;
+    load_num = 0;
+    assert(this->is_trained);
+    LOG(INFO) << "load training artifacts: " << IVFPQToString(ivpq, opq_);
+    return Status::OK();
+  }
+
   Status status =
       ReadInvertedLists(f, rt_invert_index_ptr_, indexed_vec_count_);
   if (status.code() == status::kIndexError) {
     indexed_vec_count_ = 0;
     LOG(INFO) << "unsupported inverted list format, it need rebuilding!";
   } else if (status.ok()) {
-    // if (indexed_vec_count_ < 0 ||
-    //     indexed_vec_count_ > (int)vector_->MetaInfo()->size_) {
-    //   LOG(ERROR) << "invalid indexed count [" << indexed_vec_count_
-    //              << "] vector size [" << vector_->MetaInfo()->size_ << "]";
-    //   return INTERNAL_ERR;
-    // }
     // precomputed table not stored. It is cheaper to recompute it
     ivpq->use_precomputed_table = 0;
     if (ivpq->by_residual) ivpq->precompute_table();
     LOG(INFO) << "load: " << IVFPQToString(ivpq, opq_)
               << ", indexed vector count=" << indexed_vec_count_;
   } else {
-    std::string msg =
-        std::string("read invert list error, index name=") + index_name;
+    std::string msg = std::string("read invert list error, index name=") +
+                      vector_->MetaInfo()->AbsoluteName();
     LOG(ERROR) << msg;
     return Status::IOError(msg);
   }

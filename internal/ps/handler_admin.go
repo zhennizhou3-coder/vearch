@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -83,6 +84,7 @@ func ExportToRpcAdminHandler(server *Server) {
 		{client.DeleteBackupHandler, &DeleteBackupHandler{server: server}, false},
 		{client.RebuildStatusHandler, &RebuildStatusHandler{server: server}, false},
 		{client.RebuildIndexHandler, &RebuildIndexHandler{server: server}, false},
+		{client.PullTrainingArtifactsHandler, &PullTrainingArtifactsHandler{server: server}, false},
 	}
 
 	for _, h := range handlers {
@@ -1407,7 +1409,8 @@ func (rih *RebuildIndexHandler) Execute(ctx context.Context, req *vearchpb.Parti
 	rebuildMgr := rih.server.GetRebuildManager()
 
 	if err := rebuildMgr.StartRebuildTask(dbName, spaceName, param.IndexName, idx.FieldName, idx.Type,
-		uint32(pid), param.DropBefore, param.LimitCPU, param.Describe); err != nil {
+		uint32(pid), param.DropBefore, param.LimitCPU, param.Describe,
+		param.RoundID, param.IsTrainer, param.TrainerAddr); err != nil {
 		log.Error("Failed to start rebuild task: dbName=%s, spaceName=%s, indexName=%s, pid=%d: %v",
 			dbName, spaceName, param.IndexName, pid, err)
 		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, err)
@@ -1457,5 +1460,109 @@ func (rsh *RebuildStatusHandler) Execute(ctx context.Context, req *vearchpb.Part
 	}
 
 	log.Info("Returning rebuild status response: exists=%v, status=%d, errorMsg=%s, progress=%d%%", exists, status, errorMsg, progress)
+	return nil
+}
+
+// defaultTrainingArtifactsChunkSize is the fallback pull chunk size (10MB, matching
+// the snapshot buf_size convention) when config.PS.RebuildTrainingArtifactsChunkSize
+// is unset.
+const defaultTrainingArtifactsChunkSize = 10 << 20
+
+// trainingArtifactsChunkSize returns the configured pull chunk size, or the 10MB
+// default when unset.
+func trainingArtifactsChunkSize() int {
+	if n := config.Conf().PS.RebuildTrainingArtifactsChunkSize; n > 0 {
+		return n
+	}
+	return defaultTrainingArtifactsChunkSize
+}
+
+// trainingArtifactsPaths resolves the training-artifacts file + `.meta` sidecar for
+// (pid, indexName) via the partition's data path. The files are produced by the
+// trainer / installed by a follower (rebuild_training_artifacts.go); this handler
+// only reads them.
+func trainingArtifactsPaths(server *Server, pid entity.PartitionID, indexName string) (modelPath, metaPath string, err error) {
+	store := server.GetPartition(pid)
+	if store == nil {
+		return "", "", fmt.Errorf("partition %d not found", pid)
+	}
+	modelPath, metaPath = trainingArtifactsPathsAt(store.GetPartition().Path, indexName)
+	return modelPath, metaPath, nil
+}
+
+// readTrainingArtifactsChunk reads up to size bytes at offset from path. A short read
+// at EOF returns the partial tail (io.EOF is not treated as an error here).
+func readTrainingArtifactsChunk(path string, offset int64, size int) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, size)
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+// PullTrainingArtifactsHandler serves training artifacts to followers.
+// It is stateless and idempotent: each request is one independent pread, so
+// the follower drives progress. Offset<0 returns the stat (TrainingArtifactsMeta);
+// Offset>=0 returns the raw model chunk starting at that byte offset.
+type PullTrainingArtifactsHandler struct {
+	server *Server
+}
+
+func (h *PullTrainingArtifactsHandler) Execute(ctx context.Context, req *vearchpb.PartitionData, reply *vearchpb.PartitionData) error {
+	reply.Err = &vearchpb.Error{Code: vearchpb.ErrorEnum_SUCCESS}
+
+	r := new(entity.PullTrainingArtifactsReq)
+	if err := json.Unmarshal(req.Data, r); err != nil {
+		return vearchpb.NewError(vearchpb.ErrorEnum_RPC_PARAM_ERROR, err)
+	}
+
+	modelPath, metaPath, err := trainingArtifactsPaths(h.server, r.PartitionID, r.IndexName)
+	if err != nil {
+		return vearchpb.NewError(vearchpb.ErrorEnum_PARTITION_NOT_EXIST, err)
+	}
+
+	// The `.meta` sidecar is the "model ready for this round" commit marker
+	// (written atomically after the model bytes). Reading it yields round/size/hash.
+	metaBytes, err := os.ReadFile(metaPath)
+	if err != nil {
+		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR,
+			fmt.Errorf("training artifacts meta not ready pid=%d index=%s: %v",
+				r.PartitionID, r.IndexName, err))
+	}
+	meta := new(entity.TrainingArtifactsMeta)
+	if err := json.Unmarshal(metaBytes, meta); err != nil {
+		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, err)
+	}
+
+	// Round check: refuse to serve a round this trainer no longer holds (e.g. a
+	// stale/retried pull after the fixed-path model was overwritten by a newer
+	// round). PARAM_ERROR + a distinct message identifies it without a dedicated
+	// error code; the follower treats any non-SUCCESS reply as a pull failure.
+	if meta.RoundID != r.RoundID {
+		return vearchpb.NewError(vearchpb.ErrorEnum_PARAM_ERROR,
+			fmt.Errorf("training artifacts round mismatch pid=%d index=%s: have %q, want %q",
+				r.PartitionID, r.IndexName, meta.RoundID, r.RoundID))
+	}
+
+	if r.Offset < 0 { // stat
+		reply.Data, err = json.Marshal(meta)
+		if err != nil {
+			return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, err)
+		}
+		return nil
+	}
+
+	// Chunk: raw bytes [Offset, Offset+chunkSize).
+	chunk, err := readTrainingArtifactsChunk(modelPath, r.Offset, trainingArtifactsChunkSize())
+	if err != nil {
+		return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, err)
+	}
+	reply.Data = chunk
 	return nil
 }

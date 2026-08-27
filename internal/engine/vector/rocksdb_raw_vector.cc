@@ -110,11 +110,17 @@ int RocksDBRawVector::GetVector(int64_t vid, const uint8_t *&vec,
 
 int RocksDBRawVector::Gets(const std::vector<int64_t> &vids,
                            ScopeVectors &vecs) const {
+  return GetsWithSnapshot(vids, vecs, nullptr);
+}
+
+int RocksDBRawVector::GetsWithSnapshot(const std::vector<int64_t> &vids,
+                                       ScopeVectors &vecs,
+                                       const rocksdb::Snapshot *snap) const {
   size_t k = vids.size();
 
   std::vector<std::string> values(k);
   std::vector<rocksdb::Status> statuses =
-      storage_mgr_->MultiGet(cf_id_, vids, values);
+      storage_mgr_->MultiGet(cf_id_, vids, values, snap);
   if (statuses.size() != k) {
     LOG(ERROR) << desc_
                << "rocksdb multiget error: statuses size=" << statuses.size()
@@ -198,6 +204,19 @@ int RocksDBRawVector::SampleTrainingVectors(const size_t num,
                                              ScopeVectors &vecs,
                                              size_t &num_got,
                                              size_t &valid_count) {
+  // RAII owner of the RocksDB snapshot: acquires on construction, releases on
+  // every exit path, and must not outlive this function.
+  struct SnapshotGuard {
+    StorageManager *mgr;
+    const rocksdb::Snapshot *snap;
+    explicit SnapshotGuard(StorageManager *m) : mgr(m), snap(m->GetSnapshot()) {}
+    ~SnapshotGuard() { mgr->ReleaseSnapshot(snap); }
+  };
+  // Snapshot must be taken BEFORE sampling: DeleteDocid sets the bitmap before
+  // deleting the row, and sampling skips bitmap-deleted vids, so every sampled
+  // vid is still visible in this snapshot and MultiGet cannot miss.
+  SnapshotGuard snap_guard{storage_mgr_};
+
   // Reservoir sampling lives in the base class (shared with Memory).
   std::vector<int64_t> reservoir;
   if (SampleTrainingVectorIds(num, reservoir, valid_count) != 0) {
@@ -213,7 +232,7 @@ int RocksDBRawVector::SampleTrainingVectors(const size_t num,
   // * num_got, still bounded by the per-index training threshold (typical
   // IVF ~ ncentroids * 256, tens of MB).
   ScopeVectors scope_vecs;
-  if (Gets(reservoir, scope_vecs)) {
+  if (GetsWithSnapshot(reservoir, scope_vecs, snap_guard.snap)) {
     LOG(ERROR) << desc_ << "RocksDB MultiGet failed for training vectors";
     return -2;
   }

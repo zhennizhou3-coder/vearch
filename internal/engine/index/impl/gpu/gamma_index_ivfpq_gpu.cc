@@ -8,6 +8,7 @@
 #include "gamma_index_ivfpq_gpu.h"
 
 #include <faiss/IndexFlat.h>
+#include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexShards.h>
 #include <faiss/gpu/GpuAutoTune.h>
 #include <faiss/gpu/GpuClonerOptions.h>
@@ -15,8 +16,11 @@
 #include <faiss/gpu/StandardGpuResources.h>
 #include <faiss/gpu/impl/IndexUtils.h>
 #include <faiss/gpu/utils/DeviceUtils.h>
+#include <faiss/invlists/InvertedLists.h>
 #include <faiss/utils/Heap.h>
 #include <faiss/utils/utils.h>
+
+#include "index/index_io.h"
 
 #include <algorithm>
 #include <chrono>
@@ -327,7 +331,8 @@ int GammaIVFPQGPUIndex::Indexing() {
   if (!is_trained_) {
     gpu_index_ = CreateGPUIndex();
     {
-      size_t num = ComputeIVFTrainingNum(nlist_);
+      int64_t num = ComputeIVFTrainingNum(nlist_);
+      if (num <= 0) return num;
 
       std::unique_ptr<const uint8_t[]> train_data;
       size_t num_got = 0;
@@ -546,6 +551,116 @@ int GammaIVFPQGPUIndex::GetNprobe(IVFPQGPURetrievalParameters *params,
                  << default_nprobe;
     return default_nprobe;
   }
+}
+
+// Dump: GPU keeps no full on-disk dump (base class Dump is a no-op), so the full
+// path returns OK; training_only bridges shard0's GpuIndexIVFPQ → host
+// faiss::IndexIVFPQ via copyTo, then writes the coarse centroids + PQ codebook
+// (write_ivf_header + write_product_quantizer), skipping the inverted lists. GPU
+// IVFPQ has nbits fixed at 8 and no OPQ. Magic "IgPm".
+Status GammaIVFPQGPUIndex::Dump(const std::string &path, bool training_only) {
+  if (!training_only) return Status::OK();
+  std::shared_lock<std::shared_mutex> lock(gpu_index_mutex_);
+  if (!is_trained_ || gpu_index_ == nullptr) {
+    LOG(INFO) << "gamma index is not trained, skip dumping training artifacts";
+    return Status::OK();
+  }
+  auto shards = dynamic_cast<faiss::IndexShards *>(gpu_index_);
+  if (shards == nullptr || shards->count() == 0) {
+    return Status::IOError("gpu_index_ is not a non-empty IndexShards");
+  }
+  auto gpu_ivfpq = dynamic_cast<faiss::gpu::GpuIndexIVFPQ *>(shards->at(0));
+  if (gpu_ivfpq == nullptr) {
+    return Status::IOError("shard0 is not a GpuIndexIVFPQ");
+  }
+
+  faiss::IndexIVFPQ host;
+  try {
+    gpu_ivfpq->copyTo(&host);  // GPU→host DMA
+  } catch (const std::exception &e) {
+    LOG(ERROR) << "GpuIndexIVFPQ copyTo failed: " << e.what();
+    return Status::IOError(std::string("dump training artifacts failed: ") + e.what());
+  }
+
+  faiss::IOWriter *f = new FileIOWriter(path.c_str());
+  utils::ScopeDeleter1<FileIOWriter> del((FileIOWriter *)f);
+  uint32_t h = faiss::fourcc("IgPm");
+  WRITE1(h);
+  vearch::write_ivf_header(&host, f);
+  WRITE1(host.by_residual);
+  WRITE1(host.code_size);
+  vearch::write_product_quantizer(&host.pq, f);
+  // ← no OPQ (GPU IVFPQ has none), no WriteInvertedLists.
+  LOG(INFO) << "dump training artifacts: nlist=" << host.nlist << ", d=" << host.d
+            << ", pq.M=" << host.pq.M;
+  return Status::OK();
+}
+
+// Load: full load is a no-op (mirror base); training_only reads centroids + PQ
+// codebook into a host faiss::IndexIVFPQ, gives it an empty (but valid)
+// inverted-list layout + precomputed table, then rebuilds gpu_index_ and
+// copyFrom the trained-but-empty host index into every shard. indexed_count_/
+// load_num stay 0; backfill re-adds vectors after swap-in.
+Status GammaIVFPQGPUIndex::Load(const std::string &path, bool training_only,
+                                int64_t &load_num) {
+  if (!training_only) {
+    load_num = 0;
+    return Status::OK();
+  }
+  if (!utils::file_exist(path)) {
+    return Status::IOError("Load training artifacts: file not found: " + path);
+  }
+  faiss::IOReader *f = new FileIOReader(path.c_str());
+  utils::ScopeDeleter1<FileIOReader> del((FileIOReader *)f);
+  uint32_t h;
+  READ1(h);
+  if (h != faiss::fourcc("IgPm")) {
+    return Status::IOError("bad magic for GPU IVFPQ training artifacts");
+  }
+  faiss::IndexIVFPQ host;
+  vearch::read_ivf_header(&host, f, nullptr);
+  READ1(host.by_residual);
+  READ1(host.code_size);
+  vearch::read_product_quantizer(&host.pq, f);
+  // Finalize an EMPTY, valid IVFPQ so copyFrom sees a trained index with zero
+  // vectors: empty inverted lists + recomputed table (not stored, cheaper to
+  // recompute; mirror the CPU IVFPQ Load path).
+  host.ntotal = 0;
+  host.own_invlists = true;
+  host.replace_invlists(
+      new faiss::ArrayInvertedLists(host.nlist, host.code_size), true);
+  host.use_precomputed_table = 0;
+  if (host.by_residual) host.precompute_table();
+  host.is_trained = true;
+
+  std::unique_lock<std::shared_mutex> lock(gpu_index_mutex_);
+  delete gpu_index_;
+  gpu_index_ = CreateGPUIndex();
+  auto shards = dynamic_cast<faiss::IndexShards *>(gpu_index_);
+  if (shards == nullptr) {
+    return Status::IOError("gpu_index_ is not an IndexShards after create");
+  }
+  try {
+    for (int i = 0; i < shards->count(); ++i) {
+      auto gpu_ivfpq = dynamic_cast<faiss::gpu::GpuIndexIVFPQ *>(shards->at(i));
+      if (gpu_ivfpq == nullptr) {
+        return Status::IOError("shard is not a GpuIndexIVFPQ");
+      }
+      gpu_ivfpq->copyFrom(&host);  // host→GPU: trained quantizer + codebook
+    }
+  } catch (const std::exception &e) {
+    LOG(ERROR) << "GpuIndexIVFPQ copyFrom failed: " << e.what();
+    return Status::IOError(std::string("load training artifacts failed: ") + e.what());
+  }
+  is_trained_ = true;
+  indexed_count_ = 0;  // no vectors yet; backfill rebuilds them
+  load_num = 0;
+  if (gpu_threads_.size() == 0) {
+    CreateSearchThread();
+  }
+  LOG(INFO) << "load training artifacts: nlist=" << host.nlist << ", d=" << host.d
+            << ", pq.M=" << host.pq.M;
+  return Status::OK();
 }
 
 }  // namespace gpu

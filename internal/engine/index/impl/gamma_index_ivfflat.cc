@@ -345,7 +345,8 @@ int GammaIVFFlatIndex::Indexing() {
     return 0;
   }
 
-  size_t num = ComputeIVFTrainingNum(nlist);
+  int64_t num = ComputeIVFTrainingNum(nlist);
+  if (num <= 0) return num;
 
   std::unique_ptr<const uint8_t[]> train_data;
   size_t num_got = 0;
@@ -750,55 +751,86 @@ std::string IVFFlatToString(const faiss::IndexIVFFlat *ivfl) {
   return ss.str();
 }
 
-Status GammaIVFFlatIndex::Dump(const std::string &dir) {
+// Dump merges the full dump and the training-artifacts dump. IVFFLAT stores raw
+// floats in its inverted lists and has no codebook, so the only trained artifact
+// is the coarse-quantizer centroids (write_ivf_header). Distinct magic per mode
+// ("IvFm" training-only vs "IvFl" full), so a training-artifacts file is NOT a
+// prefix of a full dump. `training_only == false`: `path` is a directory;
+// `training_only == true`: `path` is the exact output file.
+Status GammaIVFFlatIndex::Dump(const std::string &path, bool training_only) {
   if (!this->is_trained) {
     LOG(INFO) << "gamma index is not trained, skip dumping";
     return Status::OK();
   }
-  std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_dir = dir + "/" + index_name;
-  if (utils::make_dir(index_dir.c_str())) {
-    std::string msg = std::string("mkdir error, index dir=") + index_dir;
-    LOG(ERROR) << msg;
-    return Status::PathNotFound(msg);
+
+  std::string index_file;
+  if (training_only) {
+    index_file = path;
+  } else {
+    std::string index_name = vector_->MetaInfo()->AbsoluteName();
+    std::string index_dir = path + "/" + index_name;
+    if (utils::make_dir(index_dir.c_str())) {
+      std::string msg = std::string("mkdir error, index dir=") + index_dir;
+      LOG(ERROR) << msg;
+      return Status::PathNotFound(msg);
+    }
+    index_file = index_dir + "/ivfflat.index";
   }
 
-  std::string index_file = index_dir + "/ivfflat.index";
   faiss::IOWriter *f = new FileIOWriter(index_file.c_str());
   utils::ScopeDeleter1<FileIOWriter> del((FileIOWriter *)f);
   const IndexIVFFlat *ivfl = static_cast<const IndexIVFFlat *>(this);
-  uint32_t h = faiss::fourcc("IvFl");
+  uint32_t h = faiss::fourcc(training_only ? "IvFm" : "IvFl");
   WRITE1(h);
   vearch::write_ivf_header(ivfl, f);
 
-  int indexed_count = indexed_vec_count_;
-  if (WriteInvertedLists(f, rt_invert_index_ptr_)) {
-    std::string msg =
-        std::string("write invert list error, index name=") + index_name;
-    LOG(ERROR) << msg;
-    return Status::IOError(msg);
+  if (!training_only) {
+    int indexed_count = indexed_vec_count_;
+    if (WriteInvertedLists(f, rt_invert_index_ptr_)) {
+      std::string msg = std::string("write invert list error, index name=") +
+                        vector_->MetaInfo()->AbsoluteName();
+      LOG(ERROR) << msg;
+      return Status::IOError(msg);
+    }
+    WRITE1(indexed_count);
   }
-  WRITE1(indexed_count);
 
-  LOG(INFO) << "dump:" << IVFFlatToString(ivfl)
-            << ", indexed count=" << indexed_count;
+  LOG(INFO) << (training_only ? "dump training artifacts:" : "dump:")
+            << IVFFlatToString(ivfl)
+            << ", indexed count=" << indexed_vec_count_;
   return Status::OK();
-};
+}
 
-Status GammaIVFFlatIndex::Load(const std::string &dir, int64_t &load_num) {
-  std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_file = dir + "/" + index_name + "/ivfflat.index";
-  if (!utils::file_exist(index_file)) {
-    LOG(INFO) << index_file << " isn't existed, skip loading";
-    load_num = 0;
-    return Status::OK();  // it should train again after load
+// Load merges the full load and the training-artifacts load (inverse of Dump):
+// both read centroids; the full load then reads the inverted lists + indexed
+// count, while the training-only load leaves indexed_vec_count_ at 0 so backfill
+// rebuilds the inverted lists after swap-in.
+Status GammaIVFFlatIndex::Load(const std::string &path, bool training_only,
+                               int64_t &load_num) {
+  std::string index_file;
+  if (training_only) {
+    index_file = path;
+    if (!utils::file_exist(index_file)) {
+      return Status::IOError("Load training artifacts: file not found: " +
+                             index_file);
+    }
+  } else {
+    std::string index_name = vector_->MetaInfo()->AbsoluteName();
+    index_file = path + "/" + index_name + "/ivfflat.index";
+    if (!utils::file_exist(index_file)) {
+      LOG(INFO) << index_file << " isn't existed, skip loading";
+      load_num = 0;
+      return Status::OK();  // it should train again after load
+    }
   }
 
   faiss::IOReader *f = new FileIOReader(index_file.c_str());
   utils::ScopeDeleter1<FileIOReader> del((FileIOReader *)f);
   uint32_t h;
   READ1(h);
-  assert(h == faiss::fourcc("IvFl"));
+  if (h != faiss::fourcc(training_only ? "IvFm" : "IvFl")) {
+    return Status::IOError("bad magic for IVFFLAT index");
+  }
   IndexIVFFlat *ivfl = static_cast<IndexIVFFlat *>(this);
   vearch::read_ivf_header(ivfl, f, nullptr);  // not legacy
 
@@ -807,6 +839,19 @@ Status GammaIVFFlatIndex::Load(const std::string &dir, int64_t &load_num) {
   if (hnsw_flat) {
     hnsw_flat->hnsw.search_bounded_queue = false;
     quantizer_type_ = 1;
+  }
+
+  if (training_only) {
+    if (ivfl->metric_type == faiss::METRIC_INNER_PRODUCT) {
+      metric_type_ = DistanceComputeType::INNER_PRODUCT;
+    } else {
+      metric_type_ = DistanceComputeType::L2;
+    }
+    indexed_vec_count_ = 0;  // no inverted lists yet; backfill rebuilds them
+    load_num = 0;
+    assert(this->is_trained);
+    LOG(INFO) << "load training artifacts: " << IVFFlatToString(ivfl);
+    return Status::OK();
   }
 
   int64_t indexed_vec_count = 0;
@@ -827,15 +872,15 @@ Status GammaIVFFlatIndex::Load(const std::string &dir, int64_t &load_num) {
     LOG(INFO) << "load: " << IVFFlatToString(ivfl)
               << ", indexed vector count=" << indexed_vec_count_;
   } else {
-    std::string msg =
-        std::string("read invert list error, index name=") + index_name;
+    std::string msg = std::string("read invert list error, index name=") +
+                      vector_->MetaInfo()->AbsoluteName();
     LOG(ERROR) << msg;
     return Status::IndexError(msg);
   }
   assert(this->is_trained);
   load_num = indexed_vec_count_;
   return Status::OK();
-};
+}
 
 faiss::InvertedListScanner *GammaIVFFlatIndex::GetGammaInvertedListScanner(
   bool store_pairs,

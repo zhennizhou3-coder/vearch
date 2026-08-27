@@ -392,18 +392,18 @@ Status StorageManager::GetString(int cf_id, int64_t id, std::string &field_name,
 
 std::vector<rocksdb::Status> StorageManager::MultiGet(
     int cf_id, const std::vector<int64_t> &vids,
-    std::vector<std::string> &values) {
+    std::vector<std::string> &values, const rocksdb::Snapshot *snap) {
   size_t k = vids.size();
   std::vector<std::string> keys_data(k);
   for (size_t i = 0; i < k; i++) {
     keys_data[i] = utils::ToRowKey(vids[i]);
   }
-  return MultiGetByKeys(cf_id, keys_data, values);
+  return MultiGetByKeys(cf_id, keys_data, values, snap);
 }
 
 std::vector<rocksdb::Status> StorageManager::MultiGetByKeys(
     int cf_id, const std::vector<std::string> &keys,
-    std::vector<std::string> &values) {
+    std::vector<std::string> &values, const rocksdb::Snapshot *snap) {
   // Sorts keys by std::string operator< (bytewise) and passes
   // sorted_input=true to db_->MultiGet. This is correct only while the CF uses
   // the default BytewiseComparator; if a custom comparator is ever configured
@@ -427,6 +427,7 @@ std::vector<rocksdb::Status> StorageManager::MultiGetByKeys(
   std::vector<rocksdb::PinnableSlice> sorted_values(k);
   std::vector<rocksdb::Status> sorted_statuses(k);
   rocksdb::ReadOptions ro;
+  ro.snapshot = snap;
   db_->MultiGet(ro, cf_handles_[cf_id], k, sorted_keys.data(),
                 sorted_values.data(), sorted_statuses.data(),
                 true /*sorted_input*/);

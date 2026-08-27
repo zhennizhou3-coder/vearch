@@ -81,6 +81,21 @@ func GetEngineStatus(engine unsafe.Pointer) (status string) {
 	return string(buffer)
 }
 
+// GetEngineMetrics returns the engine-side Prometheus metrics as a text
+// exposition string.
+func GetEngineMetrics(engine unsafe.Pointer) string {
+	var CBuffer *C.char
+	zero := 0
+	length := &zero
+	C.GetEngineMetrics(engine, (**C.char)(unsafe.Pointer(&CBuffer)), (*C.int)(unsafe.Pointer(length)))
+	defer C.free(unsafe.Pointer(CBuffer))
+	if *length == 0 {
+		return ""
+	}
+	buffer := C.GoBytes(unsafe.Pointer(CBuffer), C.int(*length))
+	return string(buffer)
+}
+
 type MemoryInfo struct {
 	TableMem      int64 `json:"table_mem,omitempty"`
 	IndexMem      int64 `json:"index_mem,omitempty"`
@@ -145,15 +160,19 @@ func BuildIndex(engine unsafe.Pointer) int {
 	return int(C.BuildIndex(engine))
 }
 
-func RebuildIndex(engine unsafe.Pointer, indexName, fieldName, indexType string, dropBeforeRebuild int, limitCPU int, describe int) int {
+func RebuildIndex(engine unsafe.Pointer, indexName, fieldName, indexType string, dropBeforeRebuild int, limitCPU int, describe int, trainingArtifactsPath string, dumpArtifactsPath string) int {
 	cIndexName := C.CString(indexName)
 	defer C.free(unsafe.Pointer(cIndexName))
 	cFieldName := C.CString(fieldName)
 	defer C.free(unsafe.Pointer(cFieldName))
 	cIndexType := C.CString(indexType)
 	defer C.free(unsafe.Pointer(cIndexType))
+	cTrainingArtifactsPath := C.CString(trainingArtifactsPath)
+	defer C.free(unsafe.Pointer(cTrainingArtifactsPath))
+	cDumpArtifactsPath := C.CString(dumpArtifactsPath)
+	defer C.free(unsafe.Pointer(cDumpArtifactsPath))
 	return int(C.RebuildIndex(engine, cIndexName, cFieldName, cIndexType,
-		C.int(dropBeforeRebuild), C.int(limitCPU), C.int(describe)))
+		C.int(dropBeforeRebuild), C.int(limitCPU), C.int(describe), cTrainingArtifactsPath, cDumpArtifactsPath))
 }
 
 func Dump(engine unsafe.Pointer) int {

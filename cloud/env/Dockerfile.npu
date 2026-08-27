@@ -1,0 +1,109 @@
+ARG CANN_VERSION=9.0.0
+
+FROM openeuler/openeuler:22.03-lts AS builder
+
+ARG CANN_VERSION
+ARG CANN_TOOLKIT_SHA256=c6e4c1332209fc04d92c7dd36acdb422536d15628c47b35cfc9338bf4f6eb0ae
+
+WORKDIR /env
+
+COPY openEuler.repo /etc/yum.repos.d/openEuler.repo
+
+RUN dnf install -y wget make automake git which libzstd-devel openssl-devel \
+        tbb-devel boost-devel tar findutils gcc-c++ python3 python3-pip \
+        util-linux pciutils net-tools gzip diffutils \
+        blas-devel lapack-devel openblas-devel
+
+RUN pip3 install --no-cache-dir "cmake>=3.24" && \
+    ln -sf /usr/local/bin/cmake /usr/bin/cmake
+ENV PATH=/usr/local/bin:${PATH}
+
+ARG CANN_TOOLKIT_URL=http://storage.jd.local/storages/Ascend-cann-toolkit_${CANN_VERSION}_linux-aarch64.run
+ARG CANN_TOOLKIT_SHA256=c6e4c1332209fc04d92c7dd36acdb422536d15628c47b35cfc9338bf4f6eb0ae
+RUN mkdir -p /tmp/cann && cd /tmp/cann && \
+    wget -q "${CANN_TOOLKIT_URL}" -O Ascend-cann-toolkit.run && \
+    echo "${CANN_TOOLKIT_SHA256}  Ascend-cann-toolkit.run" | sha256sum -c - && \
+    chmod +x Ascend-cann-toolkit.run && \
+    ./Ascend-cann-toolkit.run --install --install-for-all --quiet && \
+    rm -rf /tmp/cann
+
+RUN CANN_DIR="$(ls -d /usr/local/Ascend/cann-* | head -1)" && \
+    ln -sfn "${CANN_DIR}" /usr/local/Ascend/cann
+
+ENV ASCEND_HOME=/usr/local/Ascend/cann
+ENV LD_LIBRARY_PATH=${ASCEND_HOME}/lib64
+ENV PATH=${ASCEND_HOME}/bin:${PATH}
+
+ARG CANN_OPS_URL=http://storage.jd.local/storages/Ascend-cann-A3-ops_${CANN_VERSION}_linux-aarch64.run
+ARG CANN_OPS_SHA256=7dd739563a4d0500d40d128353253829b178501f9106fb3af1fd4643758a22e3
+RUN mkdir -p /tmp/ops && cd /tmp/ops && \
+    wget -q "${CANN_OPS_URL}" -O Ascend-cann-ops.run && \
+    echo "${CANN_OPS_SHA256}  Ascend-cann-ops.run" | sha256sum -c - && \
+    chmod +x Ascend-cann-ops.run && \
+    ./Ascend-cann-ops.run --install --install-for-all --quiet && \
+    rm -rf /tmp/ops
+
+COPY install-dependencies.sh .
+RUN cd /env && bash install-dependencies.sh
+
+ARG MXINDEX_URL=http://storage.jd.local/storages/Ascend-mindxsdk-mxindex__linux-aarch64.run
+ARG MXINDEX_SHA256=27d53ab0b258532f74652b98ea7c5c9ffc383cdfa1464cd16eaaf5bd0716fa46
+RUN mkdir -p /tmp/mxindex && cd /tmp/mxindex && \
+    wget -q "${MXINDEX_URL}" -O Ascend-mindxsdk-mxindex.run && \
+    echo "${MXINDEX_SHA256}  Ascend-mindxsdk-mxindex.run" | sha256sum -c - && \
+    chmod +x Ascend-mindxsdk-mxindex.run && \
+    ./Ascend-mindxsdk-mxindex.run --install --install-path=/usr/local/Ascend --quiet && \
+    rm -rf /tmp/mxindex
+
+ENV LIBRARY_PATH=/usr/local/Ascend/mxIndex/lib
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/mxIndex/lib:${LD_LIBRARY_PATH}
+RUN ln -sfn /usr/local/Ascend/mxIndex/lib/libascendfaiss.so /usr/local/lib64/libascendfaiss.so
+
+FROM openeuler/openeuler:22.03-lts
+
+ARG CANN_VERSION
+
+COPY openEuler.repo /etc/yum.repos.d/openEuler.repo
+
+COPY --from=builder /usr/local/Ascend/cann-${CANN_VERSION} /usr/local/Ascend/cann-${CANN_VERSION}
+RUN ln -sfn /usr/local/Ascend/cann-${CANN_VERSION} /usr/local/Ascend/cann && \
+    mkdir -p /usr/local/Ascend/ascend-toolkit && \
+    ln -sfn /usr/local/Ascend/cann /usr/local/Ascend/ascend-toolkit/latest && \
+    ln -sfn /usr/local/Ascend/ascend-toolkit/latest/set_env.sh /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+COPY --from=builder /usr/local/Ascend/mxIndex /usr/local/Ascend/mxIndex
+RUN ln -sfn /usr/local/Ascend/mxIndex/lib/libascendfaiss.so /usr/local/lib64/libascendfaiss.so
+
+COPY --from=builder /usr/local/include/rocksdb /usr/local/include/rocksdb
+COPY --from=builder /usr/local/lib/librocksdb.a /usr/local/lib/
+COPY --from=builder /usr/local/bin/protoc /usr/local/bin/protoc
+COPY --from=builder /usr/local/lib/libprotobuf* /usr/local/lib/
+COPY --from=builder /usr/local/include/google /usr/local/include/google
+COPY --from=builder /usr/local/lib64/libroaring.a /usr/local/lib64/libroaring.a
+COPY --from=builder /usr/local/include/roaring /usr/local/include/roaring
+
+COPY --from=builder /usr/local/lib64/libfaiss* /usr/local/lib64/
+COPY --from=builder /usr/local/include/faiss /usr/local/include/faiss
+COPY --from=builder /usr/local/share/faiss /usr/local/share/faiss
+
+COPY --from=builder /usr/local/bin/go /usr/local/bin/go
+
+RUN dnf install -y git make automake gcc-c++ python3 python3-pip \
+        libgomp lapack openblas libzstd tbb cronie procps \
+        wget dos2unix patch \
+        openssl-devel boost-devel tbb-devel libzstd-devel \
+        blas-devel lapack-devel openblas-devel && \
+    pip3 install --no-cache-dir "cmake>=3.24" && \
+    ln -sf /usr/local/bin/cmake /usr/bin/cmake && \
+    for h in lapack.h lapacke.h lapacke_config.h lapacke_mangling.h lapacke_utils.h; do \
+        ln -sf /usr/include/lapacke/$h /usr/include/$h; \
+    done
+
+RUN pip3 install --no-cache-dir \
+        numpy==1.25.0 decorator==5.2.1 sympy==1.14 cffi==1.15.1 \
+        pyyaml pathlib2 protobuf scipy requests attrs psutil
+
+ENV ASCEND_HOME=/usr/local/Ascend/cann
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/cann/lib64:/usr/local/Ascend/mxIndex/lib:/vearch/lib/:/usr/local/lib64
+ENV LIBRARY_PATH=/usr/local/Ascend/mxIndex/lib
+ENV PATH=/usr/local/Ascend/cann/bin:$PATH

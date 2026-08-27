@@ -18,6 +18,18 @@
 
 enum class VectorValueType : std::uint8_t { FLOAT = 0, BINARY = 1, INT8 = 2 };
 
+inline const char *VectorValueTypeName(VectorValueType type) {
+  switch (type) {
+    case VectorValueType::FLOAT:
+      return "FLOAT";
+    case VectorValueType::BINARY:
+      return "BINARY";
+    case VectorValueType::INT8:
+      return "INT8";
+  }
+  return "UNKNOWN";
+}
+
 enum class DistanceComputeType : std::uint8_t { INNER_PRODUCT = 0, L2, Cosine };
 
 // Performance tool, record performance info
@@ -310,20 +322,35 @@ class IndexModel {
 
   virtual bool IsNPUIndex() const { return false; }
 
-  /** Dump model and index
+  /** Dump the index.
    *
-   * @param dir   dump directory
+   * training_only=false: full dump for durability. `path` is a directory; the
+   * family builds `dir/<AbsoluteName>/<file>.index` internally.
+   * training_only=true: dump ONLY the training artifacts (coarse quantizer
+   * centroids + codebook, WITHOUT the inverted lists) to the exact file `path`,
+   * for replica index consistency (方案①A). Families with no separable training
+   * artifacts (FLAT/HNSW/DISKANN) return NotSupported in this mode.
+   *
+   * @param path           dump directory (full) or output file (training_only)
+   * @param training_only  dump only the training artifacts, skip inverted lists
    * @return Status::OK if successed
    */
-  virtual vearch::Status Dump(const std::string &dir) = 0;
+  virtual vearch::Status Dump(const std::string &path, bool training_only) = 0;
 
-  /** Load model and index
+  /** Load the index, symmetric to Dump.
    *
-   * @param dir   load directory
-   * @param load_num   load doc num
-   * @return load number(>=0) if successed
+   * training_only=false: full load (`path` is a directory). training_only=true:
+   * load artifacts written by Dump(path, true) into this (fresh, empty) index,
+   * mark it trained, skip the inverted lists and set load_num=0 (backfill
+   * rebuilds the inverted lists after swap-in).
+   *
+   * @param path           load directory (full) or input file (training_only)
+   * @param training_only  load only the training artifacts, skip inverted lists
+   * @param load_num       load doc num (0 when training_only)
+   * @return Status::OK if successed
    */
-  virtual vearch::Status Load(const std::string &dir, int64_t &load_num) = 0;
+  virtual vearch::Status Load(const std::string &path, bool training_only,
+                              int64_t &load_num) = 0;
 
   virtual void train(int64_t n, const float *x) {}
 
@@ -334,6 +361,13 @@ class IndexModel {
   std::string &Desc() { return desc_; }
 
   bool SupportIncrement() const { return support_increment_; }
+
+  // Whether this index is trained. A virtual (not a base field) because the
+  // underlying flag is not uniform: faiss-based indexes carry faiss's
+  // `is_trained`, while GPU/NPU/SCANN own an `is_trained_`. Indexes with no
+  // training concept (FLAT/HNSW/DISKANN) are ready on creation and use this
+  // default of true.
+  virtual bool IsTrained() const { return true; }
 
   VectorReader *vector_;
   tbb::concurrent_bounded_queue<int64_t> updated_vids_;
@@ -364,9 +398,10 @@ class IndexModel {
    * Logs a WARNING when `training_threshold_` is clamped.
    *
    * @param nlist  number of IVF centroids (caller's nlist / nlist_)
-   * @return clamped training sample size
+   * @return clamped training sample size, or -1 when training_threshold_ < nlist
+   *         (fewer points than centroids); the caller must abort the build.
    */
-  size_t ComputeIVFTrainingNum(size_t nlist) const;
+  int64_t ComputeIVFTrainingNum(size_t nlist) const;
 
   /** Sample `threshold` training vectors from `vector_` and gate on the
    * per-index minimum.  Shared by every IVF-style family (IVFFLAT /

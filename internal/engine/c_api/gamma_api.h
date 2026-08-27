@@ -67,6 +67,9 @@ int DeleteDoc(void *engine, const char *docid, int docid_len);
  */
 void GetEngineStatus(void *engine, char **status, int *len);
 
+// Get engine-side Prometheus metrics as a text exposition string.
+void GetEngineMetrics(void *engine, char **metrics, int *len);
+
 void GetMemoryInfo(void *engine, char **memory_info, int *len);
 
 /** get a doc by id
@@ -112,7 +115,9 @@ int BuildIndex(void *engine);
  */
 int RebuildIndex(void *engine, const char *index_name,
                       const char *field_name, const char *index_type,
-                      int drop_before_rebuild, int limit_cpu, int describe);
+                      int drop_before_rebuild, int limit_cpu, int describe,
+                      const char *training_artifacts_path,
+                      const char *dump_artifacts_path);
 
 /**
  * @brief dump datas into disk accord to Config

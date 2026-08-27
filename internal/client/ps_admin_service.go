@@ -15,12 +15,18 @@
 package client
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/vearch/vearch/v3/internal/entity"
 	"github.com/vearch/vearch/v3/internal/pkg/log"
 	"github.com/vearch/vearch/v3/internal/pkg/metrics/mserver"
+	server "github.com/vearch/vearch/v3/internal/pkg/server/rpc"
 	"github.com/vearch/vearch/v3/internal/pkg/vjson"
 	"github.com/vearch/vearch/v3/internal/proto/vearchpb"
 )
@@ -377,16 +383,23 @@ func UpdateMemoryLimitCfg(addr string, cfg *entity.MemoryLimitCfg) error {
 	return operatePsMemLimitCfg(MemoryLimitHandler, addr, cfg)
 }
 
-// ExecuteRebuildIndex starts a rebuild task on PS.
+// ExecuteRebuildIndex starts a rebuild task on PS. For replica consistency,
+// roundID, isTrainer, and trainerAddr coordinate the round:
+// the trainer trains + dumps, followers pull from trainerAddr. Pass roundID=""
+// to keep plain train-in-place behavior.
 func ExecuteRebuildIndex(addr string, dbName, spaceName, indexName string,
-	pid entity.PartitionID, dropBefore int, limitCPU int, describe int) error {
+	pid entity.PartitionID, dropBefore int, limitCPU int, describe int,
+	roundID string, isTrainer bool, trainerAddr string) error {
 	param := &entity.RebuildParam{
-		DBName:     dbName,
-		SpaceName:  spaceName,
-		IndexName:  indexName,
-		DropBefore: dropBefore,
-		LimitCPU:   limitCPU,
-		Describe:   describe,
+		DBName:      dbName,
+		SpaceName:   spaceName,
+		IndexName:   indexName,
+		DropBefore:  dropBefore,
+		LimitCPU:    limitCPU,
+		Describe:    describe,
+		RoundID:     roundID,
+		IsTrainer:   isTrainer,
+		TrainerAddr: trainerAddr,
 	}
 	value, err := vjson.Marshal(param)
 	if err != nil {
@@ -405,8 +418,8 @@ func ExecuteRebuildIndex(addr string, dbName, spaceName, indexName string,
 		return vearchpb.NewError(reply.Err.Code, nil)
 	}
 
-	log.Info("ExecuteRebuildIndex RPC success: addr=%s, dbName=%s, spaceName=%s, indexName=%s, pid=%d",
-		addr, dbName, spaceName, indexName, pid)
+	log.Info("ExecuteRebuildIndex RPC success: addr=%s, dbName=%s, spaceName=%s, indexName=%s, pid=%d, round=%s, isTrainer=%v",
+		addr, dbName, spaceName, indexName, pid, roundID, isTrainer)
 	return nil
 }
 
@@ -446,4 +459,131 @@ func GetRebuildStatus(addr string, dbName, spaceName, indexName string,
 	log.Info("GetRebuildStatus RPC success: addr=%s, dbName=%s, spaceName=%s, indexName=%s, pid=%d, status=%d, progress=%d%%",
 		addr, dbName, spaceName, indexName, pid, response.Status, response.Progress)
 	return response, nil
+}
+
+// PullTrainingArtifacts fetches training artifacts from a source replica over a
+// SINGLE persistent RPC connection: stat, then chunked pulls streamed to a temp
+// file (co-located with destPath for an atomic same-filesystem rename) with a
+// running sha256 verified against the source's hash, then renamed onto destPath.
+// Returns the stat meta so the caller can write the .meta sidecar. Reuses ONE
+// connection for the whole round — never the per-call Execute/execute helpers,
+// which reconnect on every call (§6.3).
+func PullTrainingArtifacts(sourceAddr string, pid entity.PartitionID, indexName, round, destPath string) (meta *entity.TrainingArtifactsMeta, err error) {
+	if err = os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return nil, err
+	}
+
+	cli, err := server.NewRpcClient(sourceAddr)
+	if err != nil {
+		return nil, vearchpb.NewError(vearchpb.ErrorEnum_CREATE_RPCCLIENT_FAILED, err)
+	}
+	defer func() {
+		if cerr := cli.Close(); cerr != nil {
+			log.Error("PullTrainingArtifacts close client err: %v", cerr)
+		}
+	}()
+
+	meta, err = pullTrainingArtifactsStat(cli, pid, indexName, round)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := os.CreateTemp(filepath.Dir(destPath), ".pull-training-artifacts-*")
+	if err != nil {
+		return nil, err
+	}
+	tmpPath := f.Name()
+	// On any failure, drop the partial temp file (double-close on the success
+	// path below is harmless).
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(tmpPath)
+		}
+	}()
+
+	// Advance by the number of bytes actually returned, so the source's chunk
+	// size drives the loop and client/server chunk sizes need not agree.
+	hasher := sha256.New()
+	var received int64
+	for received < meta.Size {
+		chunk, cerr := pullTrainingArtifactsChunk(cli, pid, indexName, round, received)
+		if cerr != nil {
+			err = cerr
+			return nil, err
+		}
+		if len(chunk) == 0 {
+			err = fmt.Errorf("empty training-artifacts chunk at offset %d (total %d) pid=%d", received, meta.Size, pid)
+			return nil, err
+		}
+		if _, werr := f.Write(chunk); werr != nil {
+			err = werr
+			return nil, err
+		}
+		hasher.Write(chunk)
+		received += int64(len(chunk))
+	}
+
+	if cerr := f.Close(); cerr != nil {
+		err = cerr
+		return nil, err
+	}
+
+	if got := hex.EncodeToString(hasher.Sum(nil)); got != meta.SHA256 {
+		err = fmt.Errorf("training artifacts hash mismatch pid=%d round=%s: got %s want %s", pid, round, got, meta.SHA256)
+		return nil, err
+	}
+
+	if err = os.Rename(tmpPath, destPath); err != nil {
+		return nil, err
+	}
+
+	log.Info("PullTrainingArtifacts success: addr=%s pid=%d index=%s round=%s size=%d -> %s",
+		sourceAddr, pid, indexName, round, meta.Size, destPath)
+	return meta, nil
+}
+
+// pullTrainingArtifactsStat issues the stat call (offset < 0) on the shared connection.
+func pullTrainingArtifactsStat(cli *server.RpcClient, pid entity.PartitionID, indexName, round string) (*entity.TrainingArtifactsMeta, error) {
+	reply, err := pullTrainingArtifactsCall(cli, pid, indexName, round, -1)
+	if err != nil {
+		return nil, err
+	}
+	meta := new(entity.TrainingArtifactsMeta)
+	if err := vjson.Unmarshal(reply.Data, meta); err != nil {
+		return nil, err
+	}
+	return meta, nil
+}
+
+// pullTrainingArtifactsChunk fetches the raw chunk at offset on the shared connection.
+func pullTrainingArtifactsChunk(cli *server.RpcClient, pid entity.PartitionID, indexName, round string, offset int64) ([]byte, error) {
+	reply, err := pullTrainingArtifactsCall(cli, pid, indexName, round, offset)
+	if err != nil {
+		return nil, err
+	}
+	return reply.Data, nil
+}
+
+// pullTrainingArtifactsCall marshals one PullTrainingArtifactsReq and executes it on the
+// shared (persistent) connection, surfacing a non-SUCCESS reply as an error.
+func pullTrainingArtifactsCall(cli *server.RpcClient, pid entity.PartitionID, indexName, round string, offset int64) (*vearchpb.PartitionData, error) {
+	data, err := vjson.Marshal(&entity.PullTrainingArtifactsReq{
+		PartitionID: pid,
+		IndexName:   indexName,
+		RoundID:     round,
+		Offset:      offset,
+	})
+	if err != nil {
+		return nil, err
+	}
+	args := &vearchpb.PartitionData{PartitionID: pid, Data: data}
+	reply := new(vearchpb.PartitionData)
+	if err := cli.Execute(context.Background(), PullTrainingArtifactsHandler, args, reply); err != nil {
+		return nil, err
+	}
+	if reply.Err != nil && reply.Err.Code != vearchpb.ErrorEnum_SUCCESS {
+		return nil, vearchpb.NewError(reply.Err.Code, fmt.Errorf("%s", reply.Err.Msg))
+	}
+	return reply, nil
 }

@@ -493,9 +493,12 @@ int GammaIndexHNSWLIB::Delete(const std::vector<int64_t> &ids) {
   return 0;
 }
 
-Status GammaIndexHNSWLIB::Dump(const std::string &dir) {
+Status GammaIndexHNSWLIB::Dump(const std::string &path, bool training_only) {
+  if (training_only) {
+    return Status::NotSupported("HNSW has no separable training artifacts");
+  }
   std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_dir = dir + "/" + index_name;
+  std::string index_dir = path + "/" + index_name;
   if (utils::make_dir(index_dir.c_str())) {
     std::string msg = std::string("mkdir error, index dir=") + index_dir;
     LOG(ERROR) << msg;
@@ -508,9 +511,13 @@ Status GammaIndexHNSWLIB::Dump(const std::string &dir) {
   return Status::OK();
 }
 
-Status GammaIndexHNSWLIB::Load(const std::string &index_dir, int64_t &load_num) {
+Status GammaIndexHNSWLIB::Load(const std::string &path, bool training_only,
+                               int64_t &load_num) {
+  if (training_only) {
+    return Status::NotSupported("HNSW has no separable training artifacts");
+  }
   std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_file = index_dir + "/" + index_name + "/hnswlib.index";
+  std::string index_file = path + "/" + index_name + "/hnswlib.index";
   if (!utils::file_exist(index_file)) {
     LOG(INFO) << index_file << " isn't existed, skip loading";
     load_num = 0;

@@ -74,11 +74,13 @@ struct GammaBinaryInvertedListScanner {
   RetrievalContext *retrieval_context_;
 };
 
-class GammaIndexBinaryIVF : public IndexModel, faiss::IndexBinaryIVF {
+class GammaIndexBinaryIVF : public IndexModel, public faiss::IndexBinaryIVF {
  public:
   GammaIndexBinaryIVF();
 
   virtual ~GammaIndexBinaryIVF();
+
+  bool IsTrained() const override { return is_trained; }
 
   Status Init(const std::string &model_parameters,
               int training_threshold) override;
@@ -95,11 +97,9 @@ class GammaIndexBinaryIVF : public IndexModel, faiss::IndexBinaryIVF {
 
   long GetTotalMemBytes() override;
 
-  Status Dump(const std::string &dir) override { return Status::OK(); }
-  Status Load(const std::string &index_dir, int64_t &load_num) override {
-    load_num = 0;
-    return Status::OK();
-  }
+  Status Dump(const std::string &path, bool training_only) override;
+  Status Load(const std::string &path, bool training_only,
+              int64_t &load_num) override;
 
   int Delete(const std::vector<int64_t> &ids) override;
 

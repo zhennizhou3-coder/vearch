@@ -619,6 +619,73 @@ class TestRebuildBasicLifecycle:
     def setup_class(self):
         _ensure_clean_db()
 
+    def test_rebuild_progress_drop_true_tracks_completion(self):
+        """Observe progress across a drop=true rebuild.
+
+        overall_percent must track real completion: it stays 0 while no replica
+        has completed (a running replica's in-flight/backfill progress must NOT
+        inflate it) and reaches 100 only at completion. Per-replica task progress
+        is observed and must be monotonic non-decreasing. Regression guard for
+        progress that previously jumped to a high value before training/swap had
+        finished on a drop=true rebuild (indexed_num of the pre-existing index)."""
+        case_space = space_name + "_mri_progress_drop_true"
+        total = 10000
+        batch_size = 100
+
+        assert create_space(
+            router_url, db_name,
+            _ivfpq_space_config(case_space, partition_num=1, replica_num=1),
+        ).json()["code"] == 0
+        try:
+            add(total // batch_size, batch_size, xb[:total], True, False,
+                space_name=case_space)
+            waiting_index_finish(total, space_name=case_space)
+            _wait_index_status_indexed(db_name, case_space)
+
+            assert _trigger_rebuild(
+                db_name, case_space, drop_before_rebuild=True
+            ).json().get("code") == 0
+
+            # Collects chronological snapshots, asserts overall_percent is
+            # monotonic non-decreasing within a target, and logs the progression.
+            snapshots = _wait_rebuild_completed(
+                db_name, case_space, timeout=600, poll_interval=1)
+            assert snapshots, "no progress snapshots captured"
+            assert snapshots[-1]["status"] == "completed", snapshots[-1]
+            assert snapshots[-1]["overall_percent"] == 100, snapshots[-1]
+
+            # overall_percent must be completion-based at every snapshot: a
+            # running replica — even at progress 100 while backfilling — must not
+            # inflate it. It must equal completed*100/(total-cancelled).
+            for s in snapshots:
+                total_tasks = s["total_tasks"]
+                completed = s["completed_tasks"]
+                cancelled = sum(1 for t in (s.get("tasks") or [])
+                                if t.get("status") == "cancelled")
+                denom = total_tasks - cancelled
+                expected = (completed * 100 // denom) if denom > 0 else 0
+                assert s["overall_percent"] == expected, (
+                    "overall_percent=%s but completion-based value is %s "
+                    "(completed=%s total=%s cancelled=%s); running progress "
+                    "leaked into overall_percent:\n%s" % (
+                        s["overall_percent"], expected, completed, total_tasks,
+                        cancelled, json.dumps(s, indent=2, default=str)))
+
+            # Per-replica task progress must be monotonic non-decreasing.
+            last = {}
+            for s in snapshots:
+                for t in s.get("tasks") or []:
+                    if t.get("status") not in ("running", "completed"):
+                        continue
+                    key = (t.get("partition_id"), t.get("node_id"))
+                    prog = int(t.get("progress", 0))
+                    assert prog >= last.get(key, 0), (
+                        "task %s progress decreased: %s -> %s"
+                        % (key, last.get(key), prog))
+                    last[key] = prog
+        finally:
+            drop_space(router_url, db_name, case_space)
+
     def test_rebuild_hnsw_full_space(self):
         """Rebuilds every HNSW replica in one space and verifies lifecycle progress and search consistency."""
         batch_size = 100
@@ -2160,6 +2227,101 @@ class TestRebuildIndexTypeMatrix:
                 f"doc_num diverged across rebuild: pre={pre_doc_num} "
                 f"post={post_doc_num}")
 
+            _check_search(case_space, times=3)
+        finally:
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception:
+                pass
+
+    def test_rebuild_diskann_below_training_threshold(self):
+        """DiskANN rebuild must build a usable index even when the live doc count
+        is below training_threshold.
+
+        DiskANN is non-incremental: its whole on-disk structure is built in
+        Indexing(), with no IVF-style "enough samples to train" requirement.
+        RebuildIndex must therefore force a full build for it regardless of the
+        threshold gate. Before that fix, a sub-threshold rebuild took do_train=
+        false, skipped Indexing(), and swapped in an empty (unqueryable) index
+        while still reporting the rebuild complete. This test inserts far fewer
+        docs than training_threshold and asserts the rebuilt index still reaches
+        INDEXED and returns results.
+        """
+        case_space = space_name + "_comp_diskann_sub"
+        embedding_size = xb.shape[1]
+        # threshold far above the doc count we insert, so do_train would be false
+        # under the plain IVF-style gate.
+        cfg = {
+            "name": case_space, "partition_num": 1, "replica_num": 1,
+            "fields": [
+                {"name": "field_int", "type": "integer"},
+                {"name": "field_vector", "type": "vector",
+                 "store_type": "RocksDB",
+                 "index": {"name": "gamma", "type": "DISKANN_STATIC",
+                           "params": {
+                               "metric_type": "L2",
+                               "training_threshold": 50000,
+                               "R": 32, "L": 64,
+                               "num_threads": 2,
+                               "beam_width": 4,
+                               "num_nodes_to_cache": 100000,
+                               "search_dram_budget_gb": 0.5,
+                               "build_dram_budget_gb": 0.56,
+                               "disk_pq_bytes": 0,
+                               "use_opq": 0,
+                               "append_reorder_data": 0,
+                           }},
+                 "dimension": embedding_size},
+            ],
+        }
+        resp = create_space(router_url, db_name, cfg)
+        body = resp.json()
+        if body.get("code") != 0:
+            pytest.skip(
+                f"DISKANN_STATIC not supported on this cluster build: "
+                f"code={body.get('code')} msg={body.get('msg')}")
+        try:
+            # 500 docs << training_threshold (50000).
+            batch_size, total = 100, 500
+            logger.info("6.6 inserting %d docs (sub-threshold DISKANN)", total)
+            add(total // batch_size, batch_size, xb[:total], True, False,
+                space_name=case_space)
+            time.sleep(5)
+            doc_num_after_insert = _get_space_detail(
+                db_name, case_space).get("doc_num", 0)
+            assert doc_num_after_insert >= total, (
+                f"insert lost data: expected ≥{total}, got {doc_num_after_insert}")
+
+            logger.info("6.6 triggering /index/forcemerge for initial DiskANN build")
+            fm = requests.post(
+                router_url + "/index/forcemerge",
+                auth=(username, password),
+                json={"db_name": db_name, "space_name": case_space,
+                      "partition_id": 0},
+                timeout=60)
+            assert fm.json().get("code") == 0, f"forcemerge failed: {fm.text[:300]}"
+
+            # Initial build should reach INDEXED despite doc_num < threshold.
+            _wait_index_status_indexed(db_name, case_space,
+                                       max_rounds=300, poll_interval=5)
+
+            pre_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
+
+            logger.info("6.6 triggering rebuild (sub-threshold)")
+            assert _trigger_indexed_rebuild(db_name, case_space).json().get("code") == 0
+            _wait_rebuild_completed(db_name, case_space, timeout=1800)
+
+            # The rebuilt index must still be INDEXED (force-build), not left
+            # UNINDEXED/empty by a skipped Indexing().
+            _wait_index_status_indexed(db_name, case_space,
+                                       max_rounds=300, poll_interval=5)
+
+            post_doc_num = _get_space_detail(db_name, case_space).get("doc_num")
+            assert post_doc_num == pre_doc_num, (
+                f"doc_num diverged across rebuild: pre={pre_doc_num} "
+                f"post={post_doc_num}")
+
+            # And it must return results — an empty index would find nothing.
             _check_search(case_space, times=3)
         finally:
             try:

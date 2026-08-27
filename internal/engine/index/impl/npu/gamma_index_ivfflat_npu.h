@@ -64,8 +64,9 @@ class GammaIVFFlatNPUIndex
   int Search(RetrievalContext *retrieval_context, int n, const uint8_t *x,
              int k, float *distances, int64_t *labels) override;
 
-  Status Dump(const std::string &dir) override;
-  Status Load(const std::string &dir, int64_t &load_num) override;
+  Status Dump(const std::string &path, bool training_only) override;
+  Status Load(const std::string &path, bool training_only,
+              int64_t &load_num) override;
 
  protected:
   faiss::Index *CreateNPUIndex() override;

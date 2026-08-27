@@ -15,6 +15,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <vector>
+#include <atomic>
 
 #include "common/gamma_common_data.h"
 #include "concurrentqueue/blockingconcurrentqueue.h"
@@ -59,6 +60,8 @@ class GammaGPUIndexBase : public IndexModel {
 
   virtual ~GammaGPUIndexBase() { Cleanup(); }
 
+  bool IsTrained() const override { return is_trained_.load(); }
+
   virtual Status Init(const std::string &model_parameters,
                       int training_threshold) override {
     b_exited_ = false;
@@ -77,10 +80,19 @@ class GammaGPUIndexBase : public IndexModel {
 
   virtual long GetTotalMemBytes() override { return 0; }
 
-  virtual Status Dump(const std::string &dir) override { return Status::OK(); }
+  virtual Status Dump(const std::string &path, bool training_only) override {
+    if (training_only) {
+      return Status::NotSupported("training-artifacts dump not supported");
+    }
+    return Status::OK();
+  }
 
-  virtual Status Load(const std::string &index_dir,
+  virtual Status Load(const std::string &path, bool training_only,
                       int64_t &load_num) override {
+    if (training_only) {
+      return Status::NotSupported("training-artifacts load not supported");
+    }
+    load_num = 0;
     return Status::OK();
   }
 
@@ -136,7 +148,7 @@ class GammaGPUIndexBase : public IndexModel {
 
   // State variables
   bool b_exited_;
-  bool is_trained_;
+  std::atomic<bool> is_trained_;
   int d_;
   DistanceComputeType metric_type_;
 

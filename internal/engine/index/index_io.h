@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "faiss/IndexBinaryIVF.h"
 #include "faiss/IndexIVFPQ.h"
 #include "faiss/VectorTransform.h"
 #include "faiss/impl/FaissAssert.h"
@@ -92,6 +93,13 @@ void write_RaBitQuantizer(const faiss::RaBitQuantizer* rabitq, faiss::IOWriter* 
                           bool multi_bit = true);
 void read_RaBitQuantizer(faiss::RaBitQuantizer* rabitq, faiss::IOReader* f,
                           bool multi_bit = true);
+
+// Binary IVF header (BINARYIVF training artifacts): writes the IVF params plus the
+// binary coarse quantizer (faiss::IndexBinaryFlat) via write_index_binary. No
+// PQ codebook — pure Hamming, so the centroids are the whole training artifacts.
+void write_binary_ivf_header(const faiss::IndexBinaryIVF *ivf,
+                             faiss::IOWriter *f);
+void read_binary_ivf_header(faiss::IndexBinaryIVF *ivf, faiss::IOReader *f);
 
 
 struct FileIOReader : faiss::IOReader {

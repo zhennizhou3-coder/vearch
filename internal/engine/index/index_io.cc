@@ -294,4 +294,30 @@ void write_RaBitQuantizer(
   }
 }
 
+void write_binary_ivf_header(const faiss::IndexBinaryIVF *ivf,
+                             faiss::IOWriter *f) {
+  WRITE1(ivf->d);
+  WRITE1(ivf->code_size);
+  WRITE1(ivf->ntotal);
+  WRITE1(ivf->is_trained);
+  WRITE1(ivf->metric_type);
+  WRITE1(ivf->nlist);
+  WRITE1(ivf->nprobe);
+  faiss::write_index_binary(ivf->quantizer, f);
+}
+
+void read_binary_ivf_header(faiss::IndexBinaryIVF *ivf, faiss::IOReader *f) {
+  READ1(ivf->d);
+  READ1(ivf->code_size);
+  READ1(ivf->ntotal);
+  READ1(ivf->is_trained);
+  READ1(ivf->metric_type);
+  READ1(ivf->nlist);
+  READ1(ivf->nprobe);
+  // Replace the coarse quantizer with the one read from bytes. The gamma
+  // BINARYIVF class owns and deletes `quantizer` itself (own_fields stays
+  // false), so the caller frees the previous quantizer before calling this.
+  ivf->quantizer = faiss::read_index_binary(f);
+}
+
 }  // namespace vearch

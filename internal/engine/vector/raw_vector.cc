@@ -167,7 +167,8 @@ int RawVector::SampleTrainingVectorIds(const size_t num,
     return -1;
   }
   reservoir.reserve(num);
-  std::mt19937 rng(std::random_device{}());
+  constexpr unsigned kTrainSampleSeed = 1234;
+  std::mt19937 rng(kTrainSampleSeed);
   size_t seen = 0;
 
   for (int64_t vid = 0; vid < (int64_t)total; ++vid) {

@@ -544,9 +544,18 @@ int GammaFLATIndex::Update(const std::vector<idx_t> &ids,
   return 0;
 }
 
-Status GammaFLATIndex::Dump(const std::string &dir) { return Status::OK(); }
+Status GammaFLATIndex::Dump(const std::string &path, bool training_only) {
+  if (training_only) {
+    return Status::NotSupported("FLAT has no separable training artifacts");
+  }
+  return Status::OK();
+}
 
-Status GammaFLATIndex::Load(const std::string &index_dir, int64_t &load_num) {
+Status GammaFLATIndex::Load(const std::string &path, bool training_only,
+                            int64_t &load_num) {
+  if (training_only) {
+    return Status::NotSupported("FLAT has no separable training artifacts");
+  }
   load_num = 0;
   return Status::OK();
 }

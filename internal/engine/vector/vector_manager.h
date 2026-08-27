@@ -44,6 +44,21 @@ class VectorManager {
   struct IndexStatusEntry {
     std::string name;
     IndexStatus status;
+    // Vectors actually added to this index so far (the framework's
+    // indexed_count_). Read from the same IndexModel the status is keyed by,
+    // under the same rdlock. Lets the rebuild monitor gate completion on
+    // "backfill caught up" instead of the train-done status flip (which reports
+    // INDEXED while indexed_count_ is still climbing from the background
+    // AddRTVecsToIndex pass). Named indexed_num to match the EngineStatus
+    // surface field (min_indexed_num), not the internal indexed_count_.
+    int64_t indexed_num;
+    // Two factual basic properties the rebuild monitor combines to classify
+    // whether this index will backfill after swap: is_trained (untrained IVF
+    // serves via full-recall FLAT, never backfills indexed_num) and
+    // support_increment (non-incremental DISKANN is built whole in Indexing(),
+    // never backfilled). Both read under the same rdlock as status/indexed_num.
+    bool is_trained;
+    bool support_increment;
   };
 
   VectorManager(const VectorStorageType &store_type,
@@ -96,26 +111,30 @@ class VectorManager {
 
   Status ReCreateVectorIndexes(int training_threshold);
 
-  // Per-index rebuild (drop-before path): destroy the existing index for
-  // (field_name, index_type), re-create + train it, and swap in. The map key
-  // in vector_indexes_ is IndexName(field_name, index_type); index_name is the
-  // user-facing name used to publish build state to index_name_to_state_
-  // (describe API) in addition to the numeric vector_index_status_ the rebuild
-  // monitor polls.
+  // Drop-before rebuild: replace the existing index, optionally loading or
+  // dumping shared training artifacts.
   Status ReCreateVectorIndex(const std::string &index_name,
                              const std::string &field_name,
                              const std::string &index_type,
-                             int training_threshold);
+                             int training_threshold,
+                             const std::string &load_path = "",
+                             const std::string &dump_artifacts_path = "");
 
-  // Per-index rebuild (in-place path): build a new index alongside the live
-  // one, optionally train it, then swap it in under the write lock. The old
-  // index stays queryable until the swap, so search never sees a missing
-  // index. index_name is used for build-state publishing (see
-  // ReCreateVectorIndex).
+  // In-place rebuild: build alongside the live index, then swap it in.
   Status RebuildVectorIndex(const std::string &index_name,
                             const std::string &field_name,
                             const std::string &index_type,
-                            int training_threshold, bool do_train);
+                            int training_threshold, bool do_train,
+                            const std::string &load_path = "",
+                            const std::string &dump_artifacts_path = "");
+
+  // Dump training artifacts from newly built indexes.
+  Status DumpTrainingArtifacts(std::map<std::string, IndexModel *> &new_indexes,
+                               const std::string &path);
+
+  // Load training artifacts into newly built indexes.
+  Status LoadTrainingArtifacts(std::map<std::string, IndexModel *> &new_indexes,
+                               const std::string &path);
 
   // Snapshot every vector index's rebuild status under vector_indexes_mutex_
   // rdlock, returned by value. Powers EngineStatus.index_statuses and lets the
@@ -174,6 +193,13 @@ class VectorManager {
   std::map<std::string, std::string> GetAllIndexStates() const;
 
   bool SupportIncrement();
+
+  // Per-index variant: does the index named index_name support incremental
+  // Add? A missing index returns the same default as a fresh IndexModel (true),
+  // so callers treat "unknown" as incremental. Used by RebuildIndex to force a
+  // full build for non-incremental indexes (e.g. DISKANN) regardless of the
+  // training_threshold gate, which is an IVF-only concept.
+  bool SupportIncrementOf(const std::string &index_name);
 
   void VectorNames(std::vector<std::string> &names) {
     for (const auto &it : raw_vectors_) {

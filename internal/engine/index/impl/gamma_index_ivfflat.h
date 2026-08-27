@@ -152,6 +152,8 @@ struct GammaIVFFlatIndex : faiss::IndexIVFFlat, public GammaFLATIndex {
   GammaIVFFlatIndex();
   virtual ~GammaIVFFlatIndex();
 
+  bool IsTrained() const override { return is_trained; }
+
   void search_preassigned(RetrievalContext *retrieval_context, idx_t n,
                           const float *x, int k, const idx_t *keys,
                           const float *coarse_dis, float *distances,
@@ -172,8 +174,9 @@ struct GammaIVFFlatIndex : faiss::IndexIVFFlat, public GammaFLATIndex {
 
   long GetTotalMemBytes() override { return 0; };
 
-  Status Dump(const std::string &dir) override;
-  Status Load(const std::string &dir, int64_t &load_num) override;
+  Status Dump(const std::string &path, bool training_only) override;
+  Status Load(const std::string &path, bool training_only,
+              int64_t &load_num) override;
 
   void train(int64_t n, const float *x) override {
     faiss::IndexIVFFlat::train(n, x);

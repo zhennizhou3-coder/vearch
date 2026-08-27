@@ -20,6 +20,21 @@ type IndexStatus struct {
 	// Status is the engine's stringified IndexStatus:
 	// "UNINDEXED"/"INDEXING"/"INDEXED"/"FAILED".
 	Status string `json:"status"`
+	// IndexedNum is the number of vectors actually added to this index so far.
+	// The rebuild monitor gates completion on this catching up to the doc count
+	// snapshot, so the index is not reported complete while the background
+	// AddRTVecsToIndex pass is still backfilling it. Absent (0) from engines
+	// predating this field, in which case the monitor falls back to MinIndexedNum.
+	// Named to match the sibling MinIndexedNum / min_indexed_num surface field.
+	IndexedNum int64 `json:"indexed_num,omitempty"`
+	// IsTrained / SupportIncrement are factual per-index basic properties the
+	// rebuild monitor combines to classify whether the index backfills after a
+	// swap. Pointers so a nil distinguishes "engine predates this field" (old
+	// .so) from a real false — the binding then falls back to safe defaults
+	// rather than misclassifying a normal index as non-incremental. Absent on
+	// engines predating these fields.
+	IsTrained        *bool `json:"is_trained,omitempty"`
+	SupportIncrement *bool `json:"support_increment,omitempty"`
 }
 
 type EngineStatus struct {

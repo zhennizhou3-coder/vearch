@@ -14,6 +14,8 @@
 #include <faiss/utils/sorting.h>
 #include <faiss/utils/utils.h>
 
+#include "index/index_io.h"
+
 namespace vearch {
 
 struct BinaryModelParams {
@@ -215,7 +217,8 @@ int GammaIndexBinaryIVF::Indexing() {
     return 0;
   }
 
-  size_t num = ComputeIVFTrainingNum(nlist);
+  int64_t num = ComputeIVFTrainingNum(nlist);
+  if (num <= 0) return num;
 
   std::unique_ptr<const uint8_t[]> train_data;
   size_t num_got = 0;
@@ -460,6 +463,63 @@ GammaIndexBinaryIVF::get_GammaInvertedListScanner(bool store_pairs) const {
   } else {
     return select_IVFBinaryScannerL2<false>(code_size);
   }
+}
+
+// Dump: BINARYIVF's full dump is a no-op (relies on backfill); training_only
+// writes only the binary coarse quantizer (IndexBinaryFlat centroids) via
+// write_binary_ivf_header — pure Hamming, no PQ codebook. Magic "IbVm". Inverted
+// lists are rebuilt locally by backfill. (The dir-based Dump delegates here.)
+Status GammaIndexBinaryIVF::Dump(const std::string &path, bool training_only) {
+  if (!training_only) return Status::OK();
+  if (!this->is_trained) {
+    LOG(INFO) << "gamma index is not trained, skip dumping training artifacts";
+    return Status::OK();
+  }
+  faiss::IOWriter *f = new FileIOWriter(path.c_str());
+  utils::ScopeDeleter1<FileIOWriter> del((FileIOWriter *)f);
+  const faiss::IndexBinaryIVF *ivf =
+      static_cast<const faiss::IndexBinaryIVF *>(this);
+  uint32_t h = faiss::fourcc("IbVm");
+  WRITE1(h);
+  vearch::write_binary_ivf_header(ivf, f);
+  LOG(INFO) << "dump training artifacts: d=" << ivf->d << ", nlist=" << ivf->nlist
+            << ", code_size=" << ivf->code_size;
+  return Status::OK();
+}
+
+// Load: full load is a no-op; training_only reads the binary coarse quantizer
+// into a fresh, empty index and marks it trained. indexed_vec_count_/load_num
+// stay 0; backfill rebuilds the inverted lists. (The dir-based Load delegates
+// here.)
+Status GammaIndexBinaryIVF::Load(const std::string &path, bool training_only,
+                                 int64_t &load_num) {
+  if (!training_only) {
+    load_num = 0;
+    return Status::OK();
+  }
+  if (!utils::file_exist(path)) {
+    return Status::IOError("Load training artifacts: file not found: " + path);
+  }
+  faiss::IOReader *f = new FileIOReader(path.c_str());
+  utils::ScopeDeleter1<FileIOReader> del((FileIOReader *)f);
+  uint32_t h;
+  READ1(h);
+  if (h != faiss::fourcc("IbVm")) {
+    return Status::IOError("bad magic for BINARYIVF training artifacts");
+  }
+  faiss::IndexBinaryIVF *ivf = static_cast<faiss::IndexBinaryIVF *>(this);
+  // read_binary_ivf_header replaces `quantizer`; free the empty one created in
+  // Init first (this class owns/deletes quantizer itself, own_fields == false).
+  delete ivf->quantizer;
+  ivf->quantizer = nullptr;
+  vearch::read_binary_ivf_header(ivf, f);
+  // ← no inverted lists read
+  indexed_vec_count_ = 0;  // backfill rebuilds them
+  load_num = 0;
+  assert(this->is_trained);
+  LOG(INFO) << "load training artifacts: d=" << ivf->d << ", nlist=" << ivf->nlist
+            << ", code_size=" << ivf->code_size;
+  return Status::OK();
 }
 
 }  // namespace vearch

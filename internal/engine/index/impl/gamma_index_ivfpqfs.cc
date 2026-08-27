@@ -42,6 +42,7 @@ GammaIVFPQFastScanIndex::GammaIVFPQFastScanIndex() : indexed_vec_count_(0) {
   updated_num_ = 0;
   is_trained = false;
   opq_ = nullptr;
+  model_param_ = nullptr;
 #ifdef PERFORMANCE_TESTING
   add_count_ = 0;
 #endif
@@ -213,7 +214,8 @@ int GammaIVFPQFastScanIndex::Indexing() {
     return 0;
   }
 
-  size_t num = ComputeIVFTrainingNum(nlist);
+  int64_t num = ComputeIVFTrainingNum(nlist);
+  if (num <= 0) return num;
 
   std::unique_ptr<const uint8_t[]> train_data;
   size_t num_got = 0;
@@ -428,13 +430,87 @@ int GammaIVFPQFastScanIndex::Search(RetrievalContext *retrieval_context, int n,
   return 0;
 }
 
-Status GammaIVFPQFastScanIndex::Dump(const std::string &dir) {
+// FastScan's full dump/load are no-ops (relies entirely on backfill). The
+// training artifacts are the same shape as IVFPQ (centroids + PQ codebook +
+// optional OPQ) plus the block-layout params bbs/M2. Magic "IfSm".
+Status GammaIVFPQFastScanIndex::Dump(const std::string &path,
+                                     bool training_only) {
+  if (!training_only) return Status::OK();
+  if (!this->is_trained) {
+    LOG(INFO) << "gamma index is not trained, skip dumping training artifacts";
+    return Status::OK();
+  }
+  faiss::IOWriter *f = new FileIOWriter(path.c_str());
+  utils::ScopeDeleter1<FileIOWriter> del((FileIOWriter *)f);
+  const faiss::IndexIVFPQFastScan *ivfpqfs =
+      static_cast<const faiss::IndexIVFPQFastScan *>(this);
+  uint32_t h = faiss::fourcc("IfSm");
+  WRITE1(h);
+  vearch::write_ivf_header(ivfpqfs, f);
+  WRITE1(ivfpqfs->by_residual);
+  WRITE1(ivfpqfs->code_size);
+  vearch::write_product_quantizer(&ivfpqfs->pq, f);
+  if (opq_ != nullptr) write_opq(opq_, f);
+  WRITE1(ivfpqfs->bbs);
+  WRITE1(ivfpqfs->M2);
+  LOG(INFO) << "dump training artifacts: nlist=" << ivfpqfs->nlist
+            << ", pq.M=" << ivfpqfs->pq.M << ", bbs=" << ivfpqfs->bbs
+            << ", M2=" << ivfpqfs->M2;
   return Status::OK();
 }
 
-Status GammaIVFPQFastScanIndex::Load(const std::string &index_dir,
+// Reads the artifacts, then rebuilds an EMPTY BlockInvertedLists with the loaded
+// block layout (mirrors Init) so backfill can add vectors; load_num stays 0.
+Status GammaIVFPQFastScanIndex::Load(const std::string &path, bool training_only,
                                      int64_t &load_num) {
+  if (!training_only) {
+    load_num = 0;
+    return Status::OK();
+  }
+  if (!utils::file_exist(path)) {
+    return Status::IOError("Load training artifacts: file not found: " + path);
+  }
+  faiss::IOReader *f = new FileIOReader(path.c_str());
+  utils::ScopeDeleter1<FileIOReader> del((FileIOReader *)f);
+  uint32_t h;
+  READ1(h);
+  if (h != faiss::fourcc("IfSm")) {
+    return Status::IOError("bad magic for IVFPQFastScan training artifacts");
+  }
+  faiss::IndexIVFPQFastScan *ivfpqfs =
+      static_cast<faiss::IndexIVFPQFastScan *>(this);
+  vearch::read_ivf_header(ivfpqfs, f, nullptr);
+  READ1(ivfpqfs->by_residual);
+  READ1(ivfpqfs->code_size);
+  vearch::read_product_quantizer(&ivfpqfs->pq, f);
+  if (opq_) read_opq(opq_, f);
+  READ1(ivfpqfs->bbs);
+  READ1(ivfpqfs->M2);
+
+  faiss::IndexHNSWFlat *hnsw_flat =
+      dynamic_cast<faiss::IndexHNSWFlat *>(ivfpqfs->quantizer);
+  if (hnsw_flat) {
+    hnsw_flat->hnsw.search_bounded_queue = false;
+    quantizer_type_ = 1;
+  }
+
+  ivfpqfs->code_size = ivfpqfs->pq.code_size;
+  ivfpqfs->replace_invlists(
+      new faiss::BlockInvertedLists(ivfpqfs->nlist, ivfpqfs->bbs,
+                                    ivfpqfs->bbs * ivfpqfs->M2 / 2),
+      true);
+
+  if (ivfpqfs->metric_type == faiss::METRIC_INNER_PRODUCT) {
+    metric_type_ = DistanceComputeType::INNER_PRODUCT;
+  } else {
+    metric_type_ = DistanceComputeType::L2;
+  }
+  indexed_vec_count_ = 0;  // no inverted lists yet; backfill rebuilds them
   load_num = 0;
+  assert(this->is_trained);
+  LOG(INFO) << "load training artifacts: nlist=" << ivfpqfs->nlist
+            << ", pq.M=" << ivfpqfs->pq.M << ", bbs=" << ivfpqfs->bbs
+            << ", M2=" << ivfpqfs->M2;
   return Status::OK();
 }
 

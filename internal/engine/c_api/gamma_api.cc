@@ -265,12 +265,17 @@ int BuildIndex(void *engine) {
 
 int RebuildIndex(void *engine, const char *index_name,
                       const char *field_name, const char *index_type,
-                      int drop_before_rebuild, int limit_cpu, int describe) {
+                      int drop_before_rebuild, int limit_cpu, int describe,
+                      const char *training_artifacts_path,
+                      const char *dump_artifacts_path) {
   std::string name_str = index_name ? index_name : "";
   std::string field_str = field_name ? field_name : "";
   std::string type_str = index_type ? index_type : "";
+  std::string training_artifacts_str = training_artifacts_path ? training_artifacts_path : "";
+  std::string dump_artifacts_str = dump_artifacts_path ? dump_artifacts_path : "";
   int ret = static_cast<vearch::Engine *>(engine)->RebuildIndex(
-      name_str, field_str, type_str, drop_before_rebuild, limit_cpu, describe);
+      name_str, field_str, type_str, drop_before_rebuild, limit_cpu, describe,
+      training_artifacts_str, dump_artifacts_str);
   return ret;
 }
 

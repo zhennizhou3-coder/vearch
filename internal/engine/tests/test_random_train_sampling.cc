@@ -21,9 +21,11 @@
 #include <string.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test.h"
@@ -388,6 +390,71 @@ TEST_F(RandomTrainSamplingTest, RocksDBReturnedDataIntegrity) {
         << " (RocksDB backend)";
     delete[] expected;
   }
+}
+
+// ---------- Concurrent delete window (RocksDB) ----------
+
+// Regression guard for the sample/fetch race: SampleTrainingVectorIds picks
+// live vids, then Gets() batch-fetches them. A concurrent delete that lands
+// between the two steps used to retire a just-sampled vid, so its row was
+// gone by MultiGet time and SampleTrainingVectors returned -2 ("Gets returned
+// null ... bitmap/storage inconsistency").
+//
+// The fix takes a RocksDB snapshot BEFORE sampling and fetches under it.
+// Because Engine::DeleteDocid sets the bitmap before deleting the row and
+// sampling only picks non-deleted vids, every sampled vid's row-delete is
+// newer than the snapshot, so the fetch always sees the pre-delete row. This
+// test hammers that path: a background thread deletes ~half the vids (bitmap
+// first, then row, matching DeleteDocid's order) spread across the whole id
+// range while the main thread samples in a loop. Every call must return 0
+// with a full, byte-identical sample — never -2.
+TEST_F(RandomTrainSamplingTest, RocksDBConcurrentDeleteWindow) {
+  const size_t kTotal = 20000;
+  const size_t kRequest = 500;
+  const size_t kMaxDeletes = kTotal / 2;  // keep >> kRequest live vectors
+  CreateAndFill(VectorStorageType::RocksDB, kTotal);
+
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> deleted{0};
+  std::thread deleter([&] {
+    // (i * 7919) % kTotal is a full-period permutation (7919 is prime and
+    // coprime with kTotal=20000), so tombstones spread across the whole range
+    // instead of a moving frontier — maximizing sample/delete overlap.
+    for (size_t i = 0; i < kMaxDeletes && !stop.load(); ++i) {
+      int64_t id = (int64_t)((i * 7919ULL) % kTotal);
+      bitmap_->Set(id);            // mirror DeleteDocid: bitmap first,
+      raw_vector_->Delete(id);     // then the RocksDB row.
+      deleted.fetch_add(1);
+    }
+  });
+
+  for (int iter = 0; iter < 100; ++iter) {
+    ScopeVectors vecs;
+    size_t num_got = 0, valid_count = 0;
+    int ret = raw_vector_->SampleTrainingVectors(kRequest, vecs, num_got,
+                                                 valid_count);
+    ASSERT_EQ(0, ret)
+        << "iter " << iter << ": sampling failed under concurrent delete (ret="
+        << ret << ", deleted so far=" << deleted.load()
+        << ") — the sample/fetch window is not closed";
+    ASSERT_EQ(kRequest, num_got);
+
+    // A stale/missing MultiGet slot would corrupt these bytes.
+    vector<int64_t> ids = CollectReturnedIds(vecs, num_got);
+    const uint8_t *block = vecs.Get(0);
+    size_t stride = (size_t)kDimension * sizeof(float);
+    for (size_t i = 0; i < num_got; ++i) {
+      float *expected = MakeVector(ids[i]);
+      ASSERT_EQ(0, memcmp(block + i * stride, expected,
+                          kDimension * sizeof(float)))
+          << "byte mismatch for sampled id=" << ids[i]
+          << " under concurrent delete";
+      delete[] expected;
+    }
+  }
+
+  stop.store(true);
+  deleter.join();
 }
 
 }  // namespace

@@ -87,9 +87,10 @@ struct GammaIndexHNSWLIB : public GammaFLATIndex,
 
   long GetTotalMemBytes() override;
 
-  Status Dump(const std::string &dir) override;
+  Status Dump(const std::string &path, bool training_only) override;
 
-  Status Load(const std::string &index_dir, int64_t &load_num) override;
+  Status Load(const std::string &path, bool training_only,
+              int64_t &load_num) override;
 
   /*
   virtual char *getDataByInternalId(tableint internal_id) const override {

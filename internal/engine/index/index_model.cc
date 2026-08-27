@@ -11,14 +11,25 @@
 #include "util/log.h"
 #include "vector/raw_vector.h"
 
-size_t IndexModel::ComputeIVFTrainingNum(size_t nlist) const {
+// Decide how many vectors to sample for IVF training.
+//
+// The PS/write layer (entity.ValidateIndexes) guarantees NEW spaces satisfy
+// training_threshold_ >= max(MinTrainingThreshold, ncentroids*39). This engine
+// function must additionally tolerate LEGACY spaces persisted before that check
+// existed, whose training_threshold_ may sit below ncentroids*39: it trains on
+// the configured threshold (only warning about lower quality) instead of
+// clamping the sample count up to ncentroids*39, which would demand more vectors
+// than such a table holds and make GetTrainingVectors fail the build. It still
+// returns -1 when training_threshold_ < ncentroids (k-means cannot run) and
+// clamps down above ncentroids*max_points_per_centroid to avoid oversampling.
+int64_t IndexModel::ComputeIVFTrainingNum(size_t nlist) const {
   size_t num;
   if ((size_t)training_threshold_ < nlist) {
-    // Fewer training points than centroids: k-means cannot run. Return 0 so
-    // GetTrainingVectors rejects it and the index is left unbuilt.
+    // Fewer training points than centroids: k-means cannot run. Return -1 and
+    // let the caller abort the build.
     LOG(ERROR) << "training_threshold[" << training_threshold_
                << "] < ncentroids[" << nlist << "], cannot train index.";
-    return 0;
+    return -1;
   } else if ((size_t)training_threshold_ <
              nlist * vearch::min_points_per_centroid) {
     num = (size_t)training_threshold_;

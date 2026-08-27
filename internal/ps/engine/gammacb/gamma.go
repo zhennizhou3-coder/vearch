@@ -329,8 +329,8 @@ func (ge *gammaEngine) GetEngineStatus(status *entity.EngineStatus) error {
 	// Pin the engine for the whole cgo call. Close() nils ge.gamma and then
 	// waits for counter==0 before freeing the C++ engine, so holding the
 	// counter across gamma.GetEngineStatus prevents a use-after-free when a
-	// partition closes mid-call — e.g. the rebuild monitor polling an
-	// adopt-in-flight build that holds no counter of its own.
+	// partition closes mid-call — e.g. the rebuild monitor polling on the
+	// monitor-only path, which holds no counter of its own.
 	ge.counter.Incr()
 	defer ge.counter.Decr()
 
@@ -347,20 +347,31 @@ func (ge *gammaEngine) GetEngineStatus(status *entity.EngineStatus) error {
 	return nil
 }
 
-// IndexStatusOf returns the numeric status of the index whose name matches
-// indexName (the user index_name, which is the vector_indexes_ key), from
-// EngineStatus.IndexStatuses.
-func (ge *gammaEngine) IndexStatusOf(indexName string) (string, error) {
+// IndexStatusOf returns the per-index status (status, indexed count, and the
+// isTrained / supportIncrement classification flags) of the index whose name
+// matches indexName (the user index_name, which is the vector_indexes_ key),
+// from EngineStatus.IndexStatuses. A nil flag from the engine (older .so that
+// does not emit it) resolves to true — the safe "will backfill, wait for
+// catch-up" default, so a normal index is never misclassified as terminal.
+// MaxDocid is filled from the same EngineStatus so the caller needs only this
+// one read to obtain both the index's fields and the engine-wide doc frontier.
+func (ge *gammaEngine) IndexStatusOf(indexName string) (engine.IndexStatusInfo, error) {
 	status := &entity.EngineStatus{}
 	if err := ge.GetEngineStatus(status); err != nil {
-		return "", err
+		return engine.IndexStatusInfo{}, err
 	}
 	for _, p := range status.IndexStatuses {
 		if p.IndexName == indexName {
-			return p.Status, nil
+			return engine.IndexStatusInfo{
+				Status:           p.Status,
+				IndexedNum:       int(p.IndexedNum),
+				IsTrained:        p.IsTrained == nil || *p.IsTrained,
+				SupportIncrement: p.SupportIncrement == nil || *p.SupportIncrement,
+				MaxDocid:         int(status.MaxDocid),
+			}, nil
 		}
 	}
-	return "", fmt.Errorf("index %q not found in index_statuses", indexName)
+	return engine.IndexStatusInfo{}, fmt.Errorf("index %q not found in index_statuses", indexName)
 }
 
 func (ge *gammaEngine) BuildIndex() error {
@@ -400,7 +411,7 @@ func (ge *gammaEngine) BuildIndex() error {
 // this on its own goroutine and reports the result through its done channel,
 // so this must not spawn another goroutine — doing so would report completion
 // before the rebuild actually finished.
-func (ge *gammaEngine) RebuildIndex(indexName, field, indexType string, drop, cpu, des int) error {
+func (ge *gammaEngine) RebuildIndex(indexName, field, indexType string, drop, cpu, des int, trainingArtifactsPath, dumpArtifactsPath string) error {
 	// Per-engine gate: at most one rebuild in flight on this partition. CAS
 	// failure means a rebuild is already running — fail fast rather than queue,
 	// matching the "one rebuild per partition" contract. See the rebuilding
@@ -429,11 +440,11 @@ func (ge *gammaEngine) RebuildIndex(indexName, field, indexType string, drop, cp
 	if field == "" {
 		log.Info("RebuildIndex partition:[%d] field empty, delegating to C++ whole-partition rebuild", ge.partitionID)
 	}
-	log.Info("RebuildIndex partition:[%d] name=%s field=%s indexType=%s drop=%d cpu=%d describe=%d",
-		ge.partitionID, indexName, field, indexType, drop, cpu, des)
+	log.Info("RebuildIndex partition:[%d] name=%s field=%s indexType=%s drop=%d cpu=%d describe=%d trainingArtifactsPath=%s dumpArtifactsPath=%s",
+		ge.partitionID, indexName, field, indexType, drop, cpu, des, trainingArtifactsPath, dumpArtifactsPath)
 
 	startTime := time.Now()
-	rc := gamma.RebuildIndex(enginePtr, indexName, field, indexType, drop, cpu, des)
+	rc := gamma.RebuildIndex(enginePtr, indexName, field, indexType, drop, cpu, des, trainingArtifactsPath, dumpArtifactsPath)
 	cost := time.Since(startTime).Seconds() * 1000
 	if rc != 0 {
 		log.Error("RebuildIndex partition:[%d] name=%s field=%s indexType=%s cost:[%.2f]ms err rc:[%d]",

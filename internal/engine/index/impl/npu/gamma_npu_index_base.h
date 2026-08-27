@@ -24,6 +24,8 @@
 #include "index/impl/accelerator/search_item.h"
 #include "index/impl/gamma_index_flat.h"
 #include "index/index_model.h"
+#include "monitor/monitor.h"
+#include "monitor/scope_metric.h"
 #include "util/log.h"
 #include "util/utils.h"
 #include "vector/raw_vector.h"
@@ -74,7 +76,6 @@ inline RerankSemaphore &NpuRerankLimiter() {
   return sem;
 }
 
-
 template <typename NPURetrievalParamsType>
 class GammaNPUIndexBase : public IndexModel {
  public:
@@ -86,6 +87,8 @@ class GammaNPUIndexBase : public IndexModel {
         d_(0) {}
 
   virtual ~GammaNPUIndexBase() { Cleanup(); }
+
+  bool IsTrained() const override { return is_trained_.load(); }
 
   virtual Status Init(const std::string &model_parameters,
                       int training_threshold) override {
@@ -118,6 +121,11 @@ class GammaNPUIndexBase : public IndexModel {
                  << kMaxReqNum << "]";
       return -1;
     }
+
+    SCOPE_ENGINE_METRIC(
+        npu_search_latency,
+        (monitor::Labels{{"field", vector_->MetaInfo()->Name()}}),
+        npu_search_hist_);
 
     NPURetrievalParamsType *retrieval_params =
         dynamic_cast<NPURetrievalParamsType *>(
@@ -166,9 +174,10 @@ class GammaNPUIndexBase : public IndexModel {
     // Cap rerank concurrency so the single NPU worker keeps getting scheduled.
     std::optional<RerankScope> gate;
     if (rerank) gate.emplace();
-    return accelerator::ApplyFiltersAndCompute(
+    int rc = accelerator::ApplyFiltersAndCompute(
         retrieval_context, retrieval_params, n, k, xq, raw_d, d_, recall_num,
         rerank, dis, label, distances, labels, vector_);
+    return rc;
   }
 
   void Cleanup() {
@@ -204,9 +213,14 @@ class GammaNPUIndexBase : public IndexModel {
 
   int vectors_added_since_last_log_;
 
+#ifdef ENGINE_METRICS_ENABLED
+  // Cached per-instance histogram; resolved once, then hot path only Observes.
+  prometheus::Histogram *npu_search_hist_ = nullptr;
+#endif
+
   static constexpr int kMaxBatchItems = 512;
   static constexpr int kMaxReqNum = 512;
-  static constexpr int kMaxRecallNum = 4096;
+  static constexpr int kMaxRecallNum = 16384;
 
  private:
   class RerankScope {

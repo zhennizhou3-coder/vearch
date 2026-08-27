@@ -176,6 +176,16 @@ Status GammaIVFRABITQNPUIndex::Init(const std::string &model_parameters,
     if (!status.ok()) return status;
   }
   LOG(INFO) << ivfrabitq_param.ToString();
+
+  if (vector_->MetaInfo()->DataType() != VectorValueType::FLOAT) {
+    std::string msg =
+        std::string("NPU_IVFRABITQ only supports float32 vectors, but vector "
+                    "data type is ") +
+        VectorValueTypeName(vector_->MetaInfo()->DataType());
+    LOG(ERROR) << msg;
+    return Status::ParamError(msg);
+  }
+
   int d = vector_->MetaInfo()->Dimension();
   if (std::find(kSupportedDims.begin(), kSupportedDims.end(), d) == kSupportedDims.end()) {
     std::stringstream ss;
@@ -321,7 +331,8 @@ int GammaIVFRABITQNPUIndex::Indexing() {
   if (!is_trained_) {
     std::unique_lock<std::shared_mutex> lock(npu_index_mutex_);
 
-    size_t num = ComputeIVFTrainingNum(nlist_);
+    int64_t num = ComputeIVFTrainingNum(nlist_);
+    if (num <= 0) return num;
 
     std::unique_ptr<const uint8_t[]> train_data;
     size_t num_got = 0;
@@ -475,7 +486,6 @@ int GammaIVFRABITQNPUIndex::Update(const std::vector<int64_t> &ids,
                     "exception, n_update=" << n_update;
       return -1;
     }
-
   }
 
   updated_num_ += n_update;
@@ -724,17 +734,28 @@ std::string IVFRaBitQToString(const faiss::IndexIVFRaBitQ *ivfrq) {
   return ss.str();
 }
 
-Status GammaIVFRABITQNPUIndex::Dump(const std::string &dir) {
+// Merged full/training dump: shared copyTo bridge + try/catch. Full writes the
+// whole index (write_index + indexed_count); training_only writes just the
+// centroids + RaBitQ scalar params (magics "InRq"/"InRr", no learned codebook).
+// path is a directory (full) or the exact file (training_only).
+Status GammaIVFRABITQNPUIndex::Dump(const std::string &path, bool training_only) {
   if (not is_trained_) {
     LOG(INFO) << "gamma index is not trained, skip dumping";
     return Status::OK();
   }
+
   std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_dir = dir + "/" + index_name;
-  if (utils::make_dir(index_dir.c_str())) {
-    std::string msg = std::string("mkdir error, index dir=") + index_dir;
-    LOG(ERROR) << msg;
-    return Status::PathNotFound(msg);
+  std::string index_file;
+  if (training_only) {
+    index_file = path;
+  } else {
+    std::string index_dir = path + "/" + index_name;
+    if (utils::make_dir(index_dir.c_str())) {
+      std::string msg = std::string("mkdir error, index dir=") + index_dir;
+      LOG(ERROR) << msg;
+      return Status::PathNotFound(msg);
+    }
+    index_file = index_dir + "/" + kIndexFileName;
   }
 
   std::unique_lock<std::shared_mutex> lock(npu_index_mutex_);
@@ -742,32 +763,46 @@ Status GammaIVFRABITQNPUIndex::Dump(const std::string &dir) {
   auto index = std::make_unique<faiss::IndexIVFRaBitQ>();
   index->own_fields = true;
   index->own_invlists = true;
-  auto ivf_rabitq = dynamic_cast<faiss::ascend::AscendIndexIVFRaBitQ *>(npu_index_.get());
+  auto ivf_rabitq =
+      dynamic_cast<faiss::ascend::AscendIndexIVFRaBitQ *>(npu_index_.get());
   if (ivf_rabitq == nullptr) {
     std::string msg = "npu_index_ is not AscendIndexIVFRaBitQ, skip dump";
     LOG(ERROR) << msg;
     return Status::IOError(msg);
   }
 
-  // Wrap the heavy lifting in try/catch: copyTo (NPU→host DMA + buffer alloc)
-  // and write_index (filesystem IO) are external library calls that can throw
-  // std::bad_alloc / std::ios_base::failure / ascendfaiss errors. Without
-  // this guard a thrown exception calls std::terminate() and crashes the
-  // whole PS process. Catch and report cleanly so the next flush cycle can
-  // retry.
+  // Wrap the heavy lifting in try/catch: copyTo (NPU→host DMA) and the write
+  // calls (filesystem IO) are external library calls that can throw. Without
+  // this guard a thrown exception calls std::terminate() and crashes the whole
+  // PS process. Catch and report cleanly so the next flush cycle can retry.
   try {
     ivf_rabitq->copyTo(index.get());
     lock.unlock();
 
-    std::string index_file = index_dir + "/" + kIndexFileName;
     faiss::IOWriter *f = new FileIOWriter(index_file.c_str());
     utils::ScopeDeleter1<FileIOWriter> del((FileIOWriter *)f);
-
-    faiss::write_index(index.get(), f);
-    WRITE1(indexed_count);
+    if (training_only) {
+      if (index->rabitq.nb_bits == 1) {
+        uint32_t h = faiss::fourcc("InRq");  // 1-bit
+        WRITE1(h);
+        vearch::write_ivf_header(index.get(), f);
+        vearch::write_RaBitQuantizer(&index->rabitq, f, false);
+      } else {
+        uint32_t h = faiss::fourcc("InRr");  // multi-bit
+        WRITE1(h);
+        vearch::write_ivf_header(index.get(), f);
+        vearch::write_RaBitQuantizer(&index->rabitq, f, true);
+      }
+      WRITE1(index->code_size);
+      WRITE1(index->by_residual);
+      WRITE1(index->qb);
+    } else {
+      faiss::write_index(index.get(), f);
+      WRITE1(indexed_count);
+    }
   } catch (const std::exception &e) {
-    LOG(ERROR) << "AscendIndexIVFRaBitQ Dump failed, index_name="
-               << index_name << ", err=" << e.what();
+    LOG(ERROR) << "AscendIndexIVFRaBitQ Dump failed, index_name=" << index_name
+               << ", err=" << e.what();
     return Status::IOError(std::string("dump failed: ") + e.what());
   } catch (...) {
     LOG(ERROR) << "AscendIndexIVFRaBitQ Dump failed with unknown exception, "
@@ -775,63 +810,106 @@ Status GammaIVFRABITQNPUIndex::Dump(const std::string &dir) {
     return Status::IOError("dump failed: unknown exception");
   }
 
-  LOG(INFO) << "dump:" << IVFRaBitQToString(index.get())
+  LOG(INFO) << (training_only ? "dump training artifacts:" : "dump:")
+            << IVFRaBitQToString(index.get())
             << ", indexed count=" << indexed_count;
-
   index.reset();
   malloc_trim(0);
   return Status::OK();
 }
 
-Status GammaIVFRABITQNPUIndex::Load(const std::string &dir, int64_t &load_num) {
+// Merged full/training load: shared try/catch + copyFrom + search-thread start.
+// Full reads the whole index (read_index + indexed_count); training_only reads
+// just the centroids + RaBitQ params (magics "InRq"/"InRr") and leaves
+// indexed_count_/load_num at 0 so backfill rebuilds the inverted lists.
+Status GammaIVFRABITQNPUIndex::Load(const std::string &path, bool training_only,
+                                    int64_t &load_num) {
   std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_file = dir + "/" + index_name + "/" + kIndexFileName;
-  if (!utils::file_exist(index_file)) {
-    LOG(INFO) << index_file << " is not existing, skip loading";
-    load_num = 0;
-    return Status::OK();  // it should train again after load
+  std::string index_file;
+  if (training_only) {
+    index_file = path;
+    if (!utils::file_exist(index_file)) {
+      return Status::IOError("Load training artifacts: file not found: " +
+                             index_file);
+    }
+  } else {
+    index_file = path + "/" + index_name + "/" + kIndexFileName;
+    if (!utils::file_exist(index_file)) {
+      LOG(INFO) << index_file << " is not existing, skip loading";
+      load_num = 0;
+      return Status::OK();  // it should train again after load
+    }
   }
 
   // Wrap the IO + deserialization + host→NPU copy in try/catch. Any of
-  // faiss::read_index / READ1 / AscendIndexIVFRaBitQ::copyFrom can throw on
-  // corrupt files, partial writes from a previous crash, or NPU device
-  // errors during boot. An uncaught exception here would abort the PS
-  // process during partition recovery and prevent the whole node from
-  // coming up.
+  // read_index / READ1 / read_ivf_header / copyFrom can throw on corrupt files,
+  // partial writes from a previous crash, or NPU device errors during boot. An
+  // uncaught exception here would abort the PS process during recovery.
   try {
     faiss::IOReader *f = new FileIOReader(index_file.c_str());
     utils::ScopeDeleter1<FileIOReader> del((FileIOReader *)f);
-    std::unique_ptr<faiss::Index> index(faiss::read_index(f));
-    if (index == nullptr) {
-      std::string msg =
-          std::string("read Ascendivfrabitq index error, index name=") + index_name;
-      LOG(ERROR) << msg;
-      return Status::IOError(msg);
-    }
 
-    LOG(INFO) << "read index success, index name=" << index_name;
-    faiss::IndexIVFRaBitQ *loaded_index = dynamic_cast<faiss::IndexIVFRaBitQ *>(index.get());
-    if (loaded_index == nullptr) {
-      std::string msg =
-          std::string("read index error, index name=" ) + index_name;
-      LOG(ERROR) << msg;
-      return Status::IOError(msg);
-    }
+    std::unique_ptr<faiss::Index> full_holder;          // owns full-load result
+    std::unique_ptr<faiss::IndexIVFRaBitQ> ta_holder;   // owns artifacts result
+    faiss::IndexIVFRaBitQ *loaded_index = nullptr;
 
-    int64_t indexed_vec_count = 0;
-    READ1(indexed_vec_count);
-    indexed_count_ = indexed_vec_count;
-    if (indexed_count_ < 0) {
+    if (training_only) {
+      uint32_t h;
+      READ1(h);
+      if (h != faiss::fourcc("InRq") && h != faiss::fourcc("InRr")) {
+        return Status::IOError("bad magic for NPU IVFRABITQ training artifacts");
+      }
+      ta_holder = std::make_unique<faiss::IndexIVFRaBitQ>();
+      ta_holder->own_fields = true;
+      ta_holder->own_invlists = true;
+      vearch::read_ivf_header(ta_holder.get(), f, nullptr);
+      if (h == faiss::fourcc("InRq")) {
+        vearch::read_RaBitQuantizer(&ta_holder->rabitq, f, false);
+      } else {
+        vearch::read_RaBitQuantizer(&ta_holder->rabitq, f, true);
+      }
+      READ1(ta_holder->code_size);
+      READ1(ta_holder->by_residual);
+      READ1(ta_holder->qb);
+      ta_holder->rabitq.code_size = ta_holder->rabitq.compute_code_size(
+          ta_holder->d, ta_holder->rabitq.nb_bits);
+      ta_holder->code_size = ta_holder->rabitq.code_size;
+      loaded_index = ta_holder.get();
+      indexed_count_ = 0;  // no inverted lists yet; backfill rebuilds them
+    } else {
+      full_holder.reset(faiss::read_index(f));
+      if (full_holder == nullptr) {
+        std::string msg =
+            std::string("read Ascendivfrabitq index error, index name=") +
+            index_name;
+        LOG(ERROR) << msg;
+        return Status::IOError(msg);
+      }
+      LOG(INFO) << "read index success, index name=" << index_name;
+      loaded_index = dynamic_cast<faiss::IndexIVFRaBitQ *>(full_holder.get());
+      if (loaded_index == nullptr) {
+        std::string msg =
+            std::string("read index error, index name=") + index_name;
+        LOG(ERROR) << msg;
+        return Status::IOError(msg);
+      }
+      int64_t indexed_vec_count = 0;
+      READ1(indexed_vec_count);
+      indexed_count_ = indexed_vec_count;
+      if (indexed_count_ < 0) {
         std::string msg = std::string("invalid indexed count [") +
                           std::to_string(indexed_count_) + "] vector size [" +
                           std::to_string(vector_->MetaInfo()->size_) + "]";
         LOG(ERROR) << msg;
         return Status::IndexError(msg);
+      }
+      LOG(INFO) << "load: " << IVFRaBitQToString(loaded_index)
+                << ", indexed vector count=" << indexed_count_;
     }
-    LOG(INFO) << "load: " << IVFRaBitQToString(loaded_index)
-              << ", indexed vector count=" << indexed_count_;
 
-    auto ivf_rabitq = dynamic_cast<faiss::ascend::AscendIndexIVFRaBitQ *>(npu_index_.get());
+    std::unique_lock<std::shared_mutex> lock(npu_index_mutex_);
+    auto ivf_rabitq =
+        dynamic_cast<faiss::ascend::AscendIndexIVFRaBitQ *>(npu_index_.get());
     if (ivf_rabitq == nullptr) {
       std::string msg = "npu_index_ is not AscendIndexIVFRaBitQ, skip load";
       LOG(ERROR) << msg;
@@ -841,9 +919,13 @@ Status GammaIVFRABITQNPUIndex::Load(const std::string &dir, int64_t &load_num) {
     this->is_trained_ = loaded_index->is_trained;
     assert(this->is_trained_);
     load_num = indexed_count_;
+    if (training_only) {
+      LOG(INFO) << "load training artifacts: "
+                << IVFRaBitQToString(loaded_index);
+    }
   } catch (const std::exception &e) {
-    LOG(ERROR) << "AscendIndexIVFRaBitQ Load failed, index_name="
-               << index_name << ", err=" << e.what();
+    LOG(ERROR) << "AscendIndexIVFRaBitQ Load failed, index_name=" << index_name
+               << ", err=" << e.what();
     return Status::IOError(std::string("load failed: ") + e.what());
   } catch (...) {
     LOG(ERROR) << "AscendIndexIVFRaBitQ Load failed with unknown exception, "
@@ -851,11 +933,8 @@ Status GammaIVFRABITQNPUIndex::Load(const std::string &dir, int64_t &load_num) {
     return Status::IOError("load failed: unknown exception");
   }
 
-  // After a successful load the NPU index is fully usable, but the search
-  // worker thread is only started inside Indexing(). Without this hook the
-  // first search after a PS restart fails with "npu index not indexed!" until
-  // someone manually triggers /index/forcemerge or writes a document. Start
-  // the worker eagerly so search becomes available as soon as Load returns.
+  // Start the search worker eagerly (mirror the pre-merge Load): without this
+  // the first search after a PS restart fails until a manual forcemerge/write.
   if (is_trained_ && npu_search_threads_.size() == 0) {
     CreateSearchThread();
     LOG(INFO) << "NPU search thread started after Load, index name="

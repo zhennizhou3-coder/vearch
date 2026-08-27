@@ -1260,6 +1260,8 @@ struct GammaIVFPQIndex : GammaFLATIndex, faiss::IndexIVFPQ {
 
   virtual ~GammaIVFPQIndex();
 
+  bool IsTrained() const override { return is_trained; }
+
   faiss::InvertedListScanner *GetInvertedListScanner(
       bool store_pairs, const faiss::IDSelector *sel,
       const faiss::IVFSearchParameters*, const RetrievalContext *retrieval_context);
@@ -1294,9 +1296,10 @@ struct GammaIVFPQIndex : GammaFLATIndex, faiss::IndexIVFPQ {
     return rt_invert_index_ptr_->GetTotalMemBytes();
   }
 
-  Status Dump(const std::string &dir) override;
+  Status Dump(const std::string &path, bool training_only) override;
 
-  Status Load(const std::string &index_dir, int64_t &load_num) override;
+  Status Load(const std::string &path, bool training_only,
+              int64_t &load_num) override;
 
   virtual void copy_subset_to(faiss::IndexIVF &other,
                               faiss::InvertedLists::subset_type_t subset_type,

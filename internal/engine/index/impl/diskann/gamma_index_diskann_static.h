@@ -25,6 +25,15 @@ class GammaIndexDiskANNStatic : public IndexModel {
   GammaIndexDiskANNStatic();
   ~GammaIndexDiskANNStatic() override;
 
+  // DISKANN has no IVF-style training; its on-disk structure is built whole in
+  // Indexing() and only becomes queryable once disk_index_ready_ is set (at the
+  // end of Indexing()/Load()). Report that readiness through IsTrained() so the
+  // rebuild monitor and EngineStatus see a truthful "produced a usable index"
+  // signal — matching VectorManager's uniform "Indexing() produced an index"
+  // view, even though DISKANN never trains in the faiss sense. Reads the atomic
+  // disk_index_ready_, so it is safe under the IndexStatuses() rdlock.
+  bool IsTrained() const override { return disk_index_ready_.load(); }
+
   Status Init(const std::string &model_parameters,
               int training_threshold) override;
 
@@ -48,8 +57,9 @@ class GammaIndexDiskANNStatic : public IndexModel {
 
   long GetTotalMemBytes() override;
 
-  Status Dump(const std::string &dir) override;
-  Status Load(const std::string &dir, int64_t &load_num) override;
+  Status Dump(const std::string &path, bool training_only) override;
+  Status Load(const std::string &path, bool training_only,
+              int64_t &load_num) override;
 
   void Describe() override;
 

@@ -237,7 +237,8 @@ int GammaIVFRABITQIndex::Indexing() {
     return 0;
   }
 
-  size_t num = ComputeIVFTrainingNum(nlist);
+  int64_t num = ComputeIVFTrainingNum(nlist);
+  if (num <= 0) return num;
 
   std::unique_ptr<const uint8_t[]> train_data;
   size_t num_got = 0;
@@ -781,77 +782,109 @@ std::string IVFRABITQToString(const faiss::IndexIVFRaBitQ *ivfrabitq) {
   return ss.str();
 }
 
-Status GammaIVFRABITQIndex::Dump(const std::string &dir) {
+// Dump merges the full dump and the training-artifacts dump: both write the
+// same artifacts (magic + IVF header + RaBitQ scalar params); the full dump
+// then appends the inverted lists + indexed count. Magics "Iwrq" (1-bit) /
+// "Iwrr" (multi-bit) are identical in both, so a training-artifacts file is a
+// byte-for-byte prefix of a full dump. `training_only == false`: `path` is a
+// directory; `training_only == true`: `path` is the exact output file.
+Status GammaIVFRABITQIndex::Dump(const std::string &path, bool training_only) {
   if (!this->is_trained) {
     LOG(INFO) << "gamma index is not trained, skip dumping";
     return Status::OK();
   }
-  std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_dir = dir + "/" + index_name;
-  if (utils::make_dir(index_dir.c_str())) {
-    std::string msg = std::string("mkdir error, index dir=") + index_dir;
-    LOG(ERROR) << msg;
-    return Status::PathNotFound(msg);
+
+  std::string index_file;
+  if (training_only) {
+    index_file = path;
+  } else {
+    std::string index_name = vector_->MetaInfo()->AbsoluteName();
+    std::string index_dir = path + "/" + index_name;
+    if (utils::make_dir(index_dir.c_str())) {
+      std::string msg = std::string("mkdir error, index dir=") + index_dir;
+      LOG(ERROR) << msg;
+      return Status::PathNotFound(msg);
+    }
+    index_file = index_dir + "/ivfrabitq.index";
   }
 
-  std::string index_file = index_dir + "/ivfrabitq.index";
   faiss::IOWriter *f = new FileIOWriter(index_file.c_str());
   utils::ScopeDeleter1<FileIOWriter> del((FileIOWriter *)f);
+
   const IndexIVFRaBitQ *ivfrabitq = static_cast<const IndexIVFRaBitQ *>(this);
   // keep format same as faiss, 1-bit (backward compatible) or multi-bit (new format)
   if (ivfrabitq->rabitq.nb_bits == 1) {
-    uint32_t h = faiss::fourcc("Iwrq"); // 1-bit (backward compatible)
+    uint32_t h = faiss::fourcc("Iwrq");  // 1-bit (backward compatible)
     WRITE1(h);
     vearch::write_ivf_header(ivfrabitq, f);
     vearch::write_RaBitQuantizer(&ivfrabitq->rabitq, f, false);
   } else {
-    uint32_t h = faiss::fourcc("Iwrr"); // multi-bit (new format)
+    uint32_t h = faiss::fourcc("Iwrr");  // multi-bit (new format)
     WRITE1(h);
     vearch::write_ivf_header(ivfrabitq, f);
     vearch::write_RaBitQuantizer(&ivfrabitq->rabitq, f, true);
   }
-
   WRITE1(ivfrabitq->code_size);
   WRITE1(ivfrabitq->by_residual);
   WRITE1(ivfrabitq->qb);
 
-  int64_t indexed_count = indexed_vec_count_;
-  if (WriteInvertedLists(f, rt_invert_index_ptr_)) {
-    std::string msg =
-        std::string("write invert list error, index name=") + index_name;
-    LOG(ERROR) << msg;
-    return Status::IOError(msg);
+  if (!training_only) {
+    int64_t indexed_count = indexed_vec_count_;
+    if (WriteInvertedLists(f, rt_invert_index_ptr_)) {
+      std::string msg = std::string("write invert list error, index name=") +
+                        vector_->MetaInfo()->AbsoluteName();
+      LOG(ERROR) << msg;
+      return Status::IOError(msg);
+    }
+    WRITE1(indexed_count);
   }
-  WRITE1(indexed_count);
 
-  LOG(INFO) << "dump:" << IVFRABITQToString(ivfrabitq)
-            << ", indexed count=" << indexed_count;
+  LOG(INFO) << (training_only ? "dump training artifacts:" : "dump:")
+            << IVFRABITQToString(ivfrabitq)
+            << ", indexed count=" << indexed_vec_count_;
   return Status::OK();
-};
+}
 
-Status GammaIVFRABITQIndex::Load(const std::string &dir, int64_t &load_num) {
-  std::string index_name = vector_->MetaInfo()->AbsoluteName();
-  std::string index_file = dir + "/" + index_name + "/ivfrabitq.index";
-  if (!utils::file_exist(index_file)) {
-    LOG(INFO) << index_file << " isn't existed, skip loading";
-    load_num = 0;
-    return Status::OK();  // it should train again after load
+// Load merges the full load and the training-artifacts load (inverse of Dump):
+// both read centroids + RaBitQ scalar params; the full load then reads the
+// inverted lists + indexed count, while the training-only load leaves
+// indexed_vec_count_ at 0 so backfill rebuilds the inverted lists.
+Status GammaIVFRABITQIndex::Load(const std::string &path, bool training_only,
+                                 int64_t &load_num) {
+  std::string index_file;
+  if (training_only) {
+    index_file = path;
+    if (!utils::file_exist(index_file)) {
+      return Status::IOError("Load training artifacts: file not found: " +
+                             index_file);
+    }
+  } else {
+    std::string index_name = vector_->MetaInfo()->AbsoluteName();
+    index_file = path + "/" + index_name + "/ivfrabitq.index";
+    if (!utils::file_exist(index_file)) {
+      LOG(INFO) << index_file << " isn't existed, skip loading";
+      load_num = 0;
+      return Status::OK();  // it should train again after load
+    }
   }
 
   faiss::IOReader *f = new FileIOReader(index_file.c_str());
   utils::ScopeDeleter1<FileIOReader> del((FileIOReader *)f);
+
   uint32_t h;
   READ1(h);
   // keep format same as faiss, 1-bit (backward compatible) or multi-bit (new format)
-  assert(h == faiss::fourcc("Iwrq") || h == faiss::fourcc("Iwrr"));
+  if (h != faiss::fourcc("Iwrq") && h != faiss::fourcc("Iwrr")) {
+    return Status::IOError("bad magic for IVFRABITQ index");
+  }
   IndexIVFRaBitQ *ivfrabitq = static_cast<IndexIVFRaBitQ *>(this);
   vearch::read_ivf_header(ivfrabitq, f, nullptr);  // not legacy
 
   if (h == faiss::fourcc("Iwrq")) {
     vearch::read_RaBitQuantizer(&ivfrabitq->rabitq, f, false);
-  } else if (h == faiss::fourcc("Iwrr")) {
-    // Iwrr = multi-bit format (new)
-    vearch::read_RaBitQuantizer(&ivfrabitq->rabitq, f, true); // Reads nb_bits from file
+  } else {
+    // Iwrr = multi-bit format (new); reads nb_bits from file
+    vearch::read_RaBitQuantizer(&ivfrabitq->rabitq, f, true);
   }
 
   READ1(ivfrabitq->code_size);
@@ -860,7 +893,7 @@ Status GammaIVFRABITQIndex::Load(const std::string &dir, int64_t &load_num) {
 
   // Update rabitq to match nb_bits
   ivfrabitq->rabitq.code_size =
-          ivfrabitq->rabitq.compute_code_size(ivfrabitq->d, ivfrabitq->rabitq.nb_bits);
+      ivfrabitq->rabitq.compute_code_size(ivfrabitq->d, ivfrabitq->rabitq.nb_bits);
   ivfrabitq->code_size = ivfrabitq->rabitq.code_size;
 
   faiss::IndexHNSWFlat *hnsw_flat =
@@ -868,6 +901,14 @@ Status GammaIVFRABITQIndex::Load(const std::string &dir, int64_t &load_num) {
   if (hnsw_flat) {
     hnsw_flat->hnsw.search_bounded_queue = false;
     quantizer_type_ = 1;
+  }
+
+  if (training_only) {
+    indexed_vec_count_ = 0;  // no inverted lists yet; backfill rebuilds them
+    load_num = 0;
+    assert(this->is_trained);
+    LOG(INFO) << "load training artifacts: " << IVFRABITQToString(ivfrabitq);
+    return Status::OK();
   }
 
   int64_t indexed_vec_count = 0;
@@ -888,14 +929,14 @@ Status GammaIVFRABITQIndex::Load(const std::string &dir, int64_t &load_num) {
     LOG(INFO) << "load: " << IVFRABITQToString(ivfrabitq)
               << ", indexed vector count=" << indexed_vec_count_;
   } else {
-    std::string msg =
-        std::string("read invert list error, index name=") + index_name;
+    std::string msg = std::string("read invert list error, index name=") +
+                      vector_->MetaInfo()->AbsoluteName();
     LOG(ERROR) << msg;
     return Status::IndexError(msg);
   }
   assert(this->is_trained);
   load_num = indexed_vec_count_;
   return Status::OK();
-};
+}
 
 }  // namespace vearch

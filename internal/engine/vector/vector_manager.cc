@@ -6,10 +6,11 @@
  */
 
 #include "vector/vector_manager.h"
-
+#include <algorithm>
 #include "index/impl/hnswlib/gamma_index_hnswlib.h"
 #include "index/impl/gamma_index_ivfflat.h"
 #include "index/impl/gamma_index_ivfpq.h"
+#include "index/index_io.h"
 #ifdef BUILD_WITH_GPU
 #include "index/impl/gpu/gamma_index_ivfflat_gpu.h"
 #include "index/impl/gpu/gamma_index_ivfpq_gpu.h"
@@ -510,7 +511,9 @@ Status VectorManager::ResolveRebuildTarget(const std::string &field_name,
 Status VectorManager::ReCreateVectorIndex(const std::string &index_name,
                                           const std::string &field_name,
                                           const std::string &index_type,
-                                          int training_threshold) {
+                                          int training_threshold,
+                                          const std::string &load_path,
+                                          const std::string &dump_artifacts_path) {
   const std::string target_index_name = index_name;
 
   // Publish BUILDING to the name-keyed state map (describe API) in addition to
@@ -558,24 +561,74 @@ Status VectorManager::ReCreateVectorIndex(const std::string &index_name,
     return status;
   }
 
+  // Publish the freshly-created (untrained) index into the live map, mark it
+  // INDEXING, then release the write lock BEFORE training. Training is the long
+  // (minutes~hours) phase; holding vector_indexes_mutex_ across it would block
+  // every search on this partition for the whole rebuild. With the lock
+  // released, searches on this field hit the untrained index under the rdlock
+  // and fall back to the realtime buffer — exactly the initial-build behavior
+  // (the field is effectively unqueryable until training completes) — instead
+  // of blocking. The old index was already dropped above, so peak memory stays
+  // at a single index (the drop-before contract this path exists for).
   for (auto &[name, idx] : new_indexes) {
     vector_indexes_[name] = idx;
-    vector_index_status_[name] = IndexStatus::UNINDEXED;
+    vector_index_status_[name] = IndexStatus::INDEXING;
     LOG(INFO) << desc_ << "set " << name << " index";
   }
-
-  int train_ret = TrainIndex(new_indexes);
-  if (train_ret != 0) {
-    LOG(ERROR) << desc_ << "TrainIndex for " << target_index_name
-               << " failed after ReCreateVectorIndex, ret=" << train_ret;
-    vector_index_status_[target_index_name] = IndexStatus::FAILED;
-    pthread_rwlock_unlock(&vector_indexes_mutex_);
-    SetIndexState(index_name, IndexState::FAILED);
-    return Status::IOError("ReCreateVectorIndex: TrainIndex failed");
-  }
-  vector_index_status_[target_index_name] = IndexStatus::INDEXED;
-
   pthread_rwlock_unlock(&vector_indexes_mutex_);
+
+  // Train / load without the lock. new_indexes holds the same IndexModel* now
+  // live in vector_indexes_; concurrent search reads them under the rdlock while
+  // Indexing() trains — the same read-vs-train concurrency the initial build
+  // already relies on. SetIndexStatus re-takes the write lock briefly and is a
+  // no-op if the index was meanwhile removed, so it is safe to call unlocked.
+  //
+  // Replica consistency (same policy as RebuildVectorIndex): a follower loads
+  // the trainer's artifacts instead of training; a trainer trains then dumps for
+  // followers to pull. An index family without separable artifacts reports
+  // kNotSupported — on load, fall back to training; on dump, skip.
+  bool loaded = false;
+  if (!load_path.empty()) {
+    Status load_status = LoadTrainingArtifacts(new_indexes, load_path);
+    if (load_status.code() == status::kNotSupported) {
+      LOG(INFO) << desc_ << "index " << target_index_name
+                << " has no separable training artifacts, training instead of "
+                   "loading from "
+                << load_path;
+    } else if (!load_status.ok()) {
+      LOG(ERROR) << desc_ << "LoadTrainingArtifacts for " << target_index_name
+                 << " failed after ReCreateVectorIndex: "
+                 << load_status.ToString();
+      SetIndexStatus(target_index_name, IndexStatus::FAILED);
+      SetIndexState(index_name, IndexState::FAILED);
+      return load_status;
+    } else {
+      loaded = true;
+    }
+  }
+  if (!loaded) {
+    int train_ret = TrainIndex(new_indexes);
+    if (train_ret != 0) {
+      LOG(ERROR) << desc_ << "TrainIndex for " << target_index_name
+                 << " failed after ReCreateVectorIndex, ret=" << train_ret;
+      SetIndexStatus(target_index_name, IndexStatus::FAILED);
+      SetIndexState(index_name, IndexState::FAILED);
+      return Status::IOError("ReCreateVectorIndex: TrainIndex failed");
+    }
+    if (!dump_artifacts_path.empty()) {
+      Status dump_status =
+          DumpTrainingArtifacts(new_indexes, dump_artifacts_path);
+      if (!dump_status.ok()) {
+        LOG(ERROR) << desc_ << "DumpTrainingArtifacts for " << target_index_name
+                   << " failed after ReCreateVectorIndex: "
+                   << dump_status.ToString();
+        SetIndexStatus(target_index_name, IndexStatus::FAILED);
+        SetIndexState(index_name, IndexState::FAILED);
+        return dump_status;
+      }
+    }
+  }
+  SetIndexStatus(target_index_name, IndexStatus::INDEXED);
   SetIndexState(index_name, IndexState::READY);
   LOG(INFO) << desc_ << "ReCreateVectorIndex for " << target_index_name
             << " success";
@@ -586,7 +639,9 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
                                          const std::string &field_name,
                                          const std::string &index_type,
                                          int training_threshold,
-                                         bool do_train) {
+                                         bool do_train,
+                                         const std::string &load_path,
+                                         const std::string &dump_artifacts_path) {
   const std::string target_index_name = index_name;
 
   SetIndexStatus(target_index_name, IndexStatus::INDEXING);
@@ -623,8 +678,35 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
     return status;
   }
 
-  // Step 2: train if requested.
-  if (do_train) {
+  // Step 2: replica consistency. A follower loads the trainer's artifacts
+  // (centroids + PQ codebook) instead of training; a trainer trains then dumps
+  // them for followers to pull. An index family without separable artifacts
+  // reports kNotSupported — on load, fall back to training; on dump, skip
+  // (no artifacts published for the round). The engine owns this capability
+  // judgment.
+  bool loaded = false;
+  if (!load_path.empty()) {
+    Status load_status = LoadTrainingArtifacts(new_indexes, load_path);
+    if (load_status.code() == status::kNotSupported) {
+      LOG(INFO) << desc_ << "RebuildVectorIndex " << target_index_name
+                << " has no separable training artifacts, training instead of "
+                   "loading from "
+                << load_path;
+    } else if (!load_status.ok()) {
+      LOG(ERROR) << desc_ << "RebuildVectorIndex LoadTrainingArtifacts for "
+                 << target_index_name
+                 << " failed: " << load_status.ToString();
+      for (auto &[name, idx] : new_indexes) {
+        if (idx != nullptr) delete idx;
+      }
+      SetIndexStatus(target_index_name, IndexStatus::FAILED);
+      SetIndexState(index_name, IndexState::FAILED);
+      return load_status;
+    } else {
+      loaded = true;
+    }
+  }
+  if (!loaded && do_train) {
     int ret = TrainIndex(new_indexes);
     if (ret != 0) {
       LOG(ERROR) << desc_ << "RebuildVectorIndex TrainIndex for "
@@ -636,9 +718,33 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
       SetIndexState(index_name, IndexState::FAILED);
       return Status::IOError("TrainIndex failed");
     }
+    if (!dump_artifacts_path.empty()) {
+      Status dump_status =
+          DumpTrainingArtifacts(new_indexes, dump_artifacts_path);
+      if (!dump_status.ok()) {
+        LOG(ERROR) << desc_ << "RebuildVectorIndex DumpTrainingArtifacts for "
+                   << target_index_name
+                   << " failed: " << dump_status.ToString();
+        for (auto &[name, idx] : new_indexes) {
+          if (idx != nullptr) delete idx;
+        }
+        SetIndexStatus(target_index_name, IndexStatus::FAILED);
+        SetIndexState(index_name, IndexState::FAILED);
+        return dump_status;
+      }
+    }
   }
 
   // Step 3: swap in under the write lock. Old index stays queryable until here.
+  // Status reflects the training state: a trained index (do_train succeeded in
+  // Step 2, or a model was injected — a failure there already returned) is
+  // INDEXED; an untrained index (do_train was false and no model injected,
+  // because the live doc count is below training_threshold) is UNINDEXED,
+  // matching the first-build convention so the AddOrUpdate auto-index gate
+  // re-trains it once enough docs exist.
+  bool trained = do_train || loaded;
+  IndexStatus index_status =
+      trained ? IndexStatus::INDEXED : IndexStatus::UNINDEXED;
   pthread_rwlock_wrlock(&vector_indexes_mutex_);
   auto it = vector_indexes_.find(target_index_name);
   if (it != vector_indexes_.end()) {
@@ -649,8 +755,9 @@ Status VectorManager::RebuildVectorIndex(const std::string &index_name,
   }
   for (auto &[name, idx] : new_indexes) {
     vector_indexes_[name] = idx;
-    vector_index_status_[name] = IndexStatus::INDEXED;
-    LOG(INFO) << desc_ << "set " << name << " index";
+    vector_index_status_[name] = index_status;
+    LOG(INFO) << desc_ << "set " << name << " index, status="
+              << IndexStatusToString(index_status);
   }
   pthread_rwlock_unlock(&vector_indexes_mutex_);
 
@@ -665,7 +772,30 @@ std::vector<VectorManager::IndexStatusEntry> VectorManager::IndexStatuses() {
   pthread_rwlock_rdlock(&vector_indexes_mutex_);
   out.reserve(vector_index_status_.size());
   for (const auto &[name, st] : vector_index_status_) {
-    out.push_back({name, st});
+    // vector_index_status_ and vector_indexes_ share keys (kept in sync at swap);
+    // a missing model keeps the safe defaults below.
+    int64_t indexed_num = 0;
+    bool is_trained = true;
+    bool support_increment = true;
+    auto it = vector_indexes_.find(name);
+    if (it != vector_indexes_.end() && it->second != nullptr) {
+      indexed_num = it->second->indexed_count_;
+      // IsTrained() for the faiss families (IVF*) reads faiss's non-atomic
+      // `is_trained`, which Engine::Indexing writes via train() WITHOUT this
+      // lock (TrainIndex iterates lock-free). That is a formal data race on a
+      // non-atomic bool. It does NOT corrupt the rebuild monitor's decision:
+      // Indexing() writes is_trained (train()) and only afterwards, under the
+      // WRITE lock, publishes status=INDEXED (SetAllStatuses). A reader that
+      // observes INDEXED under this read lock therefore also observes the
+      // settled is_trained (write-unlock synchronizes-with read-lock); and the
+      // monitor consumes is_trained only once status has settled (not while
+      // INDEXING). GPU/NPU/SCANN avoid the race outright with atomic<bool>;
+      // faiss's is_trained is a base-class member we cannot retype here, so the
+      // race remains benign-but-real (ThreadSanitizer will flag it).
+      is_trained = it->second->IsTrained();
+      support_increment = it->second->SupportIncrement();
+    }
+    out.push_back({name, st, indexed_num, is_trained, support_increment});
   }
   pthread_rwlock_unlock(&vector_indexes_mutex_);
   return out;
@@ -952,6 +1082,52 @@ int VectorManager::TrainIndex(
     }
   }
   return ret;
+}
+
+Status VectorManager::DumpTrainingArtifacts(
+    std::map<std::string, IndexModel *> &new_indexes, const std::string &path) {
+  for (const auto &[name, index] : new_indexes) {
+    try {
+      Status status = index->Dump(path, /*training_only=*/true);
+      // Indexes without separable training artifacts need no dump.
+      if (status.code() == status::kNotSupported) {
+        LOG(INFO) << desc_ << "index " << name
+                  << " has no separable training artifacts, skip dump";
+        continue;
+      }
+      if (!status.ok()) {
+        LOG(ERROR) << desc_ << "vector table " << name
+                   << " dump training artifacts failed: " << status.ToString();
+        return status;
+      }
+    } catch (const std::exception &e) {
+      return Status::IOError(std::string("DumpTrainingArtifacts failed for ") +
+                             name + ": " + e.what());
+    }
+  }
+  return Status::OK();
+}
+
+Status VectorManager::LoadTrainingArtifacts(
+    std::map<std::string, IndexModel *> &new_indexes, const std::string &path) {
+  for (const auto &[name, index] : new_indexes) {
+    // Each index opens and reads the same training-artifacts file from the
+    // beginning (a rebuild targets a single index, so new_indexes holds one
+    // entry).
+    try {
+      int64_t load_num = 0;
+      Status status = index->Load(path, /*training_only=*/true, load_num);
+      if (!status.ok()) {
+        LOG(ERROR) << desc_ << "vector table " << name
+                   << " load training artifacts failed: " << status.ToString();
+        return status;
+      }
+    } catch (const std::exception &e) {
+      return Status::IOError(std::string("LoadTrainingArtifacts failed for ") +
+                             name + ": " + e.what());
+    }
+  }
+  return Status::OK();
 }
 
 int VectorManager::AddRTVecsToIndex(bool &index_is_dirty) {
@@ -1585,7 +1761,7 @@ int VectorManager::Dump(const std::string &path, int64_t dump_docid,
     std::string vec_name =
         index->vector_ != nullptr ? index->vector_->MetaInfo()->Name() : "";
     vector_index_counts[vec_name] = index->indexed_count_;
-    Status status = index->Dump(path);
+    Status status = index->Dump(path, /*training_only=*/false);
     if (!status.ok()) {
       LOG(ERROR) << desc_ << "vector " << name << " dump gamma index failed!";
       pthread_rwlock_unlock(&vector_indexes_mutex_);
@@ -1748,7 +1924,7 @@ int VectorManager::Load(const std::vector<std::string> &index_dirs,
         }
       }
 
-      Status status = index->Load(index_dirs[0], load_num);
+      Status status = index->Load(index_dirs[0], /*training_only=*/false, load_num);
       if (!status.ok()) {
         LOG(ERROR) << desc_ << "vector [" << name << "] load index "
                    << index_dirs[0] << " failed, num: " << load_num;
@@ -1770,6 +1946,27 @@ int VectorManager::Load(const std::vector<std::string> &index_dirs,
                 << ", has_delete=" << has_delete;
     }
   }
+
+  // A non-incremental index (DISKANN) is not driven by Engine::Indexing's status
+  // machine and is not re-trained by the post-load BuildIndex gate (that gate is
+  // skipped for it because SupportIncrement() is false). So after a restart its
+  // vector_index_status_ would stay at the UNINDEXED seed from CreateVectorTable
+  // even though index->Load has restored a fully queryable on-disk index — a
+  // status that lies about a serving index and makes the rebuild monitor treat
+  // it as never-built. Reconcile here: for a non-incremental index that Load
+  // left ready (IsTrained() reflects disk_index_ready_), publish INDEXED. One
+  // that was never built (no meta file → not ready) keeps UNINDEXED, honestly.
+  // Incremental indexes are untouched — their status is owned by Engine::Indexing.
+  pthread_rwlock_wrlock(&vector_indexes_mutex_);
+  for (const auto &[name, index] : vector_indexes_) {
+    if (index != nullptr && !index->SupportIncrement() && index->IsTrained()) {
+      vector_index_status_[name] = IndexStatus::INDEXED;
+      LOG(INFO) << desc_ << "load reconciled non-incremental index [" << name
+                << "] status=INDEXED";
+    }
+  }
+  pthread_rwlock_unlock(&vector_indexes_mutex_);
+
   LOG(INFO) << desc_ << "vector_mgr load vec_num=" << doc_num;
   return 0;
 }
@@ -1932,6 +2129,19 @@ bool VectorManager::SupportIncrement() {
       support = false;
       break;
     }
+  }
+  pthread_rwlock_unlock(&vector_indexes_mutex_);
+  return support;
+}
+
+bool VectorManager::SupportIncrementOf(const std::string &index_name) {
+  // Same locking rationale as SupportIncrement(). Default true when the index
+  // is not (yet) present, matching IndexModel's default.
+  pthread_rwlock_rdlock(&vector_indexes_mutex_);
+  bool support = true;
+  auto it = vector_indexes_.find(index_name);
+  if (it != vector_indexes_.end() && it->second != nullptr) {
+    support = it->second->SupportIncrement();
   }
   pthread_rwlock_unlock(&vector_indexes_mutex_);
   return support;

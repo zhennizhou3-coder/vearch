@@ -30,6 +30,8 @@
 #include "index/impl/gpu/gamma_index_ivfflat_gpu.h"
 #include "index/impl/gpu/gamma_index_ivfpq_gpu.h"
 #endif
+#include "monitor/monitor.h"
+#include "monitor/scope_metric.h"
 #include "omp.h"
 #include "table/table_io.h"
 #include "table/bitmap_index.h"
@@ -255,6 +257,11 @@ Status Engine::Search(Request &request, Response &response_results) {
     LOG(ERROR) << msg;
     return status;
   }
+
+  // Time the full top-level search into a Prometheus histogram for P99, recorded on every return below by RAII.
+  SCOPE_ENGINE_METRIC(engine_search_latency,
+                      (monitor::Labels{{"space", space_name_}}),
+                      engine_search_hist_);
 
   bool req_permit = RequestConcurrentController::GetInstance().Acquire(req_num);
   if (not req_permit) {
@@ -1072,11 +1079,15 @@ int Engine::RebuildIndex(const std::string &index_name,
                               const std::string &field_name,
                               const std::string &index_type,
                               int drop_before_rebuild, int limit_cpu,
-                              int describe) {
+                              int describe,
+                              const std::string &training_artifacts_path,
+                              const std::string &dump_artifacts_path) {
   LOG(INFO) << space_name_ << " RebuildIndex name=" << index_name
             << " field=" << field_name << " index_type=" << index_type
             << " drop_before_rebuild=" << drop_before_rebuild
-            << " limit_cpu=" << limit_cpu << " describe=" << describe;
+            << " limit_cpu=" << limit_cpu << " describe=" << describe
+            << " training_artifacts_path=" << training_artifacts_path
+            << " dump_artifacts_path=" << dump_artifacts_path;
 
   if (describe) {
     vec_manager_->DescribeVectorIndexes();
@@ -1097,26 +1108,62 @@ int Engine::RebuildIndex(const std::string &index_name,
   // no-op call never needlessly interrupts realtime indexing.
   StopIndexingThread("rebuild");
 
-  if (drop_before_rebuild) {
-    Status status = vec_manager_->ReCreateVectorIndex(
-        index_name, field_name, index_type, training_threshold_);
-    if (!status.ok()) {
-      LOG(ERROR) << space_name_
-                 << " RebuildIndex ReCreateVectorIndex failed for "
-                 << index_name << " (" << field_name << ":" << index_type
-                 << ") : " << status.ToString();
-      return -1;
-    }
-  } else {
-    bool do_train = (max_docid_ - delete_num_ > training_threshold_);
-    Status status = vec_manager_->RebuildVectorIndex(
-        index_name, field_name, index_type, training_threshold_, do_train);
-    if (!status.ok()) {
-      LOG(ERROR) << space_name_
-                 << " RebuildIndex RebuildVectorIndex failed for "
-                 << index_name << " (" << field_name << ":" << index_type
-                 << ") : " << status.ToString();
-      return -1;
+  // Cap the OpenMP thread count for the long, CPU-heavy training below. A
+  // rebuild that saturates every core starves this PS's raft log apply; slow
+  // apply backs up the raft applyc pipeline and can push lagging followers into
+  // a snapshot. omp_set_num_threads sets only the current (synchronous rebuild)
+  // thread's ICV, so concurrent search threads keep their own thread counts, and
+  // the restart-indexing thread spawned further below gets fresh ICVs — the cap
+  // is confined to this training. Restored via RAII on every exit, including the
+  // early-return failures. The cap value and the guard are defined in engine.h
+  // so they can be unit-tested directly. num_cores comes from omp_get_num_procs()
+  // (the fixed hardware core count), not omp_get_max_threads() (a mutable ICV):
+  // the cap is always clamped to num_cores, so an out-of-range RPC limit_cpu
+  // cannot oversubscribe the CPU.
+  const int rebuild_train_threads =
+      RebuildTrainThreadCap(limit_cpu, omp_get_num_procs());
+
+  {
+    OmpThreadScope omp_scope(rebuild_train_threads);
+    if (drop_before_rebuild) {
+      Status status = vec_manager_->ReCreateVectorIndex(
+          index_name, field_name, index_type, training_threshold_,
+          training_artifacts_path, dump_artifacts_path);
+      if (!status.ok()) {
+        LOG(ERROR) << space_name_
+                   << " RebuildIndex ReCreateVectorIndex failed for "
+                   << index_name << " (" << field_name << ":" << index_type
+                   << ") : " << status.ToString();
+        return -1;
+      }
+    } else {
+      // training_threshold gates IVF-style training (need enough samples to
+      // train the coarse quantizer). A non-incremental index (DISKANN) has no
+      // such concept — it rebuilds its whole on-disk structure from the current
+      // vectors in Indexing(). Gating it on the threshold would, below the
+      // threshold, swap in an index whose Indexing() never ran (empty,
+      // unqueryable). So force a full build for it — but only when there is live
+      // data: an empty partition (max_docid_ - delete_num_ == 0) has nothing to
+      // build, and BuildDiskIndex hard-fails on num_vecs == 0. Forcing the build
+      // there would turn an empty partition's rebuild into a FAILED task (and a
+      // deterministic retry storm on the master side). Leaving do_train=false for
+      // it swaps in a fresh, unbuilt index and returns cleanly — matching how an
+      // empty incremental partition's rebuild completes rather than fails.
+      bool do_train = (max_docid_ - delete_num_ > training_threshold_);
+      if (!vec_manager_->SupportIncrementOf(index_name) &&
+          max_docid_ - delete_num_ > 0) {
+        do_train = true;
+      }
+      Status status = vec_manager_->RebuildVectorIndex(
+          index_name, field_name, index_type, training_threshold_, do_train,
+          training_artifacts_path, dump_artifacts_path);
+      if (!status.ok()) {
+        LOG(ERROR) << space_name_
+                   << " RebuildIndex RebuildVectorIndex failed for "
+                   << index_name << " (" << field_name << ":" << index_type
+                   << ") : " << status.ToString();
+        return -1;
+      }
     }
   }
 
@@ -1281,6 +1328,9 @@ std::string Engine::EngineStatus() {
       arr.push_back({
           {"index_name", s.name},
           {"status", IndexStatusToString(s.status)},
+          {"indexed_num", s.indexed_num},
+          {"is_trained", s.is_trained},
+          {"support_increment", s.support_increment},
       });
     }
   } else {
@@ -1572,7 +1622,7 @@ int Engine::LoadFromFaiss() {
   index_status_ = INDEXED;
 
   int64_t load_num;
-  Status status = index->Load("files", load_num);
+  Status status = index->Load("files", /*training_only=*/false, load_num);
   if (!status.ok()) {
     LOG(ERROR) << space_name_ << " vector [faiss] load gamma index failed!";
     return -1;

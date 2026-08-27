@@ -47,18 +47,28 @@ class StorageManager {
 
   std::vector<rocksdb::Status> MultiGet(int cf_id,
                                         const std::vector<int64_t> &vids,
-                                        std::vector<std::string> &values);
+                                        std::vector<std::string> &values,
+                                        const rocksdb::Snapshot *snap = nullptr);
 
   // Batch read by arbitrary string keys in one column family. Keys do NOT
   // need to be sorted - this helper sorts internally and passes
   // sorted_input=true to rocksdb so each SST is opened at most once.
   std::vector<rocksdb::Status> MultiGetByKeys(
       int cf_id, const std::vector<std::string> &keys,
-      std::vector<std::string> &values);
+      std::vector<std::string> &values,
+      const rocksdb::Snapshot *snap = nullptr);
 
   std::unique_ptr<rocksdb::Iterator> NewIterator(int cf_id) {
     return std::unique_ptr<rocksdb::Iterator>(
         db_->NewIterator(rocksdb::ReadOptions(), cf_handles_[cf_id]));
+  }
+
+  // Consistent-view primitives for training-sample reads. The snapshot only
+  // pins a sequence number (no data copy); callers MUST ReleaseSnapshot on
+  // every exit path, or the pinned rows are never compacted.
+  const rocksdb::Snapshot *GetSnapshot() { return db_->GetSnapshot(); }
+  void ReleaseSnapshot(const rocksdb::Snapshot *s) {
+    if (s) db_->ReleaseSnapshot(s);
   }
 
   int64_t Size() { return size_; }

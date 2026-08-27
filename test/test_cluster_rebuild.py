@@ -347,6 +347,54 @@ def _ivfpq_cfg(name, pn=2, rn=2):
     }
 
 
+def _ivfflat_cfg(name, pn=2, rn=2):
+    """IVFFLAT config. Trained model is the coarse-quantizer centroids only."""
+    dim = xb.shape[1]
+    return {
+        "name": name,
+        "partition_num": pn,
+        "replica_num": rn,
+        "resource_name": "default",
+        "fields": [
+            {"name": "field_int", "type": "integer"},
+            {"name": "field_long", "type": "long"},
+            {"name": "field_float", "type": "float"},
+            {"name": "field_double", "type": "double"},
+            {"name": "field_string", "type": "string",
+             "index": {"name": "field_string", "type": "SCALAR"}},
+            {"name": "field_vector", "type": "vector",
+             "index": {"name": "gamma", "type": "IVFFLAT",
+                       "params": {"metric_type": "L2",
+                                  "ncentroids": 64,
+                                  "nprobe": 16,
+                                  "training_threshold": 2496}},
+             "dimension": dim},
+        ],
+    }
+
+
+def _binaryivf_cfg(name, dim_bits, pn=2, rn=2):
+    """BINARYIVF config. Trained model is the binary coarse quantizer.
+
+    dim_bits must be a multiple of 8; the raw vector is dim_bits/8 bytes.
+    """
+    return {
+        "name": name,
+        "partition_num": pn,
+        "replica_num": rn,
+        "resource_name": "default",
+        "fields": [
+            {"name": "field_int", "type": "integer"},
+            {"name": "field_vector", "type": "vector",
+             "index": {"name": "gamma", "type": "BINARYIVF",
+                       "params": {"metric_type": "L2",
+                                  "ncentroids": 64,
+                                  "training_threshold": 2496}},
+             "dimension": dim_bits},
+        ],
+    }
+
+
 def _wait_index_status_indexed(db, space, max_rounds=180, poll_interval=5):
     """Wait until every partition reports INDEXED and the space is not red."""
     url = f"{router_url}/dbs/{db}/spaces/{space}?detail=true"
@@ -1172,6 +1220,124 @@ class TestRebuildReplicaRoutingChaos:
                 (recall_before, recall_after))
         finally:
             drop_space(router_url, db_name, case_space)
+
+    def test_failed_rebuild_marks_replica(self):
+        """A terminally-failed rebuild must mark the replica ReplicasRebuildFailed
+        (so routing keeps it off reads) and must not break search availability
+        on the surviving replicas.
+
+        NOTE: the victim PS is killed to drive the record to a terminal 'failed'
+        state, so a dead node is already excluded from routing regardless of the
+        marker — this test does NOT isolate the marker-based routing skip. It
+        verifies (a) the master sets ReplicasRebuildFailed on terminal failure
+        and it persists in the partition record while the PS is down, and (b)
+        searches stay available through a replica rebuild failure. The routing
+        skip itself is enforced by SelectNodeByClientType (same mechanism as the
+        ReplicasRebuildingIndex skip exercised by
+        test_search_skips_rebuilding_replica)."""
+        _ensure_all_ps_alive()
+        case_space = space_name + "_chaos_search_skip_failed_r3p1"
+
+        resp = create_space(router_url, db_name,
+                            _ivfpq_cfg(case_space, pn=1, rn=3))
+        if resp.json().get("code") != 0:
+            pytest.skip(f"cluster cannot host replica_num=3: {resp.json()}")
+
+        search_url = router_url + "/document/search?timeout=5000"
+
+        def _search_once(query_idx=0):
+            data = {
+                "vector_value": False,
+                "db_name": db_name,
+                "space_name": case_space,
+                "vectors": [{"field": "field_vector",
+                             "feature": xq[query_idx].tolist()}],
+                "fields": ["field_int"],
+                "limit": 10,
+            }
+            try:
+                rs = requests.post(search_url, auth=(username, password),
+                                   json=data, timeout=5)
+                body = rs.json() if rs.status_code == 200 else {}
+                documents = ((body.get("data") or {}).get("documents") or [])
+                results = (documents[0] if documents and
+                           isinstance(documents[0], list) else documents)
+                return (rs.status_code == 200 and body.get("code") == 0
+                        and bool(results))
+            except Exception:
+                return False
+
+        victim_ps_idx = None
+        try:
+            _populate(case_space, total=min(10000, xb.shape[0]))
+
+            # Trigger with max_retries=0 so the first replica failure is
+            # terminal (no retry rotation muddying the marker).
+            assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
+
+            # Catch a dispatched Running task and kill its PS.
+            deadline = time.time() + 120
+            victim_task = None
+            while time.time() < deadline:
+                p = _get_progress(db_name, case_space)
+                for task in (p or {}).get("tasks") or []:
+                    if task.get("status") == "running":
+                        victim_task = task
+                        break
+                if victim_task is not None:
+                    break
+                time.sleep(0.1)
+            assert victim_task is not None, "no Running rebuild task observed"
+            victim_node_id = int(victim_task.get("node_id"))
+            victim_ps_idx = cl.ps_idx_for_node(victim_node_id)
+            assert victim_ps_idx is not None, victim_task
+            cl.kill_ps(victim_ps_idx, hard=True)
+
+            final = _wait_terminal(db_name, case_space, timeout=300,
+                                   allow_failed=True)
+            assert final["status"] == "failed", final
+
+            # The killed replica must surface ReplicasRebuildFailed (the master
+            # sets it on terminal failure; it persists while the PS is down and
+            # is cleared only by a later successful rebuild). Poll a window
+            # because the marker write lands shortly after the record finalizes.
+            deadline = time.time() + 30
+            failed_marked = False
+            last_seen = None
+            while time.time() < deadline:
+                detail = _get_space_detail(db_name, case_space)
+                for pp in detail.get("partitions") or []:
+                    st = _partition_restatus_map(pp).get(str(victim_node_id))
+                    if st is not None:
+                        last_seen = st
+                    if st == "ReplicasRebuildFailed":
+                        failed_marked = True
+                        break
+                if failed_marked:
+                    break
+                time.sleep(1)
+            assert failed_marked, (
+                "failed replica node=%s was not marked ReplicasRebuildFailed; "
+                "last status=%s" % (victim_node_id, last_seen))
+
+            # Searches must remain available on the surviving replicas.
+            oks = sum(_search_once(i % xq.shape[0]) for i in range(30))
+            assert oks >= 27, (
+                "search availability dropped after a replica rebuild failure: "
+                "%d/30 ok" % oks)
+        finally:
+            if victim_ps_idx is not None:
+                try:
+                    cl.start_ps(victim_ps_idx, wait_ready=True, timeout=30)
+                except Exception as e:
+                    logger.warning(
+                        "search-skip-failed cleanup start_ps(%d) failed: %s",
+                        victim_ps_idx, e)
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception as e:
+                logger.warning(
+                    "search-skip-failed cleanup drop_space failed: %s", e)
 
     # Leader reads must not hit a rebuilding leader.
     PARTITION_LEADER_REBUILDING = 147
@@ -2669,6 +2835,240 @@ class TestRebuildSingleReplicaAvailability:
             assert (final.get("indexes") or []) == ["gamma_a"], (
                 f"only gamma_a should appear in Indexes for a "
                 f"single-index rebuild; got {final.get('indexes')}")
+        finally:
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception:
+                pass
+
+    def teardown_class(self):
+        _ensure_clean_db()
+
+
+# ===========================================================================
+# Category 3 — replica index consistency
+# ===========================================================================
+class TestRebuildReplicaModelConsistency:
+    """After a rebuild, every replica of a partition shares ONE trained model
+    (coarse-quantizer centroids + PQ codebook): the trainer trains once and
+    dumps it, followers pull and inject it instead of training. So the SAME
+    query must return the SAME top-k no matter which replica the router picks.
+    Before this feature each replica trained its own centroids and could
+    diverge systematically (same query → different recall on different replicas).
+
+    There is no per-replica read API, so we approximate per-replica coverage by
+    repeating each query many times: the router→PS RPC selects a replica at
+    random per request (client.RandomSelect), so with replica_num=3 and enough
+    repeats every replica is exercised with near-certainty. A vacuous pass (all
+    requests happening to hit one replica) cannot cause a false failure.
+    """
+
+    def setup_class(self):
+        _ensure_clean_db()
+
+    def _topk_ids(self, case_space, query_idx, k=10):
+        """Return the ordered list of field_int ids for one search, or []."""
+        data = {
+            "vector_value": False,
+            "db_name": db_name,
+            "space_name": case_space,
+            "vectors": [{"field": "field_vector",
+                         "feature": xq[query_idx].tolist()}],
+            "fields": ["field_int"],
+            "limit": k,
+        }
+        rs = requests.post(router_url + "/document/search?timeout=5000",
+                           auth=(username, password), json=data, timeout=5)
+        assert rs.status_code == 200, rs.text
+        body = rs.json()
+        assert body.get("code") == 0, body
+        documents = (body.get("data") or {}).get("documents") or []
+        results = (documents[0] if documents and isinstance(documents[0], list)
+                   else documents)
+        return [int(doc["field_int"]) for doc in results
+                if doc.get("field_int") is not None]
+
+    def test_replicas_consistent_topk_after_rebuild(self):
+        _ensure_all_ps_alive()
+        case_space = space_name + "_model_consistency_r3p2"
+        total = min(10000, xb.shape[0])
+
+        resp = create_space(router_url, db_name, _ivfpq_cfg(case_space, pn=2, rn=3))
+        body = resp.json()
+        if body.get("code") != 0:
+            pytest.skip(f"cluster cannot host replica_num=3: {body}")
+        try:
+            _populate(case_space, total=total)
+
+            # Rebuild: trainer trains once per partition; followers pull + inject
+            # the same model. Wait for the whole round to complete.
+            assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
+            final = _wait_terminal(db_name, case_space, timeout=600,
+                                   allow_failed=False)
+            assert final["status"] == "completed", final
+            _wait_index_status_indexed(db_name, case_space)
+
+            # For each query, repeat enough to spread across the 3 replicas and
+            # assert the top-1 id and the top-10 id set never diverge — i.e. all
+            # replicas resolve the same query identically.
+            repeats = 40
+            n_queries = min(20, xq.shape[0])
+            for query_idx in range(n_queries):
+                top1_seen = set()
+                topk_sets = set()
+                for _ in range(repeats):
+                    ids = self._topk_ids(case_space, query_idx)
+                    assert ids, f"query {query_idx} returned no documents"
+                    top1_seen.add(ids[0])
+                    topk_sets.add(frozenset(ids))
+                assert len(top1_seen) == 1, (
+                    f"query {query_idx}: top-1 id diverged across replicas after "
+                    f"rebuild — replicas do NOT share one trained model: "
+                    f"{top1_seen}")
+                assert len(topk_sets) == 1, (
+                    f"query {query_idx}: top-10 id set diverged across replicas "
+                    f"after rebuild ({len(topk_sets)} distinct sets) — replica "
+                    f"index consistency violated")
+        finally:
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception:
+                pass
+
+    def _search_topk_feature(self, case_space, feature, k=10):
+        """Top-k field_int ids for a search with an explicit feature vector.
+
+        Unlike _topk_ids (which indexes into the float query set xq), this
+        accepts any feature list so binary (uint8) vectors can be queried too.
+        """
+        data = {
+            "vector_value": False,
+            "db_name": db_name,
+            "space_name": case_space,
+            "vectors": [{"field": "field_vector", "feature": feature}],
+            "fields": ["field_int"],
+            "limit": k,
+        }
+        rs = requests.post(router_url + "/document/search?timeout=5000",
+                           auth=(username, password), json=data, timeout=5)
+        assert rs.status_code == 200, rs.text
+        body = rs.json()
+        assert body.get("code") == 0, body
+        documents = (body.get("data") or {}).get("documents") or []
+        results = (documents[0] if documents and isinstance(documents[0], list)
+                   else documents)
+        return [int(doc["field_int"]) for doc in results
+                if doc.get("field_int") is not None]
+
+    def _assert_consistent_topk(self, case_space, feature_provider, n_queries,
+                                repeats=40, check_topk_set=True):
+        """Repeat each query enough to spread across the 3 replicas (router
+        picks one at random per request) and assert results never diverge —
+        i.e. every replica resolved the query against the SAME trained model.
+
+        check_topk_set: assert the whole top-k id set is identical. Safe for
+        float metrics (ties are near-impossible). For binary Hamming distance
+        ties at the k-th boundary can legitimately break differently per
+        replica (identical centroids, but per-replica backfill order differs),
+        so binary callers verify only top-1 (which is exact when the query is
+        an indexed vector: its nearest neighbor is itself at distance 0).
+        """
+        for query_idx in range(n_queries):
+            top1_seen = set()
+            topk_sets = set()
+            for _ in range(repeats):
+                ids = self._search_topk_feature(
+                    case_space, feature_provider(query_idx))
+                assert ids, f"query {query_idx} returned no documents"
+                top1_seen.add(ids[0])
+                topk_sets.add(frozenset(ids))
+            assert len(top1_seen) == 1, (
+                f"query {query_idx}: top-1 id diverged across replicas after "
+                f"rebuild — replicas do NOT share one trained model: "
+                f"{top1_seen}")
+            if check_topk_set:
+                assert len(topk_sets) == 1, (
+                    f"query {query_idx}: top-10 id set diverged across replicas "
+                    f"after rebuild ({len(topk_sets)} distinct sets) — replica "
+                    f"index consistency violated")
+
+    def test_replicas_consistent_topk_after_rebuild_ivfflat(self):
+        """IVFFLAT: replicas share one coarse-quantizer model after rebuild."""
+        _ensure_all_ps_alive()
+        case_space = space_name + "_model_consistency_ivfflat_r3p2"
+        total = min(10000, xb.shape[0])
+
+        resp = create_space(router_url, db_name,
+                            _ivfflat_cfg(case_space, pn=2, rn=3))
+        body = resp.json()
+        if body.get("code") != 0:
+            pytest.skip(f"cluster cannot host replica_num=3: {body}")
+        try:
+            _populate(case_space, total=total)
+
+            assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
+            final = _wait_terminal(db_name, case_space, timeout=600,
+                                   allow_failed=False)
+            assert final["status"] == "completed", final
+            _wait_index_status_indexed(db_name, case_space)
+
+            self._assert_consistent_topk(
+                case_space, lambda i: xq[i].tolist(),
+                n_queries=min(20, xq.shape[0]))
+        finally:
+            try:
+                drop_space(router_url, db_name, case_space)
+            except Exception:
+                pass
+
+    def test_replicas_consistent_topk_after_rebuild_binaryivf(self):
+        """BINARYIVF: replicas share one binary coarse quantizer after rebuild.
+
+        Queries reuse the inserted binary vectors so the exact-match doc is the
+        distance-0 top-1; we assert only top-1 consistency (see
+        _assert_consistent_topk for why the top-k set is not checked here).
+        """
+        import numpy as np
+        _ensure_all_ps_alive()
+        case_space = space_name + "_model_consistency_binaryivf_r3p2"
+        dim_bits = 128            # multiple of 8
+        code_size = dim_bits // 8  # 16 bytes per vector
+        n_docs = 10000
+
+        resp = create_space(router_url, db_name,
+                            _binaryivf_cfg(case_space, dim_bits, pn=2, rn=3))
+        body = resp.json()
+        if body.get("code") != 0:
+            pytest.skip(
+                f"BINARYIVF not supported or cluster cannot host rn=3: {body}")
+        try:
+            np.random.seed(2024)
+            bvec = np.random.randint(0, 256, size=(n_docs, code_size),
+                                     dtype=np.uint8)
+            upsert_url = router_url + "/document/upsert?timeout=300000"
+            batch = 100
+            for start in range(0, n_docs, batch):
+                docs = [{"_id": str(j), "field_int": j,
+                         "field_vector": bvec[j].tolist()}
+                        for j in range(start, min(start + batch, n_docs))]
+                r = requests.post(upsert_url, auth=(username, password),
+                                  json={"db_name": db_name,
+                                        "space_name": case_space,
+                                        "documents": docs})
+                assert r.json().get("code") == 0, (
+                    f"upsert binary docs failed at start={start}: {r.text[:300]}")
+            waiting_index_finish(n_docs, space_name=case_space)
+            _wait_index_status_indexed(db_name, case_space)
+
+            assert _trigger_rebuild(db_name, case_space).json().get("code") == 0
+            final = _wait_terminal(db_name, case_space, timeout=600,
+                                   allow_failed=False)
+            assert final["status"] == "completed", final
+            _wait_index_status_indexed(db_name, case_space)
+
+            self._assert_consistent_topk(
+                case_space, lambda i: bvec[i].tolist(),
+                n_queries=20, check_topk_set=False)
         finally:
             try:
                 drop_space(router_url, db_name, case_space)

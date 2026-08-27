@@ -128,6 +128,10 @@ class GammaIVFFlatGPUIndex
   int Search(RetrievalContext *retrieval_context, int n, const uint8_t *x,
              int k, float *distances, long *labels);
 
+  Status Dump(const std::string &path, bool training_only) override;
+  Status Load(const std::string &path, bool training_only,
+              int64_t &load_num) override;
+
  protected:
   // Implement abstract methods from GammaGPUIndexBase
   faiss::Index *CreateGPUIndex() override;

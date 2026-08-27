@@ -144,7 +144,7 @@ Status IndexIVFFlat::dump(const std::string &dir) {
   utils::FileIO index_param_io(index_param_file_path);
   index_param_io.Open("w");
   index_param_io.Write(index_param.c_str(), index_param.length(), 1);
-  return Dump(dir);
+  return Dump(dir, /*training_only=*/false);
 }
 
 Status IndexIVFFlat::load(const std::string &dir, int64_t &load_num) {
@@ -156,7 +156,7 @@ Status IndexIVFFlat::load(const std::string &dir, int64_t &load_num) {
   index_param_io.Read(index_param_str, file_size, 1);
   index_param = std::string(index_param_str, file_size);
   init(index_param);
-  return Load(dir, load_num);
+  return Load(dir, /*training_only=*/false, load_num);
 }
 
 IndexIVFPQ::IndexIVFPQ(faiss::Index *quantizer, size_t d, size_t nlist,
@@ -282,7 +282,7 @@ Status IndexIVFPQ::dump(const std::string &dir) {
   utils::FileIO index_param_io(index_param_file_path);
   index_param_io.Open("w");
   index_param_io.Write(index_param.c_str(), index_param.length(), 1);
-  return Dump(dir);
+  return Dump(dir, /*training_only=*/false);
 }
 
 Status IndexIVFPQ::load(const std::string &dir, int64_t &load_num) {
@@ -297,7 +297,7 @@ Status IndexIVFPQ::load(const std::string &dir, int64_t &load_num) {
 #ifdef OPT_IVFPQ_RELAYOUT
   check_vector_size_ = false;
 #endif
-  return Load(dir, load_num);
+  return Load(dir, /*training_only=*/false, load_num);
 }
 
 #ifdef USE_SCANN

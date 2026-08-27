@@ -115,6 +115,11 @@ type RebuildTask struct {
 	FieldName string `json:"field_name,omitempty"`
 	IndexType string `json:"index_type,omitempty"`
 
+	// IsTrainer marks the one replica that
+	// trains this round and dumps its model; the other replicas pull that model
+	// instead of training. Master-authoritative; zero when the scheme is off.
+	IsTrainer bool `json:"is_trainer,omitempty"`
+
 	// AwaitTransition is PS-local monitor state. A task dispatched while the
 	// target is already INDEXED must observe a later non-INDEXED state before
 	// another INDEXED can be attributed to this rebuild.
@@ -148,7 +153,7 @@ type RebuildProgressResponse struct {
 	RunningTasks   int            `json:"running_tasks"`
 	PendingTasks   int            `json:"pending_tasks"`   // planned but not yet dispatched
 	SuccessRatio   float64        `json:"success_ratio"`   // Success ratio (0.0-1.0)
-	OverallPercent int            `json:"overall_percent"` // 0..100, weighted across all tasks
+	OverallPercent int            `json:"overall_percent"` // 0..100, completed tasks over non-cancelled total
 	Status         RebuildStatus  `json:"status"`          // overall status: running, completed, failed
 	ErrorMsg       string         `json:"error_msg,omitempty"`
 	EnqueuedAt     time.Time      `json:"enqueued_at,omitempty"`
@@ -200,6 +205,39 @@ type RebuildParam struct {
 	DropBefore int    `json:"drop_before"`
 	LimitCPU   int    `json:"limit_cpu"`
 	Describe   int    `json:"describe"`
+
+	// RoundID is this rebuild round's ID.
+	// (SpaceRebuildRecord.RebuildID). IsTrainer marks the trainer replica (which
+	// trains + dumps). For a follower, TrainerAddr is where to pull the model
+	// from; empty TrainerAddr means "train locally" (scheme off).
+	RoundID     string `json:"round_id,omitempty"`
+	IsTrainer   bool   `json:"is_trainer,omitempty"`
+	TrainerAddr string `json:"trainer_addr,omitempty"`
+}
+
+// PullTrainingArtifactsReq fetches training artifacts from a source replica.
+// It is sent JSON-encoded in PartitionData.Data.
+// Offset < 0 is a stat call (trainer replies with TrainingArtifactsMeta); Offset >= 0
+// requests the raw chunk starting at that byte offset. The trainer is stateless
+// (each request is an independent pread), so the follower drives progress.
+type PullTrainingArtifactsReq struct {
+	PartitionID uint32 `json:"pid"`
+	IndexName   string `json:"index"`
+	RoundID     string `json:"round"`  // rebuild round; trainer only serves a match
+	Offset      int64  `json:"offset"` // <0 = stat; >=0 = fetch the chunk at this offset
+}
+
+// TrainingArtifactsMeta identifies one round's training model — its byte size,
+// sha256, and rebuild round — and serves two roles with the same shape:
+//   - the trainer's stat reply (Offset < 0): the follower uses Size to drive chunk
+//     requests and SHA256 for an end-to-end integrity check;
+//   - the on-disk `.meta` sidecar next to the training-artifacts file, written
+//     atomically AFTER the model bytes so its presence commits "model ready for
+//     this round"; a puller only trusts a model whose sidecar round/sha256 match.
+type TrainingArtifactsMeta struct {
+	RoundID string `json:"round"`
+	SHA256  string `json:"sha256"`
+	Size    int64  `json:"size"`
 }
 
 // SpaceRebuildRecord is the etcd-persisted scheduling unit for one space.
@@ -207,6 +245,11 @@ type SpaceRebuildRecord struct {
 	DBName    string        `json:"db_name"`
 	SpaceName string        `json:"space_name"`
 	Status    RebuildStatus `json:"status"` // pending|running|completed|failed|cancelled
+
+	// RebuildID is this round's identity, generated at StartRebuild and persisted
+	// in etcd. It doubles as the puller's RoundID and anchors training-artifacts
+	// identity; round isolation rides on it, not a monotonic version.
+	RebuildID string `json:"rebuild_id,omitempty"`
 
 	// Rebuild parameters propagated to PS.
 	DropBefore  int    `json:"drop_before,omitempty"`

@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/vearch/vearch/v3/internal/client"
 	"github.com/vearch/vearch/v3/internal/entity"
 	"github.com/vearch/vearch/v3/internal/pkg/log"
@@ -157,6 +158,7 @@ func (s *RebuildService) StartRebuild(ctx context.Context, req *RebuildRequest) 
 		DBName:      req.DBName,
 		SpaceName:   req.SpaceName,
 		Status:      entity.RebuildStatusPending,
+		RebuildID:   uuid.NewString(),
 		DropBefore:  dropBefore,
 		LimitCPU:    req.LimitCPU,
 		Describe:    req.Describe,
@@ -230,6 +232,12 @@ func (s *RebuildService) ListAllRebuildProgress(ctx context.Context) (*entity.Re
 
 // ListDBRebuildProgress summarizes rebuild records for one database.
 func (s *RebuildService) ListDBRebuildProgress(ctx context.Context, dbName string) (*entity.RebuildSummaryResponse, error) {
+	// Validate db existence up-front so a nonexistent db returns DB_NOT_EXIST
+	// rather than an empty summary that is indistinguishable from "db exists
+	// but has no rebuild records".
+	if _, err := s.client.Master().QueryDBName2ID(ctx, dbName); err != nil {
+		return nil, err
+	}
 	prefix := entity.PrefixRebuild + dbName + "/"
 	return s.listRebuildProgressByPrefix(ctx, prefix)
 }
@@ -304,7 +312,8 @@ func (s *RebuildService) CancelRebuild(ctx context.Context, dbName, spaceName st
 		return nil, fmt.Errorf("load rebuild record: %v", err)
 	}
 	if rec == nil {
-		return nil, fmt.Errorf("no rebuild record found for %s/%s", dbName, spaceName)
+		return nil, vearchpb.NewError(vearchpb.ErrorEnum_REBUILD_RECORD_NOT_EXIST,
+			fmt.Errorf("no rebuild record found for %s/%s", dbName, spaceName))
 	}
 
 	// classify maps a record's current terminal / read-only status to a
@@ -519,8 +528,8 @@ func rebuildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse
 		CurrentIndex:  clampOneBased(rec.CurrentIndexIdx, len(rec.Indexes)),
 		CurrentTarget: rec.CurrentTarget(),
 	}
-	// Build task counts, weighted progress, and aggregate retry count.
-	progressSum := 0
+	// Build task counts and aggregate retry count.
+	cancelled := 0
 	for _, t := range rec.Tasks {
 		resp.RetryCount += t.RetryCount
 		switch t.Status {
@@ -528,19 +537,24 @@ func rebuildProgressFromRecord(rec *SpaceRebuildRecord) *RebuildProgressResponse
 			resp.PendingTasks++
 		case entity.RebuildStatusRunning:
 			resp.RunningTasks++
-			progressSum += t.Progress
-		case entity.RebuildStatusCompleted:
-			progressSum += 100
-		case entity.RebuildStatusFailed:
-			// No progress contribution; the failure is reflected in FailedTasks.
+		case entity.RebuildStatusCancelled:
+			// Cancelled before dispatch on a user cancel: never ran, excluded
+			// from the overall_percent denominator below.
+			cancelled++
+		case entity.RebuildStatusCompleted, entity.RebuildStatusFailed:
+			// Counted via resp.CompletedTasks / FailedTasks; no per-task work here.
 		}
 	}
 	if resp.TotalTasks > 0 {
 		resp.SuccessRatio = float64(resp.CompletedTasks) / float64(resp.TotalTasks)
-		// Divide by TotalTasks so failed replicas lower overall progress.
-		resp.OverallPercent = progressSum / resp.TotalTasks
-		if resp.OverallPercent > 100 {
-			resp.OverallPercent = 100
+		// overall_percent reflects replicas that have actually completed. Running
+		// and pending tasks contribute 0: a running replica at progress 100 is
+		// still backfilling and not yet complete (completion is gated on backfill
+		// catch-up), so it must not inflate the bar. Cancelled tasks leave the
+		// denominator (they never ran); failed tasks stay in it and hold the bar
+		// below 100.
+		if denom := resp.TotalTasks - cancelled; denom > 0 {
+			resp.OverallPercent = resp.CompletedTasks * 100 / denom
 		}
 	}
 	return resp
@@ -842,7 +856,7 @@ func (sc *RebuildScheduler) admitPending(ctx context.Context,
 		return
 	}
 	for _, p := range partitions {
-		tasks = append(tasks, sc.buildReplicaTasks(ctx, rec, p, target, rec.DropBefore)...)
+		tasks = append(tasks, sc.buildReplicaTasks(ctx, rec, p, target, indexTypeOf(space, target), rec.DropBefore)...)
 	}
 	if len(tasks) == 0 {
 		log.Warn("pending %s: no replicas resolved, marking as failed", rec.SpaceKey())
@@ -1079,9 +1093,78 @@ func (sc *RebuildScheduler) advanceRunningRecord(ctx context.Context,
 	}
 }
 
+// trainingArtifactsSharingSupported reports whether an index family supports
+// sharing its training artifacts across replicas.
+func trainingArtifactsSharingSupported(indexType string) bool {
+	switch indexType {
+	case "IVFPQ", "IVFFLAT", "IVFRABITQ", "IVFPQFastScan", "BINARYIVF",
+		"GPU_IVFFLAT", "GPU_IVFPQ", "NPU_IVFFLAT", "NPU_IVFRABITQ":
+		return true
+	default:
+		return false
+	}
+}
+
+// partitionReplicaCount returns how many replica tasks the record holds for one
+// partition (used to decide whether the training-artifacts-sharing scheme applies).
+func partitionReplicaCount(rec *SpaceRebuildRecord, pid entity.PartitionID) int {
+	n := 0
+	for _, t := range rec.Tasks {
+		if t.PartitionID == pid {
+			n++
+		}
+	}
+	return n
+}
+
+// trainerTaskOf returns the partition's designated trainer task (IsTrainer), or
+// nil if none has been chosen yet this round.
+func trainerTaskOf(rec *SpaceRebuildRecord, pid entity.PartitionID) *RebuildTask {
+	for _, t := range rec.Tasks {
+		if t.PartitionID == pid && t.IsTrainer {
+			return t
+		}
+	}
+	return nil
+}
+
+// modelSourceAddrOf picks a live replica that already holds this round's model
+// and can serve it to a follower: any completed replica of
+// the partition (trainer or an already-installed follower) whose node is still
+// registered, excluding the puller itself. Preferring any completed replica —
+// not just the trainer — lets the round survive the trainer's node dying after
+// it finished (§10). Returns "" and refreshes the chosen task's PSNodeAddr.
+func (sc *RebuildScheduler) modelSourceAddrOf(ctx context.Context, rec *SpaceRebuildRecord,
+	pid entity.PartitionID, excludeNodeID entity.NodeID) string {
+	mc := sc.client.Master()
+	var trainerAddr, fallbackAddr string
+	for _, t := range rec.Tasks {
+		if t.PartitionID != pid || t.NodeID == excludeNodeID {
+			continue
+		}
+		if t.Status != entity.RebuildStatusCompleted {
+			continue
+		}
+		// A registered server (TTL-backed) is our liveness signal; refresh the addr.
+		server, err := mc.QueryServer(ctx, t.NodeID)
+		if err != nil || server == nil {
+			continue
+		}
+		if t.IsTrainer {
+			trainerAddr = server.RpcAddr()
+		} else if fallbackAddr == "" {
+			fallbackAddr = server.RpcAddr()
+		}
+	}
+	if trainerAddr != "" {
+		return trainerAddr
+	}
+	return fallbackAddr
+}
+
 // dispatchPending sends pending tasks one at a time. Within a record, tasks
 // run strictly serially: the next task is dispatched only after every
-// previously-dispatched task has reached a terminal state. This is enforced
+// previously dispatched task has reached a terminal state. This is enforced
 // on top of INV-0 (one running record cluster-wide), giving the whole
 // scheduler a single active task at any moment.
 func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebuildRecord) bool {
@@ -1141,12 +1224,45 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 			}
 		}
 
+		// Coordinate one training per
+		// partition. The first replica dispatched for a partition (a follower,
+		// by leader-last ordering) becomes the trainer and dumps its model; every
+		// later replica pulls from it instead of training. Strict-serial dispatch
+		// (one live task at a time, next only after the current completes)
+		// guarantees the trainer has completed — its model already on disk —
+		// before any follower is dispatched. Single-replica partitions get no
+		// round (nothing to share).
+		var roundID, trainerAddr string
+		var isTrainer bool
+		if rec.RebuildID != "" && partitionReplicaCount(rec, t.PartitionID) > 1 &&
+			trainingArtifactsSharingSupported(t.IndexType) {
+			roundID = rec.RebuildID
+			if trainer := trainerTaskOf(rec, t.PartitionID); trainer == nil {
+				t.IsTrainer = true // first replica of this partition → trainer
+				isTrainer = true
+			} else if trainer.NodeID == t.NodeID {
+				isTrainer = true // re-dispatch of the same trainer
+			} else {
+				// Follower: pull from any live replica already holding the model.
+				trainerAddr = sc.modelSourceAddrOf(ctx, rec, t.PartitionID, t.NodeID)
+				if trainerAddr == "" {
+					// No live source (every completed replica's node is gone).
+					// Fail the replica rather than train locally (which would
+					// produce an inconsistent index); retry/new-round re-trains.
+					sc.handleReplicaFailure(rec, t,
+						fmt.Sprintf("no live training-artifacts source for pid=%d round=%s", t.PartitionID, roundID))
+					return true
+				}
+			}
+		}
+
 		t.DispatchAttempts++
 		t.DispatchAt = time.Now()
 		t.StartTime = time.Now()
 		err := client.ExecuteRebuildIndex(t.PSNodeAddr, rec.DBName, rec.SpaceName,
 			t.IndexName, t.PartitionID,
-			t.DropBefore, t.LimitCPU, t.Describe)
+			t.DropBefore, t.LimitCPU, t.Describe,
+			roundID, isTrainer, trainerAddr)
 		if err != nil {
 			// Retry transient dispatch failures before failing the replica.
 			t.ErrorMessage = err.Error()
@@ -1170,8 +1286,8 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 		log.Info("rebuild dispatched: space=%s pid=%d nodeID=%d (attempt=%d)",
 			rec.SpaceKey(), t.PartitionID, t.NodeID, t.DispatchAttempts)
 		// Mark this replica as Rebuilding in the partition record.
-		if err := sc.markReplicaRebuilding(ctx, t.PartitionID, t.NodeID, true); err != nil {
-			log.Warn("markReplicaRebuilding(rebuilding) failed for pid=%d nodeID=%d: %v",
+		if err := sc.setReplicaRebuildStatus(ctx, t.PartitionID, t.NodeID, entity.ReplicasRebuildingIndex); err != nil {
+			log.Warn("setReplicaRebuildStatus(rebuilding) failed for pid=%d nodeID=%d: %v",
 				t.PartitionID, t.NodeID, err)
 		}
 		// Strict serialism: at most one live task at any moment.
@@ -1372,10 +1488,15 @@ func (sc *RebuildScheduler) handleReplicaFailure(rec *SpaceRebuildRecord,
 	}
 }
 
-// markReplicaRebuilding toggles the router-visible Rebuilding marker.
-// Clearing only changes ReplicasRebuildingIndex, leaving other replica states intact.
-func (sc *RebuildScheduler) markReplicaRebuilding(ctx context.Context,
-	pid entity.PartitionID, nodeID entity.NodeID, rebuilding bool) error {
+// setReplicaRebuildStatus transitions the router-visible rebuild marker for a
+// replica. Setting ReplicasRebuildingIndex is the dispatch-time mark. Clearing
+// to ReplicasOK / ReplicasRebuildFailed only fires when the replica is
+// currently ReplicasRebuildingIndex, so it never clobbers a concurrently-set
+// ReplicasNotReady (raft-lag) status. Setting ReplicasRebuildingIndex from a
+// prior ReplicasRebuildFailed is allowed, so an idle self-heal retry re-marks a
+// previously-failed replica as rebuilding again.
+func (sc *RebuildScheduler) setReplicaRebuildStatus(ctx context.Context,
+	pid entity.PartitionID, nodeID entity.NodeID, target uint32) error {
 
 	key := entity.PartitionKey(pid)
 	return sc.client.Master().STM(ctx, func(stm concurrency.STM) error {
@@ -1392,17 +1513,14 @@ func (sc *RebuildScheduler) markReplicaRebuilding(ctx context.Context,
 		}
 
 		cur := p.ReStatusMap[uint64(nodeID)]
-		if rebuilding {
+		if target == entity.ReplicasRebuildingIndex {
 			if cur == entity.ReplicasRebuildingIndex {
 				return nil // already set, no-op
 			}
-			p.ReStatusMap[uint64(nodeID)] = entity.ReplicasRebuildingIndex
-		} else {
-			if cur != entity.ReplicasRebuildingIndex {
-				return nil // not currently Rebuilding; don't clobber NotReady etc.
-			}
-			p.ReStatusMap[uint64(nodeID)] = entity.ReplicasOK
+		} else if cur != entity.ReplicasRebuildingIndex {
+			return nil // only clear from Rebuilding; don't clobber NotReady etc.
 		}
+		p.ReStatusMap[uint64(nodeID)] = target
 
 		// Bump UpdateTime so router partition caches accept this write.
 		p.UpdateTime = time.Now().UnixNano()
@@ -1416,15 +1534,22 @@ func (sc *RebuildScheduler) markReplicaRebuilding(ctx context.Context,
 	})
 }
 
-// unmarkRebuildingForTerminalTasks clears markers for finished tasks.
+// unmarkRebuildingForTerminalTasks clears markers for finished tasks. A failed
+// task leaves ReplicasRebuildFailed so reads keep avoiding the replica (its
+// index may be partial after a drop=true rebuild) until a later rebuild
+// succeeds; completed/cancelled tasks return to ReplicasOK.
 func (sc *RebuildScheduler) unmarkRebuildingForTerminalTasks(
 	ctx context.Context, rec *SpaceRebuildRecord) {
 	for _, t := range rec.Tasks {
 		if !t.Status.IsTerminal() {
 			continue
 		}
-		if err := sc.markReplicaRebuilding(ctx, t.PartitionID, t.NodeID, false); err != nil {
-			log.Warn("markReplicaRebuilding(reset) %s pid=%d nodeID=%d: %v",
+		target := uint32(entity.ReplicasOK)
+		if t.Status == entity.RebuildStatusFailed {
+			target = entity.ReplicasRebuildFailed
+		}
+		if err := sc.setReplicaRebuildStatus(ctx, t.PartitionID, t.NodeID, target); err != nil {
+			log.Warn("setReplicaRebuildStatus(reset) %s pid=%d nodeID=%d: %v",
 				rec.SpaceKey(), t.PartitionID, t.NodeID, err)
 		}
 	}
@@ -1554,7 +1679,7 @@ func (sc *RebuildScheduler) prepareNextTarget(ctx context.Context,
 	for _, p := range partitions {
 		// dropBefore=0: once the initial target has been rebuilt, subsequent
 		// targets on the same space must never re-drop, same as retries.
-		tasks = append(tasks, sc.buildReplicaTasks(ctx, rec, p, target, 0)...)
+		tasks = append(tasks, sc.buildReplicaTasks(ctx, rec, p, target, indexTypeOf(space, target), 0)...)
 	}
 	if len(tasks) == 0 {
 		return fmt.Errorf("no replicas resolved for target %s", target)
@@ -1575,7 +1700,7 @@ func (sc *RebuildScheduler) prepareNextTarget(ctx context.Context,
 // dropBefore=0 even when the record's DropBefore=1 (retrying must never
 // re-drop the index).
 func (sc *RebuildScheduler) buildReplicaTasks(ctx context.Context,
-	rec *SpaceRebuildRecord, part *entity.Partition, target string,
+	rec *SpaceRebuildRecord, part *entity.Partition, target, indexType string,
 	dropBefore int) []*RebuildTask {
 
 	mc := sc.client.Master()
@@ -1595,6 +1720,10 @@ func (sc *RebuildScheduler) buildReplicaTasks(ctx context.Context,
 			DBName:       rec.DBName,
 			SpaceName:    rec.SpaceName,
 			IndexName:    target,
+			// IndexType is normally PS-only, but master populates it so
+			// dispatchPending can gate the training-artifacts-sharing scheme by index
+			// family (see trainingArtifactsSharingSupported for the supported set).
+			IndexType: indexType,
 			// Pending means planned but not yet dispatched.
 			Status:     entity.RebuildStatusPending,
 			DropBefore: dropBefore,
@@ -1603,6 +1732,18 @@ func (sc *RebuildScheduler) buildReplicaTasks(ctx context.Context,
 		})
 	}
 	return out
+}
+
+// indexTypeOf resolves the index family (e.g. "IVFPQ") for target from the space
+// schema, or "" if the index is absent.
+func indexTypeOf(space *entity.Space, target string) string {
+	if space == nil {
+		return ""
+	}
+	if idx := space.GetIndexByName(target); idx != nil {
+		return idx.Type
+	}
+	return ""
 }
 
 // clampOneBased converts a 0-based cursor into a clamped 1-based counter.

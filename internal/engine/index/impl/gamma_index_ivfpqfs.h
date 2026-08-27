@@ -274,6 +274,8 @@ struct GammaIVFPQFastScanIndex : GammaFLATIndex, faiss::IndexIVFPQFastScan {
 
   virtual ~GammaIVFPQFastScanIndex();
 
+  bool IsTrained() const override { return is_trained; }
+
   Status Init(const std::string &model_parameters,
               int training_threshold) override;
 
@@ -296,9 +298,10 @@ struct GammaIVFPQFastScanIndex : GammaFLATIndex, faiss::IndexIVFPQFastScan {
     return rt_invert_index_ptr_->GetTotalMemBytes();
   }
 
-  Status Dump(const std::string &dir) override;
+  Status Dump(const std::string &path, bool training_only) override;
 
-  Status Load(const std::string &index_dir, int64_t &load_num) override;
+  Status Load(const std::string &path, bool training_only,
+              int64_t &load_num) override;
 
   int Delete(const std::vector<int64_t> &ids) override;
 
