@@ -7,7 +7,7 @@ option(BUILD_TEST "Build tests" off)
 option(BUILD_WITH_GPU "Build gamma with gpu index support" off)
 option(BUILD_WITH_NPU "Build gamma with NPU index support" off)
 option(BUILD_WITH_SCANN "Build gamma with scann index support" off)
-option(BUILD_WITH_ENGINE_METRICS "Build gamma with engine-side Prometheus metrics (needs prometheus-cpp)" on)
+option(BUILD_WITH_ENGINE_METRICS "Build gamma with engine-side Prometheus metrics (needs prometheus-cpp)" off)
 option(BUILD_WITH_DISKANN "Build gamma with diskann index support" on)
 # Backward-compatible knobs from vendored DiskANN integration.
 set(DISKANN_ROOT "" CACHE PATH "DiskANN install prefix, e.g. /usr/local")
