@@ -217,9 +217,15 @@ int RocksDBRawVector::SampleTrainingVectors(const size_t num,
   // vid is still visible in this snapshot and MultiGet cannot miss.
   SnapshotGuard snap_guard{storage_mgr_};
 
+  // Sample only over the vid space visible in THIS snapshot. `_total` is written
+  // after the vector row (engine AddOrUpdate), so every vid < total_snap has its
+  // row in `snap` — a concurrent Add (e.g. raft replay after restart) that lands
+  // after the snapshot is excluded, so the snapshot MultiGet below cannot miss.
+  int64_t total_snap = storage_mgr_->Size(snap_guard.snap);
+
   // Reservoir sampling lives in the base class (shared with Memory).
   std::vector<int64_t> reservoir;
-  if (SampleTrainingVectorIds(num, reservoir, valid_count) != 0) {
+  if (SampleTrainingVectorIds(num, total_snap, reservoir, valid_count) != 0) {
     LOG(ERROR) << desc_ << "no training vectors requested or available";
     num_got = 0;
     return -1;

@@ -1043,6 +1043,7 @@ func (sc *RebuildScheduler) advanceRunningRecord(ctx context.Context,
 			t.Status = entity.RebuildStatusCompleted
 			t.CompleteTime = time.Now()
 			t.Progress = 100
+			t.ArtifactsPublished = resp.ArtifactsPublished
 			dirty = true
 		case entity.RebuildStatusFailed:
 			sc.handleReplicaFailure(rec, t, resp.ErrorMessage)
@@ -1142,8 +1143,8 @@ func (sc *RebuildScheduler) modelSourceAddrOf(ctx context.Context, rec *SpaceReb
 		if t.PartitionID != pid || t.NodeID == excludeNodeID {
 			continue
 		}
-		if t.Status != entity.RebuildStatusCompleted {
-			continue
+		if t.Status != entity.RebuildStatusCompleted || !t.ArtifactsPublished {
+			continue // only a replica that actually published this round's model is a source
 		}
 		// A registered server (TTL-backed) is our liveness signal; refresh the addr.
 		server, err := mc.QueryServer(ctx, t.NodeID)
@@ -1242,6 +1243,11 @@ func (sc *RebuildScheduler) dispatchPending(ctx context.Context, rec *SpaceRebui
 				isTrainer = true
 			} else if trainer.NodeID == t.NodeID {
 				isTrainer = true // re-dispatch of the same trainer
+			} else if trainer.Status == entity.RebuildStatusCompleted && !trainer.ArtifactsPublished {
+				// No-model round: the trainer completed without a shared model
+				// (untrained/below threshold). Rebuild locally so every replica lands
+				// in the same untrained state; do not pull.
+				roundID = ""
 			} else {
 				// Follower: pull from any live replica already holding the model.
 				trainerAddr = sc.modelSourceAddrOf(ctx, rec, t.PartitionID, t.NodeID)

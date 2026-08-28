@@ -156,10 +156,9 @@ Status StoreParams::Parse(const char *str) {
   return Status::OK();
 }
 
-int RawVector::SampleTrainingVectorIds(const size_t num,
+int RawVector::SampleTrainingVectorIds(const size_t num, int64_t total,
                                        std::vector<int64_t> &reservoir,
                                        size_t &valid_count) {
-  size_t total = meta_info_->Size();
   reservoir.clear();
   valid_count = 0;
   if (num == 0) {

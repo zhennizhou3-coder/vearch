@@ -17,6 +17,7 @@ package ps
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -60,10 +61,14 @@ func sha256OfFile(path string) (string, int64, error) {
 }
 
 // trainingArtifactsPathsAt returns the fixed training-artifacts file and its `.meta`
-// sidecar under a partition's data path:
-// <dataPath>/rebuild_training_artifacts/<index>.training_artifacts[.meta].
-func trainingArtifactsPathsAt(dataPath, indexName string) (modelPath, metaPath string) {
-	modelPath = filepath.Join(dataPath, "rebuild_training_artifacts", indexName+".training_artifacts")
+// sidecar, namespaced by partition ID:
+// <dataPath>/rebuild_training_artifacts/<pid>/<index>.training_artifacts[.meta].
+// dataPath is the PS-level data root (Partition.Path), shared by every partition on
+// this PS, so the <pid> segment is what keeps replicas of different partitions of the
+// same space (identical index name and round) from overwriting each other's model.
+func trainingArtifactsPathsAt(dataPath string, pid entity.PartitionID, indexName string) (modelPath, metaPath string) {
+	modelPath = filepath.Join(dataPath, "rebuild_training_artifacts",
+		fmt.Sprintf("%d", pid), indexName+".training_artifacts")
 	return modelPath, modelPath + ".meta"
 }
 
@@ -74,7 +79,7 @@ func trainingArtifactsPathsAt(dataPath, indexName string) (modelPath, metaPath s
 // (sha256/rename/.meta) happens afterward in finalizeTrainerArtifacts.
 func (r *RebuildManager) trainerDumpTmpPath(store PartitionStore, indexName string) (string, error) {
 	p := store.GetPartition()
-	modelPath, _ := trainingArtifactsPathsAt(p.Path, indexName)
+	modelPath, _ := trainingArtifactsPathsAt(p.Path, p.Id, indexName)
 	if err := os.MkdirAll(filepath.Dir(modelPath), 0755); err != nil {
 		return "", err
 	}
@@ -89,7 +94,7 @@ func (r *RebuildManager) trainerDumpTmpPath(store PartitionStore, indexName stri
 // A missing temporary file means the index has no artifacts and is not an error.
 func (r *RebuildManager) finalizeTrainerArtifacts(store PartitionStore, indexName, roundID, tmpPath string) (string, error) {
 	p := store.GetPartition()
-	modelPath, metaPath := trainingArtifactsPathsAt(p.Path, indexName)
+	modelPath, metaPath := trainingArtifactsPathsAt(p.Path, p.Id, indexName)
 	if _, statErr := os.Stat(tmpPath); os.IsNotExist(statErr) {
 		log.Info("no training artifacts dumped: pid=%d index=%s round=%s (index has no separable artifacts), skip publish",
 			p.Id, indexName, roundID)
@@ -118,7 +123,7 @@ func (r *RebuildManager) finalizeTrainerArtifacts(store PartitionStore, indexNam
 // pull source for later followers. The files are kept.
 func (r *RebuildManager) pullAndInstallTrainingArtifacts(sourceAddr string, store PartitionStore, indexName, roundID string) (string, error) {
 	p := store.GetPartition()
-	modelPath, metaPath := trainingArtifactsPathsAt(p.Path, indexName)
+	modelPath, metaPath := trainingArtifactsPathsAt(p.Path, p.Id, indexName)
 	meta, err := client.PullTrainingArtifacts(sourceAddr, p.Id, indexName, roundID, modelPath)
 	if err != nil {
 		return "", err

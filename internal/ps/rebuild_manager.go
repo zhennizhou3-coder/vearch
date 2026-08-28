@@ -72,7 +72,7 @@ type RebuildTaskManager interface {
 	StartRebuildTask(dbName, spaceName, indexName, fieldName, indexType string, partitionID uint32,
 		dropBefore int, limitCPU int, describe int, roundID string, isTrainer bool, trainerAddr string) error
 	GetRebuildTaskStatus(dbName, spaceName, indexName string, partitionID uint32) (
-		status entity.RebuildStatus, errorMsg string, exists bool, progress int)
+		status entity.RebuildStatus, errorMsg string, exists bool, progress int, published bool)
 }
 
 type RebuildManager struct {
@@ -230,13 +230,24 @@ func (r *RebuildManager) executeRebuild(task *RebuildTask, dropBefore int, limit
 		// dump its trained artifacts there; both empty means train in place.
 		err := engine.RebuildIndex(task.IndexName, task.FieldName, task.IndexType,
 			dropBefore, limitCPU, describe, trainingArtifactsPath, dumpArtifactsPath)
-		// Trainer: the engine wrote the raw artifacts to dumpArtifactsPath during
-		// the rebuild; commit them (sha256/rename/.meta) before reporting success
-		// so followers can pull this round's model. A commit failure fails the
-		// round, since followers would otherwise have nothing to pull.
+		// Trainer: commit the artifacts the engine dumped and report the round's
+		// true outcome — published (a pull source), no-model (untrained/below
+		// threshold, followers rebuild locally), or a trained index that failed to
+		// produce artifacts (fail so master re-runs the trainer).
 		if err == nil && dumpArtifactsPath != "" {
-			if _, ferr := r.finalizeTrainerArtifacts(store, task.IndexName, roundID, dumpArtifactsPath); ferr != nil {
+			sha, ferr := r.finalizeTrainerArtifacts(store, task.IndexName, roundID, dumpArtifactsPath)
+			switch {
+			case ferr != nil:
 				err = fmt.Errorf("commit training artifacts (round=%s): %v", roundID, ferr)
+			case sha != "":
+				r.setArtifactsPublished(task, true)
+			default:
+				// No artifacts dumped: fail only if the index actually trained (it
+				// should then have produced them); an untrained index is a legit
+				// no-model round.
+				if info, perr := r.pollStatus(task, engine); perr == nil && info.IsTrained {
+					err = fmt.Errorf("trainer index trained but published no artifacts (round=%s)", roundID)
+				}
 			}
 		}
 		doneCh <- err
@@ -521,6 +532,12 @@ func (r *RebuildManager) updateProgress(task *RebuildTask, progress int) {
 	r.mu.Unlock()
 }
 
+func (r *RebuildManager) setArtifactsPublished(task *RebuildTask, v bool) {
+	r.mu.Lock()
+	task.ArtifactsPublished = v
+	r.mu.Unlock()
+}
+
 func (r *RebuildManager) markCompleted(task *RebuildTask) {
 	r.mu.Lock()
 	task.Status = entity.RebuildStatusCompleted
@@ -557,7 +574,7 @@ func terminalExpired(task *RebuildTask) bool {
 }
 
 func (r *RebuildManager) GetRebuildTaskStatus(dbName, spaceName, indexName string,
-	partitionID uint32) (status entity.RebuildStatus, errorMsg string, exists bool, progress int) {
+	partitionID uint32) (status entity.RebuildStatus, errorMsg string, exists bool, progress int, published bool) {
 	taskKey := r.getTaskKey(dbName, spaceName, indexName, partitionID)
 
 	// Hold the lock across the field reads: task fields are mutated under
@@ -568,14 +585,14 @@ func (r *RebuildManager) GetRebuildTaskStatus(dbName, spaceName, indexName strin
 
 	task, found := r.tasks[taskKey]
 	if !found || task == nil {
-		return "", "", false, 0
+		return "", "", false, 0, false
 	}
 	// Lazy eviction: drop retention-expired terminal tasks on read.
 	if terminalExpired(task) {
 		delete(r.tasks, taskKey)
-		return "", "", false, 0
+		return "", "", false, 0, false
 	}
-	return task.Status, task.ErrorMessage, true, task.Progress
+	return task.Status, task.ErrorMessage, true, task.Progress, task.ArtifactsPublished
 }
 
 // SetRebuildManager injects a custom manager for tests or alternate wiring.

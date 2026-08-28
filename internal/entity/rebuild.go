@@ -120,6 +120,11 @@ type RebuildTask struct {
 	// instead of training. Master-authoritative; zero when the scheme is off.
 	IsTrainer bool `json:"is_trainer,omitempty"`
 
+	// ArtifactsPublished: trainer actually committed the shared model file (+.meta).
+	// Only a Completed trainer with this true is a valid pull source; Completed+false
+	// means a no-model round (followers rebuild locally).
+	ArtifactsPublished bool `json:"artifacts_published,omitempty"`
+
 	// AwaitTransition is PS-local monitor state. A task dispatched while the
 	// target is already INDEXED must observe a later non-INDEXED state before
 	// another INDEXED can be attributed to this rebuild.
@@ -191,10 +196,11 @@ type RebuildStatusQuery struct {
 // or already evicted after terminalRetentionPeriod); Status/ErrorMessage/
 // Progress are then their zero values ("", "", 0).
 type RebuildStatusResponse struct {
-	Exists       bool          `json:"exists"`
-	Status       RebuildStatus `json:"status"` // running|completed|failed; empty when Exists=false
-	ErrorMessage string        `json:"error_message"`
-	Progress     int           `json:"progress"` // 0-100
+	Exists             bool          `json:"exists"`
+	Status             RebuildStatus `json:"status"` // running|completed|failed; empty when Exists=false
+	ErrorMessage       string        `json:"error_message"`
+	Progress           int           `json:"progress"` // 0-100
+	ArtifactsPublished bool          `json:"artifacts_published"`
 }
 
 // RebuildParam is the rebuild start payload.

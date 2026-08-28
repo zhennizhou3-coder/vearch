@@ -1441,16 +1441,17 @@ func (rsh *RebuildStatusHandler) Execute(ctx context.Context, req *vearchpb.Part
 
 	rebuildMgr := rsh.server.GetRebuildManager()
 
-	status, errorMsg, exists, progress := rebuildMgr.GetRebuildTaskStatus(
+	status, errorMsg, exists, progress, published := rebuildMgr.GetRebuildTaskStatus(
 		query.DBName, query.SpaceName, query.IndexName, pid)
 	log.Info("RebuildTaskStatus result: dbName=%s, spaceName=%s, indexName=%s, partitionID=%d, status=%s, exists=%v, errorMsg=%s, progress=%d%%",
 		query.DBName, query.SpaceName, query.IndexName, pid, status, exists, errorMsg, progress)
 
 	response := &entity.RebuildStatusResponse{
-		Exists:       exists,
-		Status:       status,
-		ErrorMessage: errorMsg,
-		Progress:     progress,
+		Exists:             exists,
+		Status:             status,
+		ErrorMessage:       errorMsg,
+		Progress:           progress,
+		ArtifactsPublished: published,
 	}
 
 	reply.Data, err = json.Marshal(response)
@@ -1486,7 +1487,7 @@ func trainingArtifactsPaths(server *Server, pid entity.PartitionID, indexName st
 	if store == nil {
 		return "", "", fmt.Errorf("partition %d not found", pid)
 	}
-	modelPath, metaPath = trainingArtifactsPathsAt(store.GetPartition().Path, indexName)
+	modelPath, metaPath = trainingArtifactsPathsAt(store.GetPartition().Path, pid, indexName)
 	return modelPath, metaPath, nil
 }
 
@@ -1551,6 +1552,23 @@ func (h *PullTrainingArtifactsHandler) Execute(ctx context.Context, req *vearchp
 	}
 
 	if r.Offset < 0 { // stat
+		// The `.meta` marker alone is not enough to advertise the round as
+		// pullable: the model bytes must actually be present AND complete. Guard
+		// against the data file being mis-deleted or truncated (meta present,
+		// bytes gone/short) by checking it exists and its size matches the meta.
+		// Failing here makes the follower fail cleanly and preserves cross-replica
+		// consistency — it never silently falls back to training a divergent model.
+		fi, statErr := os.Stat(modelPath)
+		if statErr != nil {
+			return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR,
+				fmt.Errorf("training artifacts data not ready pid=%d index=%s: %v",
+					r.PartitionID, r.IndexName, statErr))
+		}
+		if fi.Size() != meta.Size {
+			return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR,
+				fmt.Errorf("training artifacts data incomplete pid=%d index=%s: file size %d != meta size %d",
+					r.PartitionID, r.IndexName, fi.Size(), meta.Size))
+		}
 		reply.Data, err = json.Marshal(meta)
 		if err != nil {
 			return vearchpb.NewError(vearchpb.ErrorEnum_INTERNAL_ERROR, err)

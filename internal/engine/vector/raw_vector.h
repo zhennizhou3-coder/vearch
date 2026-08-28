@@ -210,11 +210,16 @@ protected:
    * vector bytes from their backing store.
    *
    * @param num           target reservoir size
+   * @param total         exclusive upper bound of the vid space to sample from;
+   *                      callers pass a count consistent with the store they
+   *                      then read (e.g. a snapshot-consistent count for
+   *                      RocksDB) so a vid absent from that store is never sampled
    * @param reservoir     [out] sampled valid vector ids
    * @param valid_count   [out] total non-deleted vectors observed
    * @return 0 on success; -1 if num is zero or no valid vectors exist
    */
-  int SampleTrainingVectorIds(const size_t num, std::vector<int64_t> &reservoir,
+  int SampleTrainingVectorIds(const size_t num, int64_t total,
+                              std::vector<int64_t> &reservoir,
                               size_t &valid_count);
 
 protected:

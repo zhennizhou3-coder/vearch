@@ -202,13 +202,18 @@ func (f *fakeEngine) IndexStatusOf(indexName string) (engine.IndexStatusInfo, er
 type fakeStore struct {
 	PartitionStore // embedded: only GetEngine + GetPartition are used by the monitor
 	eng            engine.Engine
-	path           string // partition data path; where training-artifacts files land
+	path           string             // partition data path; where training-artifacts files land
+	id             entity.PartitionID // partition id; 0 defaults to 1
 }
 
 func (s *fakeStore) GetEngine() engine.Engine { return s.eng }
 
 func (s *fakeStore) GetPartition() *entity.Partition {
-	return &entity.Partition{Id: 1, Path: s.path}
+	id := s.id
+	if id == 0 {
+		id = 1
+	}
+	return &entity.Partition{Id: id, Path: s.path}
 }
 
 // newFieldTask returns a field-level rebuild task (FieldName != "" so pollStatus

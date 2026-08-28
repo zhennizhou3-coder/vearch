@@ -28,7 +28,7 @@ import (
 // after the bytes). It exercises the P6 commit machinery without cgo.
 func TestFinalizeTrainerArtifacts(t *testing.T) {
 	dir := t.TempDir()
-	modelPath, metaPath := trainingArtifactsPathsAt(dir, "idx")
+	modelPath, metaPath := trainingArtifactsPathsAt(dir, 1, "idx")
 	tmpPath := modelPath + ".tmp"
 	payload := []byte("centroids+codebook raw bytes")
 
@@ -91,7 +91,7 @@ func TestFinalizeTrainerArtifacts(t *testing.T) {
 // the round simply carries no artifacts.
 func TestFinalizeTrainerArtifacts_NoDumpNoPublish(t *testing.T) {
 	dir := t.TempDir()
-	modelPath, metaPath := trainingArtifactsPathsAt(dir, "idx")
+	modelPath, metaPath := trainingArtifactsPathsAt(dir, 1, "idx")
 	tmpPath := modelPath + ".tmp" // never created
 
 	r := &RebuildManager{tasks: map[string]*RebuildTask{}}
@@ -111,11 +111,55 @@ func TestFinalizeTrainerArtifacts_NoDumpNoPublish(t *testing.T) {
 	}
 }
 
+// Two partitions of the same space can have replicas on ONE PS. They share the
+// PS-level data root (Partition.Path) and, being the same space, the same index
+// name and rebuild round — so the .meta round/sha checks cannot tell them apart.
+// The <pid> path segment is the only thing keeping one partition's trainer from
+// overwriting the other's model; assert both survive with their own bytes.
+func TestFinalizeTrainerArtifacts_NoCrossPartitionCollision(t *testing.T) {
+	root := t.TempDir() // one shared PS data root
+	r := &RebuildManager{tasks: map[string]*RebuildTask{}}
+
+	commit := func(pid entity.PartitionID, bytes string) string {
+		modelPath, _ := trainingArtifactsPathsAt(root, pid, "vec_ivfpq")
+		tmpPath := modelPath + ".tmp"
+		if err := os.MkdirAll(filepath.Dir(tmpPath), 0755); err != nil {
+			t.Fatalf("mkdir pid=%d: %v", pid, err)
+		}
+		if err := os.WriteFile(tmpPath, []byte(bytes), 0644); err != nil {
+			t.Fatalf("write tmp pid=%d: %v", pid, err)
+		}
+		if _, err := r.finalizeTrainerArtifacts(&fakeStore{path: root, id: pid}, "vec_ivfpq", "round-1", tmpPath); err != nil {
+			t.Fatalf("finalize pid=%d: %v", pid, err)
+		}
+		return modelPath
+	}
+
+	p42 := commit(42, "model-of-partition-42")
+	p43 := commit(43, "model-of-partition-43")
+
+	if p42 == p43 {
+		t.Fatalf("paths must differ per partition, both = %q", p42)
+	}
+	for _, tc := range []struct{ path, want string }{
+		{p42, "model-of-partition-42"},
+		{p43, "model-of-partition-43"},
+	} {
+		got, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatalf("read %s: %v", tc.path, err)
+		}
+		if string(got) != tc.want {
+			t.Errorf("cross-partition overwrite: %s holds %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
 // trainerDumpTmpPath returns the <model>.tmp slot and clears any stale .tmp so a
 // skipped dump cannot leave a previous round's file to be mistaken for this one.
 func TestTrainerDumpTmpPath_ClearsStale(t *testing.T) {
 	dir := t.TempDir()
-	modelPath, _ := trainingArtifactsPathsAt(dir, "idx")
+	modelPath, _ := trainingArtifactsPathsAt(dir, 1, "idx")
 	staleTmp := modelPath + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(staleTmp), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)

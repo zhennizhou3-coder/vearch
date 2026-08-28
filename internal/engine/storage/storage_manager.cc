@@ -56,6 +56,15 @@ int StorageManager::SetSize(int64_t size) {
   return 0;
 }
 
+int64_t StorageManager::Size(const rocksdb::Snapshot *snap) {
+  rocksdb::ReadOptions ro;
+  ro.snapshot = snap;
+  std::string value;
+  rocksdb::Status s = db_->Get(ro, rocksdb::Slice("_total"), &value);
+  if (!s.ok()) return 0;  // no `_total` yet (empty table) -> no vectors
+  return std::stoll(value);
+}
+
 Status StorageManager::SetVectorIndexCount(int64_t vector_index_count) {
   std::string key_str = "_vector_index_count";
   rocksdb::Status s =

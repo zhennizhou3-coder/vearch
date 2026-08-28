@@ -192,9 +192,11 @@ int MemoryRawVector::SampleTrainingVectors(const size_t num,
                                             ScopeVectors &vecs,
                                             size_t &num_got,
                                             size_t &valid_count) {
-  // Reservoir sampling lives in the base class (shared with RocksDB).
+  // Reservoir sampling lives in the base class (shared with RocksDB). The
+  // in-memory store has no snapshot: earlier slots are immutable once written,
+  // so the live count is a safe upper bound.
   std::vector<int64_t> reservoir;
-  if (SampleTrainingVectorIds(num, reservoir, valid_count) != 0) {
+  if (SampleTrainingVectorIds(num, meta_info_->Size(), reservoir, valid_count) != 0) {
     LOG(ERROR) << desc_ << "no training vectors requested or available";
     num_got = 0;
     return -1;

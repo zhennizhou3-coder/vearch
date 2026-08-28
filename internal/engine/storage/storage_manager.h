@@ -72,6 +72,10 @@ class StorageManager {
   }
 
   int64_t Size() { return size_; }
+  // Snapshot-consistent doc count: reads the persisted `_total` under `snap`, so
+  // it matches the vector rows visible in that same snapshot. Training sampling
+  // uses this so it never counts a vid whose row was written after the snapshot.
+  int64_t Size(const rocksdb::Snapshot *snap);
 
   int SetSize(int64_t size);
 
